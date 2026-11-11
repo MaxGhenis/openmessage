@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
@@ -426,4 +428,68 @@ func assertDownloadOpError(
 		t.Fatalf("DownloadMedia() OpError = %+v, want class %q operation download_media fingerprint %q", failure, wantClass, wantFingerprint)
 	}
 	return failure
+}
+
+func TestDownloadMediaReportsAttachmentSignalCLINeverStoredAsGone(t *testing.T) {
+	poller := readyDownloadPoller()
+	poller.downloadErr = fmt.Errorf("%w: %w", signallive.ErrAttachmentNotStored, signallive.NewCommandError(
+		"download Signal attachment: exit status 1: Could not find attachment with ID: Q3x9KpLmN2vB7cRtYw4z.html",
+	))
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	opaque := []byte(`{"v":1,"kind":"remote","att_id":"Q3x9KpLmN2vB7cRtYw4z.html","conversation_id":"signal:0d6c1f9e-3b8a-4c2e-9f71-5a4e2b8c7d10"}`)
+
+	_, err := adapter.DownloadMedia(context.Background(), "signal-primary", bridge.MediaRef{Opaque: opaque})
+	if !errors.Is(err, bridge.ErrMediaGone) {
+		t.Fatalf("DownloadMedia() error = %v, want bridge.ErrMediaGone", err)
+	}
+	var opErr bridge.OpError
+	if errors.As(err, &opErr) {
+		t.Fatalf("DownloadMedia() returned OpError %+v; an attachment signal-cli never stored is not a transient transport failure", opErr)
+	}
+	if !strings.Contains(err.Error(), "signal-cli has no copy of attachment Q3x9KpLmN2vB7cRtYw4z.html") ||
+		!strings.Contains(err.Error(), "Could not find attachment with ID") {
+		t.Fatalf("DownloadMedia() error = %q, want the attachment id and signal-cli's answer", err)
+	}
+	if got := poller.lastDownloadRequest(); got.attachmentID != "Q3x9KpLmN2vB7cRtYw4z.html" ||
+		got.target != "0d6c1f9e-3b8a-4c2e-9f71-5a4e2b8c7d10" || got.isGroup {
+		t.Fatalf("DownloadMediaRef request = %+v, want the attachment id unchanged and the ACI as recipient", got)
+	}
+}
+
+func TestAdapterKeepsAttachmentErrorsInTheDurableFrame(t *testing.T) {
+	poller := newFakePoller()
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	sink := &recordingSink{ingress: make(chan bridge.RawIngressRecord, 2)}
+	if _, err := adapter.Start(context.Background(), bridge.StartRequest{AccountID: "signal-primary", Generation: 3}, sink); err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	poller.mu.Lock()
+	observe := poller.ingressLine
+	poller.mu.Unlock()
+	if observe == nil {
+		t.Fatal("adapter did not register a line observer")
+	}
+	line := []byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"attachments":[{"id":"remote1.html","contentType":"text/html","size":85841}]}}}`)
+	observe(signallive.IngressLine{
+		Account:          "+15551230000",
+		Line:             line,
+		ResolvedSource:   "+15551234567",
+		AttachmentErrors: map[string]string{"remote1.html": "java.io.IOException: Connection reset"},
+	})
+	observe(signallive.IngressLine{Account: "+15551230000", Line: line, ResolvedSource: "+15551234567"})
+
+	withErrors := receiveValue(t, sink.ingress, "Signal ingress with attachment errors")
+	var frame struct {
+		AttachmentErrors map[string]string `json:"attachment_errors"`
+	}
+	if err := json.Unmarshal(withErrors.Payload, &frame); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	if got := frame.AttachmentErrors["remote1.html"]; got != "java.io.IOException: Connection reset" {
+		t.Fatalf("frame attachment_errors = %#v, want the receive-time cause", frame.AttachmentErrors)
+	}
+	without := receiveValue(t, sink.ingress, "Signal ingress without attachment errors")
+	if bytes.Contains(without.Payload, []byte("attachment_errors")) {
+		t.Fatalf("frame without failures carries attachment_errors: %s", without.Payload)
+	}
 }

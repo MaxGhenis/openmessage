@@ -31,13 +31,31 @@ type CounterSnapshot struct {
 	EchoNoop          uint64 `json:"echo_noop"`
 	EchoNotFound      uint64 `json:"echo_notfound"`
 	EchoErrors        uint64 `json:"echo_errors"`
-	Ephemeral         uint64 `json:"ephemeral"`
+	// EchoContentMatched counts outgoing echoes that named no transport
+	// request and were correlated to their send by conversation, body and time.
+	EchoContentMatched uint64 `json:"echo_content_matched"`
+	Ephemeral          uint64 `json:"ephemeral"`
 	// RemoteRebinds counts Google remote conversation ids whose thread binding
 	// moved because participant identity contradicted the stored numeric id
 	// (device ID-space reset). ContentDupesSkipped counts re-delivered messages
 	// dropped because identical content already existed under another remote id.
 	RemoteRebinds       uint64 `json:"remote_rebinds"`
 	ContentDupesSkipped uint64 `json:"content_dupes_skipped"`
+	// History counters cover frames a catch-up fetched on request (history
+	// codecs) rather than received live, so Appended/Projected keep meaning
+	// "the live channel delivered". HistoryAppended/HistoryDeduped mirror
+	// Appended/Deduped; HistoryImported counts messages a history frame
+	// inserted; HistoryExisting counts history messages skipped because v2
+	// already held them; HistoryConversations counts conversations a history
+	// snapshot created; HistorySkipped counts history snapshots and messages
+	// v2 could only have placed by moving a thread binding (or whose snapshot
+	// was unusable), which history never does.
+	HistoryAppended      uint64 `json:"history_appended"`
+	HistoryDeduped       uint64 `json:"history_deduped"`
+	HistoryImported      uint64 `json:"history_imported"`
+	HistoryExisting      uint64 `json:"history_existing"`
+	HistoryConversations uint64 `json:"history_conversations"`
+	HistorySkipped       uint64 `json:"history_skipped"`
 }
 
 type accountCounters struct {
@@ -62,9 +80,17 @@ type accountCounters struct {
 	echoNoop            atomic.Uint64
 	echoNotFound        atomic.Uint64
 	echoErrors          atomic.Uint64
+	echoContentMatched  atomic.Uint64
 	ephemeral           atomic.Uint64
 	remoteRebinds       atomic.Uint64
 	contentDupesSkipped atomic.Uint64
+
+	historyAppended      atomic.Uint64
+	historyDeduped       atomic.Uint64
+	historyImported      atomic.Uint64
+	historyExisting      atomic.Uint64
+	historyConversations atomic.Uint64
+	historySkipped       atomic.Uint64
 }
 
 // Counters owns atomic ingest counters partitioned by account. Its zero value
@@ -146,8 +172,16 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		EchoNoop:            c.echoNoop.Load(),
 		EchoNotFound:        c.echoNotFound.Load(),
 		EchoErrors:          c.echoErrors.Load(),
+		EchoContentMatched:  c.echoContentMatched.Load(),
 		Ephemeral:           c.ephemeral.Load(),
 		RemoteRebinds:       c.remoteRebinds.Load(),
 		ContentDupesSkipped: c.contentDupesSkipped.Load(),
+
+		HistoryAppended:      c.historyAppended.Load(),
+		HistoryDeduped:       c.historyDeduped.Load(),
+		HistoryImported:      c.historyImported.Load(),
+		HistoryExisting:      c.historyExisting.Load(),
+		HistoryConversations: c.historyConversations.Load(),
+		HistorySkipped:       c.historySkipped.Load(),
 	}
 }

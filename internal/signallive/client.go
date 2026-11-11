@@ -111,6 +111,18 @@ func (v signalCLIVersion) String() string {
 	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
 }
 
+// receiveOutputHasEnvelopes reports whether a receive call's output holds any
+// line processReceiveLine would treat as an envelope (it skips everything that
+// does not start with '{', such as signal-cli's log lines).
+func receiveOutputHasEnvelopes(output []byte) bool {
+	for _, line := range bytes.Split(output, []byte("\n")) {
+		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' {
+			return true
+		}
+	}
+	return false
+}
+
 func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 	if len(bytes.TrimSpace(output)) != 0 {
 		return false
@@ -120,6 +132,11 @@ func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 
 var (
 	now = time.Now
+
+	// receiveCallDeadline bounds one `signal-cli receive` call. signal-cli's
+	// own --timeout restarts after every envelope, so a call that is still
+	// delivering can run into it. Swapped by tests to reach it quickly.
+	receiveCallDeadline = time.Duration(receiveTimeoutSeconds+3) * time.Second
 
 	// accountProbeRetryDelays paces the in-generation listAccounts retries: a
 	// transient failure of signal-cli's per-account check (network not up at
@@ -131,8 +148,12 @@ var (
 	signalCLILookPath     = exec.LookPath
 	signalCLIStat         = os.Stat
 	probeSignalCLIVersion = func(ctx context.Context) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, signalCLIExecutable(), "--version")
+		executable := signalCLIExecutable()
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr != nil {
+			tmpDir = ""
+		}
+		cmd := exec.CommandContext(ctx, executable, append(signalCLITmpDirArgs(executable, tmpDir), "--version")...)
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 			defer cleanupTmp()
@@ -142,20 +163,31 @@ var (
 	}
 
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
-		commandArgs := append([]string{"--config", configDir}, args...)
-		cmd := exec.CommandContext(ctx, signalCLIExecutable(), commandArgs...)
+		executable := signalCLIExecutable()
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr != nil {
+			tmpDir = ""
+		}
+		commandArgs := append(signalCLITmpDirArgs(executable, tmpDir), "--config", configDir)
+		cmd := exec.CommandContext(ctx, executable, append(commandArgs, args...)...)
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 			defer cleanupTmp()
 		}
-		configureSignalCancel(cmd)
+		exited := configureSignalStop(ctx, cmd, configDir, tmpDir)
+		defer exited()
 		return cmd.CombinedOutput()
 	}
 
 	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
-		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
+		executable := signalCLIExecutable()
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr != nil {
+			tmpDir = ""
+		}
+		commandArgs := append([]string{"-q", "/dev/null", executable}, signalCLITmpDirArgs(executable, tmpDir)...)
+		commandArgs = append(commandArgs, "--config", configDir, "link", "-n", "OpenMessage")
+		cmd := exec.CommandContext(ctx, "script", commandArgs...)
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 		}
@@ -194,7 +226,7 @@ func configureSignalCancel(cmd *exec.Cmd) {
 		}
 		return nil
 	}
-	cmd.WaitDelay = 3 * time.Second
+	cmd.WaitDelay = signalStopGrace
 }
 
 type Callbacks struct {
@@ -317,6 +349,14 @@ func (r *pollerRun) markReady() {
 	r.readyOnce.Do(func() { close(r.ready) })
 }
 
+// beatFunc is beat for a caller that may hold no run (the legacy loop).
+func (r *pollerRun) beatFunc() func(detail string) {
+	if r == nil {
+		return nil
+	}
+	return r.beat
+}
+
 func (r *pollerRun) beat(detail string) {
 	activity := PollerActivity{At: now(), Detail: detail}
 	select {
@@ -406,7 +446,7 @@ type storedReaction struct {
 
 type Bridge struct {
 	mu         sync.RWMutex
-	commandMu  sync.Mutex
+	commandMu  commandGate
 	recoveryMu sync.Mutex
 
 	store     *db.Store
@@ -414,7 +454,7 @@ type Bridge struct {
 	configDir string
 	callbacks Callbacks
 
-	ingressObserver   func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressObserver   func(IngressLine)
 	ingressObserverID uint64
 
 	connected  bool
@@ -439,6 +479,10 @@ type Bridge struct {
 	// a valid link, but a persistent listAccounts/accounts.json disagreement
 	// still surfaces needs_reauth. Reset by a successful probe or an unpair.
 	probeEmptyStreak int
+
+	// receiveDraining is set while a receive call stopped by its deadline is
+	// held open to finish an attachment download (receive_drain.go).
+	receiveDraining drainFlag
 
 	pairCancel    context.CancelFunc
 	receiveCancel context.CancelFunc
@@ -578,6 +622,9 @@ type signalAttachment struct {
 	ID          string `json:"id"`
 	Filename    string `json:"filename"`
 	Caption     string `json:"caption"`
+	// Size is the sender's declared plaintext size; signal-cli prints null
+	// when the pointer carries none.
+	Size *int64 `json:"size"`
 }
 
 type signalMention struct {
@@ -630,10 +677,38 @@ type SentMessage = signalSentMessage
 type Reaction = signalReaction
 type Attachment = signalAttachment
 
+// IngressLine is one captured Signal receive line plus what the bridge
+// learned about it while capturing it.
+type IngressLine struct {
+	Account             string
+	Line                []byte
+	ResolvedSource      string
+	ResolvedDestination string
+	// AttachmentErrors maps an attachment id in Line to the failure signal-cli
+	// logged while downloading it during the receive call that printed Line.
+	// signal-cli prints and acknowledges the envelope after such a failure and
+	// never downloads that attachment again (see ErrAttachmentNotStored). Nil
+	// when every attachment downloaded, and for replayed lines, whose call
+	// output is gone.
+	AttachmentErrors map[string]string
+}
+
 // ObserveIngress installs the one pre-dispatch Signal receive observer. A
 // later registration supersedes an earlier one; the returned function only
 // removes the registration it created.
 func (b *Bridge) ObserveIngress(observer func(account string, line []byte, resolvedSource string, resolvedDestination string)) func() {
+	if observer == nil {
+		return b.ObserveIngressLine(nil)
+	}
+	return b.ObserveIngressLine(func(captured IngressLine) {
+		observer(captured.Account, captured.Line, captured.ResolvedSource, captured.ResolvedDestination)
+	})
+}
+
+// ObserveIngressLine is ObserveIngress for observers that also want the
+// capture-time detail IngressLine carries. Both install the same single
+// observer slot.
+func (b *Bridge) ObserveIngressLine(observer func(IngressLine)) func() {
 	if b == nil {
 		return func() {}
 	}
@@ -655,7 +730,7 @@ func (b *Bridge) ObserveIngress(observer func(account string, line []byte, resol
 	}
 }
 
-func (b *Bridge) observeIngress(account string, line []byte, resolvedSource string, resolvedDestination string) {
+func (b *Bridge) observeIngress(captured IngressLine) {
 	if b == nil {
 		return
 	}
@@ -665,7 +740,7 @@ func (b *Bridge) observeIngress(account string, line []byte, resolvedSource stri
 	if observer == nil {
 		return
 	}
-	line = bytes.Clone(line)
+	captured.Line = bytes.Clone(captured.Line)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logger.Warn().
@@ -674,7 +749,7 @@ func (b *Bridge) observeIngress(account string, line []byte, resolvedSource stri
 				Msg("Recovered from panic in Signal ingress observer")
 		}
 	}()
-	observer(account, line, resolvedSource, resolvedDestination)
+	observer(captured)
 }
 
 // ReportIngressError lets the lifecycle adapter log an isolated durable-tee
@@ -1034,9 +1109,11 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 		args = append(args, target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return nil, gateNotDispatchedError("send Signal message", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
@@ -1065,8 +1142,9 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 // SendTextRequest sends one text message through signal-cli's structured JSON
 // path and returns Signal's canonical outgoing identity. Signal uses the send
 // timestamp as its message ID; the durable request ID remains local dedupe
-// metadata until reconciliation can make uncertain retries safe.
-func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timestampMS int64, err error) {
+// metadata until reconciliation can make uncertain retries safe. A zero reply
+// sends no quote.
+func (b *Bridge) SendTextRequest(conversationID, body string, reply ReplyTarget) (timestampMS int64, err error) {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return 0, errors.New("signal message body is required")
@@ -1082,7 +1160,7 @@ func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timest
 	}
 
 	args := []string{"--output=json", "-a", account, "send", "-m", body}
-	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	quoteArgs, err := b.replyQuoteArgs(reply, account)
 	if err != nil {
 		return 0, err
 	}
@@ -1093,9 +1171,11 @@ func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timest
 		args = append(args, target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return 0, gateNotDispatchedError("send Signal message", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	timestampMS, resultErr := parseSignalSendResult(output)
@@ -1137,7 +1217,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 		int64(len(data)),
 		filename,
 		caption,
-		replyToID,
+		ReplyTarget{RemoteID: replyToID},
 		true,
 	)
 	if err != nil {
@@ -1173,12 +1253,13 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 // SendMediaRequest streams one attachment to signal-cli and returns Signal's
 // canonical outgoing identity. Signal uses the send timestamp as its message
 // ID; the durable request ID remains local dedupe metadata until reconciliation
-// can make uncertain retries safe.
+// can make uncertain retries safe. A zero reply sends no quote.
 func (b *Bridge) SendMediaRequest(
 	conversationID string,
 	content io.Reader,
 	size int64,
-	filename, mime, caption, replyToID string,
+	filename, mime, caption string,
+	reply ReplyTarget,
 ) (timestampMS int64, err error) {
 	result, err := b.sendMediaRequest(
 		conversationID,
@@ -1186,7 +1267,7 @@ func (b *Bridge) SendMediaRequest(
 		size,
 		filename,
 		caption,
-		replyToID,
+		reply,
 		false,
 	)
 	return result.timestampMS, err
@@ -1206,7 +1287,8 @@ func (b *Bridge) sendMediaRequest(
 	conversationID string,
 	content io.Reader,
 	size int64,
-	filename, caption, replyToID string,
+	filename, caption string,
+	reply ReplyTarget,
 	retainOnSuccess bool,
 ) (result signalMediaRequestResult, err error) {
 	account, err := b.usableAccount()
@@ -1216,6 +1298,11 @@ func (b *Bridge) sendMediaRequest(
 	target, isGroup, err := parseConversationTarget(conversationID)
 	if err != nil {
 		return result, err
+	}
+	// Retried every few seconds while a drain lasts; don't copy a large
+	// attachment each time only to give up at the gate.
+	if b.receiveDraining.Load() {
+		return result, gateNotDispatchedError("send Signal media", ErrReceiveDraining)
 	}
 
 	attachmentPath, err := b.writeLocalAttachmentReader(content, size, filename)
@@ -1241,7 +1328,7 @@ func (b *Bridge) sendMediaRequest(
 	// keeps the recipient available for parsing as the positional.
 	// Reproduced with "No recipients given" when sending to an ACI-only contact.
 	args = append(args, "--attachment="+attachmentPath)
-	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	quoteArgs, err := b.replyQuoteArgs(reply, account)
 	if err != nil {
 		return result, err
 	}
@@ -1252,9 +1339,11 @@ func (b *Bridge) sendMediaRequest(
 		args = append(args, target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return result, gateNotDispatchedError("send Signal media", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	timestampMS, resultErr := parseSignalSendResult(output)
@@ -1387,14 +1476,17 @@ func signalSendAllRecipientsFailed(err error) bool {
 	return errors.As(err, &resultErr) && resultErr.allRecipientsFailed
 }
 
-// SendReactionRequest sends a reaction using only the durable request's remote
-// references. Unlike the legacy SendReaction path, it neither reads nor updates
-// locally stored message state.
+// SendReactionRequest sends a reaction using only the durable request's
+// description of its target. Unlike the legacy SendReaction path, it neither
+// reads nor updates locally stored message state. The target's author and
+// sent timestamp come from ReactionTargetArgs; a target it cannot name fails
+// before signal-cli runs.
 func (b *Bridge) SendReactionRequest(
-	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+	conversationID string,
+	target ReactionTarget,
+	emoji, action string,
 ) error {
-	targetRemoteID = strings.TrimSpace(targetRemoteID)
-	if targetRemoteID == "" {
+	if strings.TrimSpace(target.RemoteID) == "" {
 		return errors.New("signal target message is required")
 	}
 	emoji = strings.TrimSpace(emoji)
@@ -1414,19 +1506,16 @@ func (b *Bridge) SendReactionRequest(
 	if err != nil {
 		return err
 	}
-	targetAuthor := strings.TrimSpace(targetAuthorID)
-	if targetAuthor == "" {
-		// An empty author identifies a message sent by this account.
-		targetAuthor = account
+	targetArgs, err := ReactionTargetArgs(target, account)
+	if err != nil {
+		return err
 	}
 
-	args := []string{
+	args := append([]string{
 		"-a", account,
 		"sendReaction",
 		"-e", emoji,
-		"-a", targetAuthor,
-		"-t", targetRemoteID,
-	}
+	}, targetArgs...)
 	if action == "remove" {
 		args = append(args, "-r")
 	}
@@ -1438,9 +1527,11 @@ func (b *Bridge) SendReactionRequest(
 		args = append(args, recipient)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return gateNotDispatchedError("send Signal reaction", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
@@ -1488,7 +1579,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 	if err != nil {
 		return err
 	}
-	targetAuthor := b.resolveContactAddress(target.SenderNumber)
+	targetAuthor := b.resolveContactAddressForRequest(target.SenderNumber)
 	if targetAuthor == "" {
 		return errors.New("signal reaction target author is unavailable")
 	}
@@ -1503,9 +1594,11 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		args = append(args, recipient)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return gateNotDispatchedError("send Signal reaction", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
@@ -1784,23 +1877,49 @@ func (b *Bridge) runReceiveLoop(
 
 		b.maybeSweepTmp()
 
-		callCtx, callCancel := context.WithTimeout(ctx, time.Duration(receiveTimeoutSeconds+3)*time.Second)
 		b.commandMu.Lock()
-		output, err := runSignalCLI(callCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
+		callCtx, callCancel := context.WithTimeout(ctx, receiveCallDeadline)
+		// A call its deadline stops may still be downloading an attachment
+		// for an envelope it has acknowledged; it is drained, not killed.
+		drainCtx := withReceiveDrain(callCtx, receiveDrainRequest{
+			abort:   ctx.Done(),
+			holding: &b.receiveDraining,
+			beat:    run.beatFunc(),
+			logger:  b.logger,
+		})
+		output, err := runSignalCLI(drainCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
 		b.commandMu.Unlock()
 		timedOut := errors.Is(callCtx.Err(), context.DeadlineExceeded)
 		callCancel()
-		if ctx.Err() != nil {
+		stopped := ctx.Err() != nil
+		// signal-cli acknowledges each envelope to Signal's server as it
+		// prints it, so a call that was stopped, hit its deadline or exited
+		// non-zero can still hold messages the server will never deliver to
+		// this device again. Keep them before deciding what the call's
+		// outcome means; the success path below handles its own output.
+		delivered := receiveOutputHasEnvelopes(output)
+		if delivered && (err != nil || stopped) {
+			if handleErr := b.handleReceiveOutput(probedAccount, output); handleErr != nil {
+				b.logger.Debug().Err(handleErr).Msg("Failed to process Signal receive payload")
+			}
+		}
+		if stopped {
 			continue
 		}
 		if err != nil {
-			if isSignalIdleReceiveTimeout(err, timedOut, output) {
+			// A deadline hit while envelopes were still arriving is a long
+			// batch, not a broken connection.
+			if isSignalIdleReceiveTimeout(err, timedOut, output) || (timedOut && delivered) {
 				consecutiveFailures = 0
 				consecutivePoisonFailures = 0
 				consecutiveAccountInvalid = 0
 				lastPoisonFingerprint = ""
 				if run != nil {
-					run.beat("receive_idle")
+					if delivered {
+						run.beat("receive_batch")
+					} else {
+						run.beat("receive_idle")
+					}
 				}
 				continue
 			}
@@ -2069,7 +2188,8 @@ func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
 // maybeSweepTmp runs the crash-backstop sweeps at most once per
 // signalTmpSweepInterval. Normal runs clean up after themselves, so the
 // app-tmp sweep usually finds nothing; the legacy sweep keeps reaping
-// system-temp dirs leaked by older builds as they age past the gate.
+// system-temp dirs leaked by older builds as they age past the gate, and the
+// attachments sweep the partial files of receive calls that were killed.
 func (b *Bridge) maybeSweepTmp() {
 	b.mu.Lock()
 	due := now().Sub(b.lastTmpSweep) >= signalTmpSweepInterval
@@ -2081,6 +2201,7 @@ func (b *Bridge) maybeSweepTmp() {
 		b.goTracked(func() {
 			sweepSignalTmpRoot(b.logger, signalRunTmpMaxAge)
 			sweepLegacyLibsignalTemp(b.logger)
+			sweepSignalAttachmentTemps(b.logger, b.configDir, signalRunTmpMaxAge)
 		})
 	}
 }
@@ -2097,9 +2218,9 @@ func (b *Bridge) requestSync(account string) error {
 	if account == "" {
 		return errors.New("signal account is not paired")
 	}
+	b.commandMu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), syncRequestTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, "-a", account, "sendSyncRequest")
 	b.commandMu.Unlock()
 	if err != nil {
@@ -2122,10 +2243,11 @@ func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
 		b.logger.Warn().Err(err).Msg("Failed to persist signal-cli batch to WAL — continuing with best-effort processing")
 	}
 
+	failures := parseAttachmentDownloadFailures(output)
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
-		if _, err := b.processReceiveLine(account, scanner.Bytes(), true); err != nil {
+		if _, err := b.processReceiveLineWithFailures(account, scanner.Bytes(), true, failures); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
 	}
@@ -2209,7 +2331,7 @@ func (b *Bridge) drainReceiveWAL(account string) {
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	replayed := 0
+	var records []signalReceiveRecoveryRecord
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -2219,8 +2341,21 @@ func (b *Bridge) drainReceiveWAL(account string) {
 		if err := json.Unmarshal(line, &record); err != nil {
 			continue
 		}
+		records = append(records, record)
+	}
+	// The WAL keeps every line of each batch, signal-cli's log lines among
+	// them, so the attachment download failures a crashed batch reported are
+	// still recoverable. Remote ids are unique, so parsing the whole WAL at
+	// once cannot misattribute one batch's failure to another's envelope.
+	rawLines := make([]string, 0, len(records))
+	for _, record := range records {
+		rawLines = append(rawLines, record.Raw)
+	}
+	failures := parseAttachmentDownloadFailures([]byte(strings.Join(rawLines, "\n")))
+	replayed := 0
+	for _, record := range records {
 		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
-		if _, err := b.processReceiveLine(replayAccount, []byte(record.Raw), true); err != nil {
+		if _, err := b.processReceiveLineWithFailures(replayAccount, []byte(record.Raw), true, failures); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to replay Signal WAL entry")
 		}
 		replayed++
@@ -2232,6 +2367,18 @@ func (b *Bridge) drainReceiveWAL(account string) {
 }
 
 func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecovery bool) (bool, error) {
+	return b.processReceiveLineWithFailures(account, rawLine, allowRecovery, nil)
+}
+
+// processReceiveLineWithFailures is processReceiveLine for a line from a live
+// receive call, whose output also reported the attachment downloads that
+// failed while signal-cli handled its envelopes.
+func (b *Bridge) processReceiveLineWithFailures(
+	account string,
+	rawLine []byte,
+	allowRecovery bool,
+	failures attachmentDownloadFailures,
+) (bool, error) {
 	line := bytes.TrimSpace(rawLine)
 	if len(line) == 0 {
 		return true, nil
@@ -2251,7 +2398,21 @@ func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecover
 	if env.SyncMessage != nil {
 		resolvedDestination = b.resolveContactAddressAtCapture(signalSentTarget(env.SyncMessage.SentMessage))
 	}
-	b.observeIngress(payloadAccount, line, resolvedSource, resolvedDestination)
+	attachmentErrors := failures.forEnvelope(&env)
+	for attachmentID, cause := range attachmentErrors {
+		b.logger.Warn().
+			Str("attachment_id", attachmentID).
+			Int64("envelope_timestamp", env.Timestamp).
+			Str("cause", cause).
+			Msg("signal-cli failed to download a Signal attachment while receiving it; it will not retry, so the attachment stays unavailable until restored by hand")
+	}
+	b.observeIngress(IngressLine{
+		Account:             payloadAccount,
+		Line:                line,
+		ResolvedSource:      resolvedSource,
+		ResolvedDestination: resolvedDestination,
+		AttachmentErrors:    attachmentErrors,
+	})
 	if reason := signalEnvelopeRecoveryReason(&env); reason != "" {
 		if allowRecovery {
 			b.recordReceiveRecoveryIssue(payloadAccount, line, reason, nil)
@@ -3294,9 +3455,9 @@ func (b *Bridge) refreshGroupNames() {
 	if b == nil || b.store == nil {
 		return
 	}
+	b.commandMu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, "listGroups")
 	b.commandMu.Unlock()
 	groups := parseSignalGroups(output)
@@ -3344,6 +3505,18 @@ func (b *Bridge) refreshGroupNames() {
 }
 
 func (b *Bridge) resolveContactAddress(value string) string {
+	return b.resolveContactAddressRefreshing(value, b.refreshContacts)
+}
+
+// resolveContactAddressForRequest is resolveContactAddress for a send: its
+// contact refresh gives up as the send would (lockForRequest) rather than
+// queue behind a drained receive call, leaving an unknown ACI unresolved.
+// signal-cli takes an ACI as an author too.
+func (b *Bridge) resolveContactAddressForRequest(value string) string {
+	return b.resolveContactAddressRefreshing(value, b.refreshContactsForRequest)
+}
+
+func (b *Bridge) resolveContactAddressRefreshing(value string, refresh func()) string {
 	value = normalizeSignalAddress(value)
 	if value == "" {
 		return ""
@@ -3357,7 +3530,7 @@ func (b *Bridge) resolveContactAddress(value string) string {
 	if resolved != "" {
 		return resolved
 	}
-	b.refreshContacts()
+	refresh()
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if resolved = normalizeSignalAddress(b.contactByACI[value]); resolved != "" {
@@ -3388,9 +3561,26 @@ func (b *Bridge) refreshContacts() {
 	if b == nil {
 		return
 	}
+	b.commandMu.Lock()
+	b.listContactsHoldingGate()
+}
+
+func (b *Bridge) refreshContactsForRequest() {
+	if b == nil {
+		return
+	}
+	if err := b.lockForRequest(); err != nil {
+		b.logger.Debug().Err(err).Msg("Skipped refreshing Signal contacts for a send")
+		return
+	}
+	b.listContactsHoldingGate()
+}
+
+// listContactsHoldingGate refreshes the contact cache from listContacts. The
+// caller holds the command gate; it is released once signal-cli exits.
+func (b *Bridge) listContactsHoldingGate() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, "listContacts")
 	b.commandMu.Unlock()
 	contacts := parseSignalContacts(output)
@@ -3460,23 +3650,55 @@ func decodedSignalAccounts(raw []byte) []string {
 		accounts = append(accounts, account)
 	}
 
-	var list []signalAccount
-	if err := json.Unmarshal(raw, &list); err == nil {
-		for _, item := range list {
-			appendAccount(item.Number)
+	// The buffer comes from CombinedOutput, so signal-cli's stderr is mixed in
+	// with its --output=json payload. A whole-buffer decode is therefore only
+	// the happy path: any WARN line ahead of the JSON makes it fail. Try the
+	// whole buffer first (cheapest, and correct when signal-cli was quiet),
+	// then each line on its own -- the same noise-tolerant convention
+	// decodeSignalSendJSON already uses on the send path.
+	for _, chunk := range append([][]byte{raw}, jsonCandidateLines(raw)...) {
+		var list []signalAccount
+		if err := json.Unmarshal(chunk, &list); err == nil {
+			for _, item := range list {
+				appendAccount(item.Number)
+			}
 		}
-	}
 
-	var wrapped struct {
-		Accounts []signalAccount `json:"accounts"`
-	}
-	if err := json.Unmarshal(raw, &wrapped); err == nil {
-		for _, item := range wrapped.Accounts {
-			appendAccount(item.Number)
+		var wrapped struct {
+			Accounts []signalAccount `json:"accounts"`
+		}
+		if err := json.Unmarshal(chunk, &wrapped); err == nil {
+			for _, item := range wrapped.Accounts {
+				appendAccount(item.Number)
+			}
+		}
+		if len(accounts) > 0 {
+			break
 		}
 	}
 
 	return accounts
+}
+
+// jsonCandidateLines returns the lines of raw that could be a JSON array or
+// object, so a decoder can retry them individually when the whole buffer is
+// not valid JSON. signal-cli prints one JSON document per line, so a line is
+// the right unit.
+func jsonCandidateLines(raw []byte) [][]byte {
+	var out [][]byte
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if line[0] != '[' && line[0] != '{' {
+			continue
+		}
+		out = append(out, append([]byte(nil), line...))
+	}
+	return out
 }
 
 func updateStoredReactions(existingJSON, actorID, emoji string) (string, bool, error) {
@@ -4235,15 +4457,24 @@ func (b *Bridge) downloadSignalAttachment(
 		args = append(args, "--recipient", target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return nil, commandError("download Signal attachment", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
-		return nil, commandError("download Signal attachment", err, output)
+		failure := commandError("download Signal attachment", err, output)
+		if isSignalAttachmentNotStored(output) {
+			return nil, fmt.Errorf("%w: %w", ErrAttachmentNotStored, failure)
+		}
+		return nil, failure
 	}
-	payload := strings.TrimSpace(string(output))
+	payload, err := signalAttachmentPayload(output)
+	if err != nil {
+		return nil, fmt.Errorf("read Signal attachment: %w", err)
+	}
 	if payload == "" {
 		return nil, errors.New("signal attachment is empty")
 	}
@@ -4275,27 +4506,7 @@ func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
 	if target.TimestampMS == 0 {
 		return nil, errors.New("signal reply target timestamp is unavailable")
 	}
-	author := normalizeSignalAddress(target.SenderNumber)
-	if target.IsFromMe || addressesMatch(author, account) || author == "" {
-		author = account
-	} else {
-		author = b.resolveContactAddress(author)
-	}
-	if author == "" {
-		return nil, errors.New("signal reply target author is unavailable")
-	}
-	quoteBody := strings.TrimSpace(target.Body)
-	if quoteBody == "" && target.MediaID != "" {
-		quoteBody = signalAttachmentPlaceholder([]signalAttachment{{ContentType: target.MimeType}})
-	}
-	if quoteBody == "" {
-		quoteBody = "Attachment"
-	}
-	return []string{
-		"--quote-timestamp", strconv.FormatInt(target.TimestampMS, 10),
-		"--quote-author", author,
-		"--quote-message", quoteBody,
-	}, nil
+	return QuoteArgs(legacyReplyTarget(target), account, b.resolveContactAddressForRequest)
 }
 
 func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, error) {

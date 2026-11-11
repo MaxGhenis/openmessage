@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -25,17 +26,27 @@ func (s *Store) UpsertMessage(m *Message) error {
 	}
 	defer tx.Rollback()
 
-	if err := upsertMessageTx(tx, m); err != nil {
-		return err
-	}
-	body, err := messageSearchBodyTx(tx, m.MessageID)
-	if err != nil {
-		return err
-	}
-	if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
+	if err := s.upsertMessageAndIndexTx(tx, m); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// upsertMessageAndIndexTx stores m and brings the search index in line with
+// the body that ends up stored.
+func (s *Store) upsertMessageAndIndexTx(tx *sql.Tx, m *Message) error {
+	before, existed, err := storedMessageBodyTx(tx, m.MessageID)
+	if err != nil {
+		return err
+	}
+	if err := upsertMessageTx(tx, m); err != nil {
+		return err
+	}
+	after, err := messageSearchBodyTx(tx, m.MessageID)
+	if err != nil {
+		return err
+	}
+	return s.updateMessageSearchIndex(tx, m.MessageID, existed, before, after)
 }
 
 func upsertMessageTx(tx *sql.Tx, m *Message) error {
@@ -115,14 +126,7 @@ func (s *Store) RecordOutgoingMessage(m *Message, deleteDraftID string) error {
 	}
 	defer tx.Rollback()
 
-	if err := upsertMessageTx(tx, m); err != nil {
-		return err
-	}
-	body, err := messageSearchBodyTx(tx, m.MessageID)
-	if err != nil {
-		return err
-	}
-	if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
+	if err := s.upsertMessageAndIndexTx(tx, m); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE conversations SET last_message_ts = ? WHERE conversation_id = ?`, m.TimestampMS, m.ConversationID); err != nil {
@@ -142,6 +146,19 @@ func messageSearchBodyTx(tx *sql.Tx, messageID string) (string, error) {
 		return "", err
 	}
 	return body, nil
+}
+
+// storedMessageBodyTx returns the body stored for messageID and whether a row
+// exists for it.
+func storedMessageBodyTx(tx *sql.Tx, messageID string) (string, bool, error) {
+	body, err := messageSearchBodyTx(tx, messageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return body, true, nil
 }
 
 func (s *Store) GetMessagesByConversation(conversationID string, limit int) ([]*Message, error) {
@@ -779,6 +796,14 @@ type PlatformStat struct {
 	LatestRecvMS int64 // most recent received message, 0 if none
 }
 
+// PlatformLatest is a PlatformStat without the message count, for callers that
+// only judge freshness and should not pay for counting every message.
+type PlatformLatest struct {
+	Platform     string
+	LatestMS     int64 // most recent message (sent or received), 0 if none
+	LatestRecvMS int64 // most recent received message, 0 if none
+}
+
 // PlatformStats returns per-platform message counts and the latest sent/received
 // timestamps in a single GROUP BY pass, ordered most-recent-activity first.
 //
@@ -817,6 +842,74 @@ func (s *Store) PlatformStats() ([]PlatformStat, error) {
 		stats = append(stats, st)
 	}
 	return stats, rows.Err()
+}
+
+// LatestIncomingMessageTimestamp returns the newest timestamp, at or before
+// notAfterMS, of an incoming (not from me) message on any of the given source
+// platforms, or 0. It walks the timestamp index from notAfterMS down and stops
+// at the first match; for a platform with no incoming rows that walk covers the
+// whole index. Freshness uses it as the activity clock when readers use the
+// legacy store. Outgoing rows are skipped because the app writes them itself,
+// so a send (even a failed one) must not read as the platform delivering, and
+// rows stamped in the future (a skewed sender clock) must not hide a silence.
+func (s *Store) LatestIncomingMessageTimestamp(ctx context.Context, platforms []string, notAfterMS int64) (int64, error) {
+	if len(platforms) == 0 {
+		return 0, nil
+	}
+	args := make([]any, 0, len(platforms)+1)
+	args = append(args, notAfterMS)
+	for _, platform := range platforms {
+		args = append(args, platform)
+	}
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT timestamp_ms
+		FROM messages
+		WHERE timestamp_ms <= ?
+			AND is_from_me = 0
+			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
+		ORDER BY timestamp_ms DESC
+		LIMIT 1
+	`, args...).Scan(&ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return ts, err
+}
+
+// IncomingMessageTimestampsBetween returns the timestamps (ms, ascending) of
+// incoming messages from the given source platforms inside [fromMS, toMS].
+// The timestamp index bounds the scan to the window.
+func (s *Store) IncomingMessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error) {
+	if len(platforms) == 0 || toMS < fromMS {
+		return nil, nil
+	}
+	args := make([]any, 0, len(platforms)+2)
+	args = append(args, fromMS, toMS)
+	for _, platform := range platforms {
+		args = append(args, platform)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT timestamp_ms
+		FROM messages
+		WHERE timestamp_ms BETWEEN ? AND ?
+			AND is_from_me = 0
+			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
+		ORDER BY timestamp_ms
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var timestamps []int64
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
+			return nil, err
+		}
+		timestamps = append(timestamps, ts)
+	}
+	return timestamps, rows.Err()
 }
 
 func scanMessages(rows interface {
@@ -900,16 +993,27 @@ func ValidateMessageTranscript(transcript string, model *string) error {
 	return nil
 }
 
-func (s *Store) syncMessageSearchIndex(exec interface {
-	Exec(string, ...any) (sql.Result, error)
-}, messageID, body string) error {
-	if !s.ftsEnabled {
+// updateMessageSearchIndex brings the search index in line with a message
+// whose stored body went from before (if the row existed) to after.
+//
+// The index can't find a row by message ID: messages_fts declares message_id
+// UNINDEXED, so `DELETE ... WHERE message_id = ?` scans every index row, about
+// 15 ms a save on an 80,000-message store (BenchmarkSaveIntoLargeStore). Most
+// saves re-deliver or re-import a message whose body hasn't changed (the
+// periodic Signal Desktop rescan and the Google recent reconcile re-save
+// thousands of stored messages an hour), so those leave the index alone. A new
+// row has no index entry to remove, so it only inserts one. Only a changed body
+// pays for the scan.
+func (s *Store) updateMessageSearchIndex(tx *sql.Tx, messageID string, existed bool, before, after string) error {
+	if !s.ftsEnabled || (existed && before == after) {
 		return nil
 	}
-	if _, err := exec.Exec(`DELETE FROM messages_fts WHERE message_id = ?`, messageID); err != nil {
-		return err
+	if existed {
+		if _, err := tx.Exec(`DELETE FROM messages_fts WHERE message_id = ?`, messageID); err != nil {
+			return err
+		}
 	}
-	_, err := exec.Exec(`INSERT INTO messages_fts(message_id, body) VALUES (?, ?)`, messageID, body)
+	_, err := tx.Exec(`INSERT INTO messages_fts(message_id, body) VALUES (?, ?)`, messageID, after)
 	return err
 }
 

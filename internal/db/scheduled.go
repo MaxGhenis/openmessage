@@ -180,6 +180,15 @@ func (s *Store) RevertScheduledMessageToPending(id, errMsg string) error {
 	return err
 }
 
+// RequeueScheduledMessage puts a claimed message back to pending without
+// counting an attempt, for a send that never reached the platform because the
+// transport was briefly busy.
+func (s *Store) RequeueScheduledMessage(id, errMsg string) error {
+	_, err := s.db.Exec(`UPDATE scheduled_messages SET status = ?, last_error = ? WHERE id = ?`,
+		ScheduleStatusPending, errMsg, id)
+	return err
+}
+
 // CancelScheduledMessage cancels a still-pending message. Returns false if it
 // wasn't pending (already sending/sent/canceled).
 func (s *Store) CancelScheduledMessage(id string) (bool, error) {

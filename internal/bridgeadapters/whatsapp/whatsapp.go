@@ -38,11 +38,11 @@ type Adapter struct {
 	now                 func() time.Time
 	mediaReady          func() bool // Shared connection gate; it does no media-specific work.
 	sendTextRequest     func(string, string, string, string) (string, time.Time, error)
-	sendReactionRequest func(string, string, string, string, string, string) error
+	sendReactionRequest func(string, string, string, bool, string, string, string) (time.Time, error)
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
-	observeIngress      func(func(whatsapplive.IngressFrame)) func()
+	observeIngress      func(func(whatsapplive.IngressFrame) error, bool) func()
 	logIngressError     func(error, string, uint64)
 
 	mu       sync.Mutex
@@ -179,14 +179,25 @@ func (a *Adapter) SendReaction(ctx context.Context, req bridge.ReactionRequest) 
 		return bridge.SendResult{}, whatsappReactionPreCallFailure("whatsapp_reaction_context_done", err)
 	}
 
-	err := a.sendReactionRequest(
+	sentAt, err := a.sendReactionRequest(
 		req.Conversation.RemoteID,
 		req.Target.RemoteID,
 		req.Target.AuthorID,
+		req.Target.Outgoing,
 		req.Emoji,
 		string(req.Action),
 		req.RequestID,
 	)
+	if errors.Is(err, whatsapplive.ErrReactionTargetAuthorUnknown) {
+		// Nothing was sent, and sending again cannot name the target either.
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureUnsupported,
+			Operation:   "send_reaction",
+			Fingerprint: "whatsapp_reaction_target_author_unavailable",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       err,
+		}
+	}
 	if err != nil {
 		// Deliberately no adapter-level lifecycle report. The retained core's
 		// guarded reportConnectionError path owns reconnect-worthy failures.
@@ -197,8 +208,10 @@ func (a *Adapter) SendReaction(ctx context.Context, req bridge.ReactionRequest) 
 		return bridge.SendResult{}, failure
 	}
 
-	// Reaction dispatch intentionally confirms without a transport result.
-	return bridge.SendResult{}, nil
+	// Reaction dispatch confirms without a remote ID. AcceptedAt is the
+	// reaction's own sender timestamp, which the ingest path also uses, so a
+	// change made on the phone moments later is not mistaken for a stale one.
+	return bridge.SendResult{AcceptedAt: sentAt}, nil
 }
 
 func whatsappReactionPreCallFailure(fingerprint string, cause error) bridge.OpError {
@@ -238,28 +251,76 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 		)
 	}
 
-	messageIDs := make([]string, len(req.Messages))
-	for i, message := range req.Messages {
-		messageIDs[i] = message.RemoteID
+	// whatsmeow's MarkRead names one sender for every message a receipt
+	// covers, so messages from different senders go out as one receipt per
+	// sender, in the order each sender first appears. (The dispatcher puts one
+	// message in each request.) A transport failure ends the request, and a
+	// retry sends the receipts before it again, which is harmless. A sender
+	// the retained core refuses to name does not hold up the others: their
+	// receipts are still sent, and the refusal is reported once they are.
+	var refused error
+	for _, batch := range readReceiptBatches(req.Messages) {
+		if err := ctx.Err(); err != nil {
+			return whatsappReadPreCallFailure("whatsapp_mark_read_context_done", err)
+		}
+		err := a.markReadRequest(
+			req.Conversation.RemoteID,
+			batch.messageIDs,
+			batch.authorID,
+			req.ReadAt,
+		)
+		if errors.Is(err, whatsapplive.ErrReadReceiptSenderUnknown) {
+			refused = err
+			continue
+		}
+		if err != nil {
+			// Deliberately no adapter-level lifecycle report: the retained core owns
+			// reconnect reporting through its guarded reportConnectionError path.
+			failure := a.classifyError(err, "mark_read", "whatsapp_mark_read_failed")
+			// Deliberate idempotent-read divergence: even after whatsmeow's transport
+			// call, repeating a read receipt is harmless. Preserve every retryable
+			// class as DispatchNotCalled instead of uncertain; terminal classes are
+			// still rejected by their classification before certainty is consulted.
+			failure.Dispatch = bridge.DispatchNotCalled
+			return failure
+		}
 	}
-	err := a.markReadRequest(
-		req.Conversation.RemoteID,
-		messageIDs,
-		req.Messages[0].AuthorID,
-		req.ReadAt,
-	)
-	if err != nil {
-		// Deliberately no adapter-level lifecycle report: the retained core owns
-		// reconnect reporting through its guarded reportConnectionError path.
-		failure := a.classifyError(err, "mark_read", "whatsapp_mark_read_failed")
-		// Deliberate idempotent-read divergence: even after whatsmeow's transport
-		// call, repeating a read receipt is harmless. Preserve every retryable
-		// class as DispatchNotCalled instead of uncertain; terminal classes are
-		// still rejected by their classification before certainty is consulted.
-		failure.Dispatch = bridge.DispatchNotCalled
-		return failure
+	if refused != nil {
+		// Nothing was sent for that sender, and sending again cannot name it
+		// either.
+		return bridge.OpError{
+			Class:       bridge.FailureUnsupported,
+			Operation:   "mark_read",
+			Fingerprint: "whatsapp_read_receipt_sender_invalid",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       refused,
+		}
 	}
 	return nil
+}
+
+// readReceiptBatch is the messages of a read-receipt request that one
+// WhatsApp receipt covers: those stored with the same sender.
+type readReceiptBatch struct {
+	authorID   string
+	messageIDs []string
+}
+
+// readReceiptBatches groups messages by stored sender, in the order each
+// sender first appears, keeping request order within a sender.
+func readReceiptBatches(messages []bridge.MessageRef) []readReceiptBatch {
+	var batches []readReceiptBatch
+	bySender := make(map[string]int, len(messages))
+	for _, message := range messages {
+		i, seen := bySender[message.AuthorID]
+		if !seen {
+			i = len(batches)
+			bySender[message.AuthorID] = i
+			batches = append(batches, readReceiptBatch{authorID: message.AuthorID})
+		}
+		batches[i].messageIDs = append(batches[i].messageIDs, message.RemoteID)
+	}
+	return batches
 }
 
 func whatsappReadPreCallFailure(fingerprint string, cause error) bridge.OpError {
@@ -416,6 +477,13 @@ func (a *Adapter) Start(
 	a.starting = true
 	a.mu.Unlock()
 
+	// A sink without a durable inbox (legacy-only mode) never commits a frame,
+	// so its generations report every frame committed and whatsmeow
+	// acknowledges as it always has.
+	durableIngress := sink != nil
+	if durability, ok := sink.(bridge.IngressDurability); ok {
+		durableIngress = durability.DurableIngress()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	r := &run{
 		adapter:   a,
@@ -428,6 +496,8 @@ func (a *Adapter) Start(
 		stopped:   make(chan struct{}),
 		finish:    make(chan error, 1),
 		admitting: true,
+
+		durableIngress: durableIngress,
 	}
 	r.workers.Add(1)
 	a.mu.Lock()
@@ -435,7 +505,7 @@ func (a *Adapter) Start(
 	a.starting = false
 	a.mu.Unlock()
 	if a.observeIngress != nil {
-		r.removeIngress = a.observeIngress(r.handleIngress)
+		r.removeIngress = a.observeIngress(r.handleIngress, durableIngress)
 	}
 
 	go r.coordinate()
@@ -653,6 +723,10 @@ type run struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
+	// durableIngress is whether the sink commits frames to a durable inbox
+	// (bridge.IngressDurability); without one every frame reports committed.
+	durableIngress bool
+
 	ready      chan struct{}
 	done       chan error
 	stopped    chan struct{}
@@ -758,13 +832,25 @@ type ingressErrorRecorder interface {
 	RecordIngressError(accountID string)
 }
 
-func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
+// errIngressAdmissionClosed reports a frame that reached a generation after it
+// stopped admitting callbacks (it is being retired).
+var errIngressAdmissionClosed = errors.New("whatsapp lifecycle: generation no longer admits ingress")
+
+// handleIngress commits one frame under this generation. It returns nil once
+// the frame is committed (or this generation has no durable inbox to commit it
+// to) and the reason otherwise, so the bridge can leave an uncommitted message
+// for whatsmeow to redeliver to a later generation
+// (whatsapplive.Bridge.ObserveIngress).
+func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 	if !r.admitCallback() {
-		return
+		if !r.durableIngress {
+			return nil
+		}
+		return errIngressAdmissionClosed
 	}
 	defer r.callbacks.Done()
 	if r.sink == nil {
-		return
+		return nil
 	}
 
 	err := r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
@@ -777,7 +863,10 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 		Payload:      frame.Payload,
 	})
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
-		return
+		if !r.durableIngress {
+			return nil
+		}
+		return err
 	}
 	if recorder, ok := r.sink.(ingressErrorRecorder); ok {
 		recorder.RecordIngressError(r.request.AccountID)
@@ -785,6 +874,10 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if r.adapter.logIngressError != nil {
 		r.adapter.logIngressError(err, r.request.AccountID, uint64(r.request.Generation))
 	}
+	if !r.durableIngress {
+		return nil
+	}
+	return err
 }
 
 func (r *run) handleEvent(event whatsapplive.LifecycleEvent) {

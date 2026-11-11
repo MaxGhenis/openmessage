@@ -613,3 +613,71 @@ func TestFormatLastMessagePreviewMatchesLegacyRules(t *testing.T) {
 		t.Fatalf("audio preview = %q, want %q", got, "You: Audio")
 	}
 }
+
+func TestSourceMarksAttachmentsThePlatformNeverDelivered(t *testing.T) {
+	store, messages, source := openSourceTestStore(t)
+	seedSourceAccount(t, store, "signal-account", "signal_cli")
+	seedSourceConversation(t, store, sqlite.Conversation{
+		ConversationID:       "conversation-signal",
+		AccountID:            "signal-account",
+		RemoteConversationID: "signal:+15550000002",
+		Kind:                 sqlite.ConversationKindDirect,
+		Title:                "Sam",
+		NotificationMode:     sqlite.NotificationModeAll,
+	})
+	text := func(value string) *string { return &value }
+	for index, lastError := range []*string{
+		nil,
+		text("download_media: transient: Signal is not connected"),
+		text(sqlite.ReceiveAttachmentErrorPrefix + "java.io.IOException: Connection reset"),
+		text(sqlite.UnavailableAttachmentErrorPrefix + "media gone"),
+	} {
+		importSourceMessage(t, messages, sqlite.Message{
+			MessageID:       fmt.Sprintf("message-%d", index),
+			ConversationID:  "conversation-signal",
+			AccountID:       "signal-account",
+			RemoteMessageID: fmt.Sprintf("remote-%d", index),
+			Direction:       sqlite.MessageDirectionIncoming,
+			State:           sqlite.MessageStateActive,
+			OccurredAtMS:    int64(100 + index),
+		}, sqlite.MessageAttachment{Ordinal: 0, RemoteID: fmt.Sprintf("att-%d.html", index), MIME: "text/html", LastError: lastError})
+	}
+
+	read := func() map[string]string {
+		t.Helper()
+		rows, err := source.GetMessagesByConversation("conversation-signal", 10)
+		if err != nil {
+			t.Fatalf("GetMessagesByConversation(): %v", err)
+		}
+		got := map[string]string{}
+		for _, row := range rows {
+			if row.MediaID == "" {
+				t.Fatalf("message %s lost its MediaID", row.MessageID)
+			}
+			got[row.MessageID] = row.MediaUnavailable
+		}
+		return got
+	}
+
+	// The rows were written at sourceTestTimeMS; within the hour the mark
+	// stands.
+	source.now = func() time.Time { return time.UnixMilli(sourceTestTimeMS).Add(30 * time.Minute) }
+	want := map[string]string{
+		"message-0": "",
+		"message-1": "",
+		"message-2": "", // a receive-time report alone does not mark it
+		"message-3": "media gone",
+	}
+	if got := read(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("MediaUnavailable by message = %#v, want %#v", got, want)
+	}
+	// Past it, the attachment reads as downloadable again, so the UI fetches
+	// it and that fetch re-checks the transport.
+	source.now = func() time.Time {
+		return time.UnixMilli(sourceTestTimeMS).Add(sqlite.UnavailableAttachmentRecheckAfter)
+	}
+	want["message-3"] = ""
+	if got := read(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("MediaUnavailable after the mark's window = %#v, want %#v", got, want)
+	}
+}

@@ -502,47 +502,11 @@ final class BackendManager: ObservableObject {
     /// Inspect the /api/status body for a paired platform that has silently
     /// stopped syncing, and surface it via `platformAlert`. Only flags a
     /// platform that *was* paired (so we don't nag about platforms the user
-    /// never set up).
+    /// never set up). `PlatformAttention` names the cause: a platform that went
+    /// silent while connected needs a check of the phone, not a re-pair.
     private func updatePlatformAlert(from data: Data) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-
-        let freshness = json["freshness"] as? [String: Any]
-
-        func needsAttention(_ key: String) -> Bool {
-            guard let p = json[key] as? [String: Any] else { return false }
-            let paired = (p["paired"] as? Bool) ?? false
-            let connected = (p["connected"] as? Bool) ?? false
-            let needsPairing = (p["needs_pairing"] as? Bool) ?? false
-            let needsReauth = (p["needs_reauth"] as? Bool) ?? false
-            // A paired platform that is not connected (or explicitly flags a
-            // re-pair/reauth need) has silently stopped syncing.
-            if needsPairing || needsReauth || (paired && !connected) {
-                return true
-            }
-            // Zombie guard: `connected` can stay true while a bridge has
-            // silently stopped delivering. The connection flag lies; the data
-            // doesn't. Trust freshness — a paired platform whose latest message
-            // trails the newest overall by the stale threshold needs attention
-            // even while it reports connected.
-            if paired,
-               let fresh = freshness?[key] as? [String: Any],
-               (fresh["stale"] as? Bool) ?? false {
-                return true
-            }
-            return false
-        }
-
-        var stale: [String] = []
-        if needsAttention("google") { stale.append("Google Messages") }
-        if needsAttention("whatsapp") { stale.append("WhatsApp") }
-        if needsAttention("signal") { stale.append("Signal") }
-
-        let alert: String?
-        switch stale.count {
-        case 0: alert = nil
-        case 1: alert = "\(stale[0]) needs re-pairing — it has stopped syncing."
-        default: alert = "\(stale.joined(separator: ", ")) need re-pairing — they have stopped syncing."
-        }
+        guard let items = PlatformAttention.evaluate(statusData: data) else { return }
+        let alert = PlatformAttention.alertText(for: items)
         if alert != platformAlert {
             platformAlert = alert
         }

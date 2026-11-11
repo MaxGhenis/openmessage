@@ -28,6 +28,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
@@ -47,7 +48,21 @@ var staticFS embed.FS
 // production.
 var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
-const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+// maxTranscriptRequestBytes bounds an /api/transcript body. JSON escaping can
+// spend 6 bytes on one byte of text (Go's encoder writes "<" as \u003c), so
+// the bound leaves room for that on a transcript and model at their limits,
+// plus the message ID and the JSON around them. The handler checks the limits
+// themselves against the decoded text.
+const maxTranscriptRequestBytes = 6*(db.MaxTranscriptBytes+db.MaxTranscriptModelBytes) + 4096
+
+// transcriptsUnavailableInV2Primary is /api/transcript's refusal on a
+// v2-primary daemon. The v2 store keeps no transcripts (the legacy->v2
+// migration counts and drops them). This route writes the legacy store, but
+// the message reads that show transcripts (the conversation view and the MCP
+// read tools) serve v2, so none would show it, and they hand out v2 message
+// IDs.
+const transcriptsUnavailableInV2Primary = "transcripts are not available while v2 is the serving store: " +
+	"message reads come from the v2 store, which keeps no transcripts"
 
 const sseWriteTimeout = 5 * time.Second
 
@@ -126,9 +141,21 @@ type APIOptions struct {
 	DownloadWhatsAppMedia func(msg *db.Message) ([]byte, string, error)
 	DownloadSignalMedia   func(msg *db.Message) ([]byte, string, error)
 	StartDeepBackfill     func() bool
-	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
-	BackfillPhone         func(string) error // targeted backfill for a single phone number
-	SyncGoogleContacts    func() (int, error)
+	// StartWindowBackfill re-fetches every Google message from the given time
+	// onward (POST /api/backfill with {"since": ...}); false means busy.
+	StartWindowBackfill func(since time.Time) bool
+	BackfillStatus      func() any         // returns a JSON-serializable backfill progress snapshot
+	BackfillPhone       func(string) error // targeted backfill for a single phone number
+	SyncGoogleContacts  func() (int, error)
+
+	// Activity reports when each platform's transport last delivered anything.
+	// /api/status uses it to flag a platform whose silence outlasts its own
+	// baseline (freshness.<platform>.silence). Nil skips the silence check.
+	Activity freshness.ActivitySource
+
+	// GoogleSMSPath judges whether carrier SMS has stopped reaching the phone
+	// while RCS still flows (freshness.google.sms_path). Nil skips the check.
+	GoogleSMSPath *freshness.SMSPathMonitor
 }
 
 type SearchResult struct {
@@ -166,7 +193,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if reads == nil {
 		reads = store
 	}
-	registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
+	v1 := registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -229,23 +256,42 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
-	// lies; the data doesn't). Computing this scans the messages table, and
-	// /api/status is polled every few seconds, so cache it — staleness is a
-	// multi-day signal, so a 30s cache is plenty fresh.
+	// lies; the data doesn't). /api/status is polled every few seconds, so
+	// cache it — staleness is a multi-day signal, so a 30s cache is plenty
+	// fresh. On v2 the read is a few index seeks (platformLatest); the legacy
+	// store's PlatformStats still aggregates its whole messages table.
 	var (
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time
 		freshnessValue    map[string]any
+		silenceBaselines  = silenceBaselineCache{}
 	)
+	// googleReachable reports whether the daemon can reach the phone right
+	// now: connected to Google, and the phone answering.
+	googleReachable := func() bool {
+		if !googlePhoneResponding() {
+			return false
+		}
+		if opts.GoogleStatus != nil {
+			if status, ok := opts.GoogleStatus().(app.GoogleStatusSnapshot); ok {
+				return status.Connected
+			}
+		}
+		return true
+	}
 	computeFreshness := func() map[string]any {
 		freshnessMu.Lock()
 		defer freshnessMu.Unlock()
 		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
 			return freshnessValue
 		}
-		stats, err := reads.PlatformStats()
+		stats, err := platformLatest(reads)
 		if err != nil {
-			return freshnessValue // keep last good value on error
+			// Keep the last good value on error, except the SMS path: it
+			// reads the inbox, not these stats, and a cached stall must not
+			// outlive the phone becoming unreachable or its history going
+			// stale.
+			return withFreshGoogleSMSPath(freshnessValue, opts.GoogleSMSPath, time.Now(), googleReachable)
 		}
 		var newest int64
 		for _, st := range stats {
@@ -262,11 +308,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				continue
 			}
 			behind := daysBehind(st.LatestMS, newest)
+			stale := st.LatestMS > 0 && behind >= staleDaysThreshold
 			entry := map[string]any{
 				"latest_ms":          st.LatestMS,
 				"latest_received_ms": st.LatestRecvMS,
 				"behind_days":        behind,
-				"stale":              st.LatestMS > 0 && behind >= staleDaysThreshold,
+				"stale":              stale,
+				"stale_reason":       staleReason(stale, false),
 			}
 			// sms + rcs both map to "google"; keep the freshest.
 			if existing, ok := out[key].(map[string]any); ok {
@@ -283,6 +331,15 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// receives nothing, and every per-platform row still looks fresh. Publish
 		// the per-platform gap so the divergence is observable (#155).
 		addProjectionLag(out, keyFor, store, reads, opts.V2Primary)
+		// The relative rule above cannot see a stall on the platform that
+		// carries the most traffic: it is the newest platform, so it is never
+		// "behind". Judge each platform's silence against its own baseline too
+		// (2026-10-06: Google ingest silent 38h with stale=false throughout).
+		addSilence(out, opts.Activity, silenceBaselines, freshnessValue, time.Now(), time.Local)
+		// A phone can lose carrier SMS while RCS keeps arriving over data
+		// (2026-10-03 to 10-07: 95 hours). Google stays the newest platform the
+		// whole time, so judge its SMS path on its own.
+		addGoogleSMSPath(out, opts.GoogleSMSPath, time.Now(), googleReachable)
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
@@ -303,6 +360,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				"enabled":     opts.V2IngestCounters != nil,
 				"per_account": v2IngestPerAccount,
 			},
+		}
+		if opts.V2 != nil && opts.V2.Service != nil {
+			// The dispatch loop's in-flight and abandoned transport calls: a
+			// send that never returns froze all sending for hours on
+			// 2026-10-20 while every other field here looked healthy.
+			payload["v2_dispatch"] = opts.V2.Service.DispatchHealth()
 		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
@@ -1980,9 +2043,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "v2 media not available", http.StatusServiceUnavailable)
 				return
 			}
-			if err := writeV2MessageMediaResponse(r.Context(), w, opts.V2, msgID); err != nil {
-				code, message := v1ErrorResponse(err)
-				httpError(w, message, code)
+			messageID, ordinal := parseV2MediaID(msgID)
+			if err := writeV2MessageMediaResponse(r, w, opts.V2, messageID, ordinal); err != nil {
+				writeMediaError(w, err)
 			}
 			return
 		}
@@ -2062,18 +2125,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		var req struct {
-			ConversationID string `json:"conversation_id"`
-			MessageID      string `json:"message_id"`
-			Emoji          string `json:"emoji"`
-			Action         string `json:"action"` // "add", "remove", "switch"; default "add"
-		}
+		var req reactionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
 		if req.MessageID == "" || req.Emoji == "" {
 			httpError(w, "message_id and emoji are required", 400)
+			return
+		}
+		if opts.V2Primary {
+			// The read API hands out v2 IDs here, which the legacy routing
+			// below cannot place: it tells platforms apart by ID prefix or a
+			// legacy-store lookup and falls back to Google Messages.
+			v1.react(w, r, req)
 			return
 		}
 		if isWhatsAppConversation(req.ConversationID) {
@@ -2137,6 +2202,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, transcriptsUnavailableInV2Primary, http.StatusConflict)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxTranscriptRequestBytes)
 		var req struct {
 			MessageID  string  `json:"message_id"`
@@ -2177,14 +2246,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "load message: "+err.Error(), 500)
 			return
 		}
-		if msg != nil {
-			publishMessages(msg.ConversationID)
-		}
-		writeJSON(w, map[string]any{
+		response := map[string]any{
 			"success":           true,
 			"message_id":        req.MessageID,
 			"transcript_length": utf8.RuneCountInString(*req.Transcript),
-		})
+		}
+		if msg != nil {
+			response["transcript_model"] = msg.TranscriptModel
+			publishMessages(msg.ConversationID)
+		}
+		writeJSON(w, response)
 	})
 
 	mux.HandleFunc("/api/new-conversation", func(w http.ResponseWriter, r *http.Request) {
@@ -2604,6 +2675,23 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		since, windowed, err := parseBackfillSince(r, time.Now())
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		if windowed {
+			if opts.StartWindowBackfill == nil {
+				httpError(w, "window backfill not available", 501)
+				return
+			}
+			if !opts.StartWindowBackfill(since) {
+				httpError(w, "a sync is already running — try again in a moment", 409)
+				return
+			}
+			writeJSON(w, map[string]string{"status": "started", "since": since.Format(time.RFC3339)})
 			return
 		}
 		if opts.StartDeepBackfill != nil {
@@ -3430,12 +3518,33 @@ func scheduledID() string {
 	return "sched:" + hex.EncodeToString(b)
 }
 
+// parseV2MediaID accepts either a v2 message ID (its first attachment) or
+// the media_id the read API reports for an attachment, v2msg:<message>:<n>.
+func parseV2MediaID(raw string) (string, int64) {
+	raw = strings.TrimSpace(raw)
+	rest, ok := strings.CutPrefix(raw, "v2msg:")
+	if !ok {
+		return raw, 0
+	}
+	cut := strings.LastIndexByte(rest, ':')
+	if cut <= 0 {
+		return rest, 0
+	}
+	ordinal, err := strconv.ParseInt(rest[cut+1:], 10, 64)
+	if err != nil || ordinal < 0 {
+		return raw, 0
+	}
+	return rest[:cut], ordinal
+}
+
 func writeV2MessageMediaResponse(
-	ctx context.Context,
+	r *http.Request,
 	w http.ResponseWriter,
 	v2 *V2Options,
 	messageID string,
+	ordinal int64,
 ) error {
+	ctx := r.Context()
 	messages, err := sqlite.NewMessageRepository(v2.V2Store, time.Now)
 	if err != nil {
 		return err
@@ -3447,7 +3556,7 @@ func writeV2MessageMediaResponse(
 	descriptor, err := v2.Media.Resolve(ctx, media.DownloadCommand{
 		AccountID: message.AccountID,
 		MessageID: message.MessageID,
-		Ordinal:   0,
+		Ordinal:   ordinal,
 	})
 	if err != nil {
 		return err
@@ -3457,7 +3566,7 @@ func writeV2MessageMediaResponse(
 		return err
 	}
 	defer reader.Close()
-	writeDescriptorMediaResponse(w, reader, descriptor)
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
 	return nil
 }
 
@@ -3664,6 +3773,9 @@ func googleAPIErrorMessage(action string, err error) string {
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
+	if app.IsGoogleAccountSwitchError(err) {
+		return "Google Messages on your phone switched to Google-account pairing and no longer answers this OpenMessage link. Re-pair OpenMessage, or switch the phone back to QR-code pairing."
+	}
 	return action + ": " + err.Error()
 }
 
@@ -3778,6 +3890,34 @@ func daysBehind(older, newer int64) int {
 // disagreement are normal; a real projection stall shows up as minutes.
 const projectionLagFloorMS = int64(5 * 60 * 1000)
 
+// platformLatestSource is implemented by read sources that report each
+// platform's newest message times without counting every message (v2read).
+type platformLatestSource interface {
+	PlatformLatest() ([]db.PlatformLatest, error)
+}
+
+// platformLatest returns each stored platform's newest sent/received times.
+// Freshness never reads the counts, so a v2 store answers with index seeks; the
+// legacy store has no such method and still runs its GROUP BY.
+func platformLatest(reads readsource.ReadSource) ([]db.PlatformLatest, error) {
+	if source, ok := reads.(platformLatestSource); ok {
+		return source.PlatformLatest()
+	}
+	stats, err := reads.PlatformStats()
+	if err != nil {
+		return nil, err
+	}
+	latest := make([]db.PlatformLatest, 0, len(stats))
+	for _, st := range stats {
+		latest = append(latest, db.PlatformLatest{
+			Platform:     st.Platform,
+			LatestMS:     st.LatestMS,
+			LatestRecvMS: st.LatestRecvMS,
+		})
+	}
+	return latest, nil
+}
+
 // addProjectionLag annotates each per-platform freshness entry with how far the
 // active read source trails the legacy store, and stamps a top-level
 // `projection_stalled` flag when any platform is behind. Only meaningful in
@@ -3849,4 +3989,188 @@ func addProjectionLag(
 		out[key] = entry
 	}
 	out["projection_stalled"] = stalled
+}
+
+// staleReason names why a freshness entry is stale. "behind" (the platform
+// trails the newest platform by staleDaysThreshold days) outranks "silent"
+// (the platform's own silence outlasts its baseline): a platform that is days
+// behind is usually logged out or unpaired, while a silent platform that is
+// still the newest one usually means the phone stopped relaying.
+func staleReason(behind, silent bool) string {
+	switch {
+	case behind:
+		return "behind"
+	case silent:
+		return "silent"
+	default:
+		return ""
+	}
+}
+
+// silenceBaselineCache keeps each platform's baseline event times keyed by
+// the baseline window they cover. The window depends only on the local date
+// of the last event, so a platform is re-judged every refresh, and two weeks of
+// history are read at most once a day per platform. Rows that land inside an
+// already-cached window later (a legacy backfill writes old timestamps) join
+// the baseline when the window next moves.
+type silenceBaselineCache map[string]silenceBaseline
+
+type silenceBaseline struct {
+	from   time.Time
+	to     time.Time
+	events []time.Time
+}
+
+// silenceQueryTimeout bounds the activity queries behind one status refresh.
+const silenceQueryTimeout = 5 * time.Second
+
+// addSilence annotates each per-platform freshness entry with a "silence"
+// block judging how long the platform has delivered nothing against its own
+// hour-of-day baseline (freshness.EvaluateSilence), folds a stall into
+// "stale"/"stale_reason", and stamps a top-level "silence_stalled" that is
+// true when some platform's stale_reason is "silent". A nil
+// source leaves the payload untouched. When a query fails, the platform keeps
+// the silence block from prev (the previous payload), marked
+// "carried_over", so a failing query cannot clear a stall that is still
+// going on.
+func addSilence(
+	out map[string]any,
+	source freshness.ActivitySource,
+	cache silenceBaselineCache,
+	prev map[string]any,
+	now time.Time,
+	loc *time.Location,
+) {
+	if source == nil || out == nil {
+		return
+	}
+	anyStalled := false
+	apply := func(platform string, block map[string]any, stalled bool) {
+		entry, ok := out[platform].(map[string]any)
+		if !ok {
+			entry = map[string]any{
+				"latest_ms":          int64(0),
+				"latest_received_ms": int64(0),
+				"behind_days":        0,
+				"stale":              false,
+			}
+		}
+		// Only the relative rule's verdict carries over; "stale" alone can't
+		// tell an entry made stale by the relative rule from one this function
+		// already marked.
+		behind := false
+		if reason, ok := entry["stale_reason"].(string); ok {
+			behind = reason == "behind"
+		} else {
+			behind, _ = entry["stale"].(bool)
+		}
+		entry["silence"] = block
+		entry["stale"] = behind || stalled
+		entry["stale_reason"] = staleReason(behind, stalled)
+		out[platform] = entry
+		// Only platforms whose stale reason ends up "silent" count: a
+		// platform already "behind" (often unpaired or logged out for weeks)
+		// would otherwise hold silence_stalled true forever.
+		if entry["stale_reason"] == "silent" {
+			anyStalled = true
+		}
+	}
+	cfg := freshness.DefaultSilenceConfig
+	// carry reuses the previous verdict for platform while its queries fail.
+	// With a known last event it only does so within the same silence
+	// episode: once a newer event has arrived, the old verdict (perhaps a
+	// stall) no longer describes it. A verdict judged without a baseline is
+	// never carried; it is cheap to judge again. The carried block's silence
+	// length is brought up to now and the length rules are applied to it
+	// again, so a failing query cannot hold a growing silence fresh.
+	carry := func(platform string, last time.Time) bool {
+		prevEntry, _ := prev[platform].(map[string]any)
+		block, _ := prevEntry["silence"].(map[string]any)
+		if block == nil || block["baseline_unavailable"] == true {
+			return false
+		}
+		prevLast, ok := block["last_event_ms"].(int64)
+		if !ok || (!last.IsZero() && prevLast != last.UnixMilli()) {
+			return false
+		}
+		carried := make(map[string]any, len(block)+1)
+		for key, value := range block {
+			carried[key] = value
+		}
+		carried["carried_over"] = true
+		silence := now.Sub(time.UnixMilli(prevLast))
+		if silence < 0 {
+			silence = 0
+		}
+		carried["silent_ms"] = silence.Milliseconds()
+		stalled, _ := block["stalled"].(bool)
+		if !stalled {
+			// Re-apply the length rules to the longer silence, from the
+			// baseline facts the block already holds.
+			activeDays, _ := block["baseline_active_days"].(int)
+			median, _ := block["baseline_median_daily_events"].(float64)
+			busy := activeDays > 0 && activeDays >= cfg.MinBusyDays && median >= cfg.MinEventsPerActiveDay
+			switch {
+			case busy && cfg.MaxSilence > 0 && silence >= cfg.MaxSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleMaxSilence
+			case cfg.LongSilence > 0 && silence >= cfg.LongSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleLongSilence
+			}
+			carried["stalled"] = stalled
+		}
+		apply(platform, carried, stalled)
+		return true
+	}
+
+	judge := func(platform string, last time.Time, events []time.Time, baselineUnavailable bool) {
+		verdict := freshness.EvaluateSilence(last, events, now, loc, cfg)
+		// Judged without a baseline (baselineUnavailable), only the
+		// LongSilence floor can fire. `openmessage status` renders its local
+		// verdicts with the same SilenceBlock.
+		block := freshness.SilenceBlock(source.Name(), verdict, cfg, baselineUnavailable)
+		apply(platform, block, verdict.Stalled)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
+	defer cancel()
+	latest, err := source.Latest(ctx)
+	if err != nil {
+		for platform := range prev {
+			if carry(platform, time.Time{}) {
+				continue
+			}
+			// A verdict judged without a baseline is judged again from its
+			// last event, so the LongSilence floor keeps working.
+			prevEntry, _ := prev[platform].(map[string]any)
+			block, _ := prevEntry["silence"].(map[string]any)
+			if prevLast, ok := block["last_event_ms"].(int64); ok {
+				judge(platform, time.UnixMilli(prevLast), nil, true)
+			}
+		}
+		out["silence_stalled"] = anyStalled
+		return
+	}
+	for platform, last := range latest {
+		from, to := freshness.BaselineRange(last, loc, cfg)
+		baseline, ok := cache[platform]
+		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
+			events, err := source.Between(ctx, platform, from, to)
+			switch {
+			case err == nil:
+				baseline = silenceBaseline{from: from, to: to, events: events}
+				if cache != nil {
+					cache[platform] = baseline
+				}
+			case carry(platform, last):
+				continue
+			default:
+				judge(platform, last, nil, true)
+				continue
+			}
+		}
+		judge(platform, last, baseline.events, false)
+	}
+	out["silence_stalled"] = anyStalled
 }

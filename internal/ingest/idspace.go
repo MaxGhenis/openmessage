@@ -152,7 +152,7 @@ func (w *Worker) googleConversationEventTarget(
 	if storedErr != nil && !errors.Is(storedErr, sqlite.ErrNotFound) {
 		return sqlite.Conversation{}, storedErr
 	}
-	eventPeers, err := w.resolveEventPeers(accountID, platform, event)
+	eventPeers, err := w.resolveEventPeers(accountID, platform, event, false)
 	if err != nil {
 		return sqlite.Conversation{}, err
 	}
@@ -247,6 +247,7 @@ func (w *Worker) resolveEventPeers(
 	accountID string,
 	platform bridge.Platform,
 	event bridge.ConversationEvent,
+	createOnly bool,
 ) ([]sqlite.Identity, error) {
 	peers := make([]sqlite.Identity, 0, len(event.Participants))
 	seen := make(map[string]struct{}, len(event.Participants))
@@ -254,7 +255,7 @@ func (w *Worker) resolveEventPeers(
 		if participant.Identity.IsSelf || identityRaw(participant.Identity) == "" {
 			continue
 		}
-		identity, err := w.resolveIdentity(accountID, platform, participant.Identity)
+		identity, err := w.resolveIdentityFor(accountID, platform, participant.Identity, createOnly)
 		if err != nil {
 			return nil, err
 		}

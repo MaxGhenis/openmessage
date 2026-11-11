@@ -500,6 +500,7 @@ type googleEchoHarness struct {
 	service   *messaging.MessageService
 	sink      *Sink
 	worker    *Worker
+	sender    *googleEchoTextSender
 	counters  *Counters
 	clock     *googleEchoClock
 	blobs     *blob.BlobStore
@@ -508,6 +509,17 @@ type googleEchoHarness struct {
 }
 
 func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarness {
+	t.Helper()
+	return newGoogleEchoHarnessWithObserver(t, decoder, nil)
+}
+
+// newGoogleEchoHarnessWithObserver lets a test hand the worker a different
+// echo observer built from the harness's service (nil keeps the service).
+func newGoogleEchoHarnessWithObserver(
+	t *testing.T,
+	decoder bridge.Decoder,
+	wrapObserver func(*messaging.MessageService) EchoObserver,
+) *googleEchoHarness {
 	t.Helper()
 	storePath := filepath.Join(t.TempDir(), "v2.sqlite3")
 	store, err := sqlite.Open(storePath)
@@ -543,11 +555,15 @@ func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarne
 	if decoder == nil {
 		decoder = NewGoogleDecoder(counters)
 	}
+	var echoObserver EchoObserver = service
+	if wrapObserver != nil {
+		echoObserver = wrapObserver(service)
+	}
 	worker, err := NewWorker(WorkerConfig{
 		Store:        store,
 		Messages:     messages,
 		Reactions:    reactions,
-		EchoObserver: service,
+		EchoObserver: echoObserver,
 		Counters:     counters,
 		Logger:       zerolog.Nop(),
 		Now:          clock.Now,
@@ -581,6 +597,7 @@ func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarne
 		service:   service,
 		sink:      sink,
 		worker:    worker,
+		sender:    sender,
 		counters:  counters,
 		clock:     clock,
 		blobs:     blobs,
@@ -723,7 +740,7 @@ func (h *googleEchoHarness) messageRecord(
 		DedupeKey:    "msg:" + message.GetMessageID() + ":" + hex.EncodeToString(hash[:])[:8],
 		Codec:        GoogleCodec,
 		CodecVersion: GoogleCodecVersion,
-		ReceivedAt:   googleEchoNow,
+		ReceivedAt:   h.clock.Now(),
 		Payload:      payload,
 	}
 }
@@ -854,12 +871,23 @@ func countSQLiteRows(t *testing.T, path, query string, args ...any) int {
 
 type googleEchoTextSender struct {
 	clock *googleEchoClock
+	// uncertain makes sends end with an unknown outcome, as a timed-out
+	// transport call does.
+	uncertain bool
 }
 
 func (s *googleEchoTextSender) SendText(
 	_ context.Context,
 	request bridge.TextRequest,
 ) (bridge.SendResult, error) {
+	if s.uncertain {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:     bridge.FailureTransient,
+			Operation: "send_text",
+			Dispatch:  bridge.DispatchUncertain,
+			Cause:     errors.New("transport call timed out"),
+		}
+	}
 	return bridge.SendResult{
 		RemoteMessageID: request.RequestID,
 		AcceptedAt:      s.clock.Now(),

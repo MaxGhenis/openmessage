@@ -7,6 +7,7 @@
 # Build:   docker build -t openmessage .
 # Run:     docker run -p 7007:7007 -v openmessage-data:/data openmessage
 # Pair:    docker exec -it <container> openmessage pair
+#          (to re-pair, stop the container and run pair in a fresh one with the same volume)
 # Connect: claude mcp add -s user --transport sse openmessage http://<host>:7007/mcp/sse
 
 FROM golang:1.25-alpine AS build

@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/whatsapplid"
 	"github.com/maxghenis/openmessage/internal/whatsappmedia"
 
 	_ "modernc.org/sqlite"
@@ -38,6 +40,10 @@ type WhatsAppNative struct {
 	// SinceMS limits import to messages after this Unix millisecond timestamp.
 	// When zero, imports everything.
 	SinceMS int64
+
+	// lids pairs LIDs with phone numbers from Desktop's own records, so a LID
+	// sender is stored by its number when Desktop knows it (address).
+	lids *whatsapplid.Evidence
 }
 
 type MediaRepairResult struct {
@@ -77,6 +83,14 @@ func (w *WhatsAppNative) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	waDB.SetMaxOpenConns(1)
 
 	result := &ImportResult{}
+
+	// Desktop pairs many LIDs with numbers (chat and member contact
+	// identifiers, LID.sqlite). The pairs only refine how a LID is stored, so
+	// an unreadable source leaves those LIDs stored as LIDs.
+	w.lids = whatsapplid.NewEvidence()
+	var skipped []string
+	_, _ = whatsapplid.ReadDesktopDB(context.Background(), waDB, w.lids, false, &skipped)
+	whatsapplid.ReadDesktopLIDPairs(context.Background(), whatsapplid.DesktopLIDPath(dbPath), w.lids)
 
 	chats, err := w.loadChats(waDB)
 	if err != nil {
@@ -313,9 +327,8 @@ func (w *WhatsAppNative) loadChats(waDB *sql.DB) ([]waChat, error) {
 				}
 			}
 		} else {
-			phone := jidToPhone(c.jid)
 			c.participants = []map[string]string{
-				{"name": c.name, "number": phone},
+				{"name": c.name, "number": w.address(c.jid)},
 			}
 			if c.name == "" {
 				c.name = c.jid
@@ -343,13 +356,15 @@ func (w *WhatsAppNative) loadGroupMembers(waDB *sql.DB, chatPK int) []map[string
 		if err := rows.Scan(&jid, &name); err != nil {
 			continue
 		}
-		phone := jidToPhone(jid)
-		if name == "" {
-			name = phone
+		number := w.address(jid)
+		if name == "" && strings.HasPrefix(number, "+") {
+			// A number reads as a name only when it is one; a LID's JID
+			// would pass deriveGroupName's phone-number check as a name.
+			name = number
 		}
 		participants = append(participants, map[string]string{
 			"name":   name,
-			"number": phone,
+			"number": number,
 		})
 	}
 	return participants
@@ -408,11 +423,11 @@ func (w *WhatsAppNative) loadMessages(waDB *sql.DB, chatPK int, chatName string,
 		} else if !isGroup {
 			// 1:1 chat: sender is the chat partner
 			m.senderName = chatName
-			m.senderNumber = jidToPhone(fromJID)
+			m.senderNumber = w.address(fromJID)
 		} else {
 			// Group chat: use fromJID as identifier
 			// Push names are encrypted in modern WhatsApp, so use JID-based phone
-			m.senderNumber = jidToPhone(fromJID)
+			m.senderNumber = w.address(fromJID)
 			m.senderName = m.senderNumber
 			if m.senderName == "" {
 				m.senderName = fromJID
@@ -429,27 +444,15 @@ func coreDataSecsToMS(secs float64) int64 {
 	return int64((secs + float64(coreDataEpoch)) * 1000)
 }
 
-// jidToPhone extracts a phone number from a WhatsApp JID.
-// e.g., "18312972255@s.whatsapp.net" → "+18312972255"
-func jidToPhone(jid string) string {
-	if jid == "" {
-		return ""
-	}
-	parts := strings.Split(jid, "@")
-	if len(parts) == 0 {
-		return ""
-	}
-	num := parts[0]
-	// Only convert numeric JIDs (skip LID format like "12345@lid")
-	for _, c := range num {
-		if c < '0' || c > '9' {
-			return ""
-		}
-	}
-	if num != "" {
-		return "+" + num
-	}
-	return ""
+// address returns the form a sender or chat peer is stored by: the phone
+// number of a phone-number JID ("18312972255@s.whatsapp.net" →
+// "+18312972255"), the number Desktop pairs a LID with, or the LID itself
+// ("12345@lid"), as the live bridge and v2 ingest store a LID whose number is
+// unknown. Only a phone-number JID names a phone number: a LID's digits stored
+// as "+<digits>" pass for one (whatsapplid). Other JIDs (groups, broadcast
+// lists) give "".
+func (w *WhatsAppNative) address(jid string) string {
+	return w.lids.Address(jid)
 }
 
 // isRawGroupJIDName reports whether name appears to be a raw WhatsApp group JID

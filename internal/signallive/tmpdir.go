@@ -1,12 +1,18 @@
 package signallive
 
 import (
+	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -20,7 +26,8 @@ import (
 //
 //  1. Every invocation runs with TMPDIR/java.io.tmpdir pointed at a private
 //     per-run directory under signalTmpRoot(), removed as soon as the
-//     process exits — no accumulation by construction.
+//     process exits — no accumulation by construction. The native build
+//     takes java.io.tmpdir only as an argument (signalCLITmpDirArgs).
 //  2. signalTmpRoot() is swept at startup and periodically for entries old
 //     enough that no live invocation can still own them (crash backstop).
 //  3. A one-time sweep of the system temp dir removes libsignal* dirs
@@ -30,8 +37,9 @@ import (
 const (
 	// signalRunTmpMaxAge must exceed the longest legitimate signal-cli run.
 	// Receive polls finish in seconds and sends within sendTimeout, but a
-	// `link` session can stay open while the user fetches their phone, so
-	// keep a generous margin.
+	// receive call can be drained for receiveDrain.limit and a `link`
+	// session can stay open while the user fetches their phone, so keep a
+	// generous margin. It also gates the attachments/*.tmp sweep.
 	signalRunTmpMaxAge = 30 * time.Minute
 
 	signalTmpSweepInterval = 10 * time.Minute
@@ -91,6 +99,96 @@ func signalCLIEnv(base []string, dir string) []string {
 	return append(env, "TMPDIR="+dir, "SIGNAL_CLI_OPTS="+opts)
 }
 
+// signalCLITmpDirArgs points java.io.tmpdir at dir for a native signal-cli.
+// Homebrew ships signal-cli as a GraalVM native image, which reads neither
+// SIGNAL_CLI_OPTS (a variable of the JVM start script) nor TMPDIR: on macOS
+// it takes java.io.tmpdir from the per-user Darwin temp dir. It does honor a
+// leading -Djava.io.tmpdir argument (0.14.9, checked 2026-10-21: libsignal
+// was extracted into the given dir and removed on a graceful exit). Only a
+// native executable gets it, and only once a --version run with the argument
+// has succeeded: that is the build it was checked against, a JVM install
+// takes java.io.tmpdir from SIGNAL_CLI_OPTS (signalCLIEnv), and a compiled
+// wrapper around a JVM install would pass the argument to signal-cli's own
+// parser.
+func signalCLITmpDirArgs(executable, dir string) []string {
+	if dir == "" || !acceptsTmpDirArg(executable) {
+		return nil
+	}
+	return []string{"-Djava.io.tmpdir=" + dir}
+}
+
+// tmpDirArgSupport caches acceptsTmpDirArg per executable path, size and
+// modification time, so an upgraded signal-cli is checked again.
+var tmpDirArgSupport sync.Map
+
+func acceptsTmpDirArg(executable string) bool {
+	info, err := os.Stat(executable)
+	if err != nil {
+		return false
+	}
+	key := fmt.Sprintf("%s|%d|%d", executable, info.Size(), info.ModTime().UnixNano())
+	if supported, ok := tmpDirArgSupport.Load(key); ok {
+		return supported.(bool)
+	}
+	if !isNativeExecutable(executable) {
+		tmpDirArgSupport.Store(key, false)
+		return false
+	}
+	supported, settled := probeTmpDirArg(executable)
+	if settled {
+		tmpDirArgSupport.Store(key, supported)
+	}
+	return supported
+}
+
+// probeTmpDirArg runs `<executable> -Djava.io.tmpdir=<dir> --version`, which
+// reads no config dir, and reports whether the binary took the argument.
+// settled is false when the run itself failed to happen (no temp dir, a
+// timeout, a failed start), so the next call probes again. Swapped by tests.
+var probeTmpDirArg = func(executable string) (supported, settled bool) {
+	if err := os.MkdirAll(signalTmpRoot(), 0o700); err != nil {
+		return false, false
+	}
+	dir, err := os.MkdirTemp(signalTmpRoot(), "probe-")
+	if err != nil {
+		return false, false
+	}
+	defer os.RemoveAll(dir)
+	ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "-Djava.io.tmpdir="+dir, "--version")
+	cmd.Env = signalCLIEnv(os.Environ(), dir)
+	configureSignalCancel(cmd)
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if err != nil && (ctx.Err() != nil || !errors.As(err, &exitErr)) {
+		return false, false
+	}
+	_, versioned := parseSignalCLIVersion(output)
+	return err == nil && versioned, true
+}
+
+// isNativeExecutable reports whether path is a Mach-O or ELF binary rather
+// than a script.
+func isNativeExecutable(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(file, magic[:]); err != nil {
+		return false
+	}
+	switch binary.BigEndian.Uint32(magic[:]) {
+	case 0x7f454c46, // ELF
+		0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe, // Mach-O, 32 and 64 bit, either byte order
+		0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca: // universal Mach-O, 32 and 64 bit
+		return true
+	}
+	return false
+}
+
 func signalTmpSweepDisabled() bool {
 	return strings.TrimSpace(os.Getenv(signalTmpSweepEnvVar)) == "0"
 }
@@ -128,6 +226,46 @@ func sweepLegacyLibsignalTemp(logger zerolog.Logger) {
 			Int("dirs", removed).
 			Str("reclaimed", humanBytes(bytes)).
 			Msg("Removed libsignal temp dirs leaked by earlier versions (see issue #27)")
+	}
+}
+
+// sweepSignalAttachmentTemps removes the <name>.<digits>.tmp files a killed
+// receive call leaves in signal-cli's attachments dir. signal-cli creates
+// one when an attachment download starts and deletes it in a finally block
+// that a SIGKILL skips; nothing removes it after that. maxAge must exceed the
+// longest receive call, which runs with the bridge's command gate held while
+// this sweep does not.
+func sweepSignalAttachmentTemps(logger zerolog.Logger, configDir string, maxAge time.Duration) {
+	if signalTmpSweepDisabled() || configDir == "" {
+		return
+	}
+	dir := filepath.Join(configDir, "attachments")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := now().Add(-maxAge)
+	removed := 0
+	var reclaimed int64
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !isSignalAttachmentTemp(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+			continue
+		}
+		removed++
+		reclaimed += info.Size()
+	}
+	if removed > 0 {
+		logger.Info().
+			Int("files", removed).
+			Str("reclaimed", humanBytes(reclaimed)).
+			Msg("Swept partial Signal attachment files left by killed receive calls")
 	}
 }
 

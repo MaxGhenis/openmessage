@@ -6,7 +6,6 @@ package google
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -48,6 +47,10 @@ type Adapter struct {
 	starting bool
 
 	ingressErrors atomic.Uint64
+
+	// silence holds Google intents while the phone is not answering them
+	// (phone_silence.go).
+	silence phoneSilence
 }
 
 func New(accountID string, host *app.App, canRepair func() bool) *Adapter {
@@ -169,26 +172,31 @@ func (a *Adapter) Start(
 			Cause:       errors.New("Google client factory returned a nil client"),
 		}
 	}
-	generation := a.host.BeginGoogleGeneration(legacy)
 	r := &run{
-		adapter:    a,
-		request:    req,
-		sink:       sink,
-		transport:  transport,
-		generation: generation,
-		ready:      make(chan struct{}),
-		done:       make(chan error, 1),
-		stopped:    make(chan struct{}),
-		finish:     make(chan error, 1),
-		activity:   make(chan struct{}),
-		admitting:  true,
+		adapter:   a,
+		request:   req,
+		sink:      sink,
+		transport: transport,
+		ready:     make(chan struct{}),
+		done:      make(chan error, 1),
+		stopped:   make(chan struct{}),
+		finish:    make(chan error, 1),
+		activity:  make(chan struct{}),
+		admitting: true,
 	}
+	// Catch-ups that fetch with this generation's client hand their history to
+	// this run, which commits it under this generation's fence.
+	r.generation = a.host.BeginGoogleGenerationWithHistory(legacy, r)
+	generation := r.generation
 	transport.SetEventHandler(r.handleEvent)
 	a.mu.Lock()
 	a.current = r
 	a.starting = false
 	installed = true
 	a.mu.Unlock()
+	// A new client may well reach a phone the old one could not; don't hold
+	// its first sends for the rest of the old probe window.
+	a.phoneRecovered("new_generation")
 
 	if err := transport.Connect(); err != nil {
 		failure := a.classifyTransportError(err, "connect", "connect_failed")
@@ -527,32 +535,16 @@ func (r *run) teeIngress(evt any, receivedAt time.Time) {
 	var err error
 	switch event := evt.(type) {
 	case *libgm.WrappedMessage:
-		var payload, protoBytes []byte
-		payload, protoBytes, err = ingest.MarshalGoogleMessageFrame(event)
+		var record bridge.RawIngressRecord
+		record, err = ingest.GoogleMessageRecord(r.request.AccountID, r.request.Generation, event, receivedAt)
 		if err == nil {
-			err = r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
-				AccountID:    r.request.AccountID,
-				Generation:   r.request.Generation,
-				DedupeKey:    googleIngressDedupeKey("msg", event.GetMessageID(), protoBytes),
-				Codec:        ingest.GoogleCodec,
-				CodecVersion: ingest.GoogleCodecVersion,
-				ReceivedAt:   receivedAt,
-				Payload:      payload,
-			})
+			err = r.sink.AppendIngress(context.Background(), record)
 		}
 	case *gmproto.Conversation:
-		var payload, protoBytes []byte
-		payload, protoBytes, err = ingest.MarshalGoogleConversationFrame(event)
+		var record bridge.RawIngressRecord
+		record, err = ingest.GoogleConversationRecord(r.request.AccountID, r.request.Generation, event, receivedAt)
 		if err == nil {
-			err = r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
-				AccountID:    r.request.AccountID,
-				Generation:   r.request.Generation,
-				DedupeKey:    googleIngressDedupeKey("conv", event.GetConversationID(), protoBytes),
-				Codec:        ingest.GoogleCodec,
-				CodecVersion: ingest.GoogleCodecVersion,
-				ReceivedAt:   receivedAt,
-				Payload:      payload,
-			})
+			err = r.sink.AppendIngress(context.Background(), record)
 		}
 	case *gmproto.TypingData:
 		number := event.GetUser().GetNumber()
@@ -590,9 +582,76 @@ func (r *run) recordIngressError(evt any, err error) {
 		Msg("Google ingest tee failed; continuing legacy event handling")
 }
 
-func googleIngressDedupeKey(kind, remoteID string, protoBytes []byte) string {
-	digest := sha256.Sum256(protoBytes)
-	return fmt.Sprintf("%s:%s:%x", kind, remoteID, digest[:4])
+// AppendHistoryConversation commits one conversation a catch-up listed with
+// this generation's client, as a history frame (app.GoogleHistoryIngress).
+func (r *run) AppendHistoryConversation(ctx context.Context, conversation *gmproto.Conversation) error {
+	return r.appendHistory(ctx, func(receivedAt time.Time) (bridge.RawIngressRecord, error) {
+		return ingest.GoogleHistoryConversationRecord(
+			r.request.AccountID,
+			r.request.Generation,
+			conversation,
+			receivedAt,
+		)
+	})
+}
+
+// AppendHistoryMessage commits one message a catch-up fetched from
+// conversationID with this generation's client, as a history frame carrying
+// the conversation snapshot it was fetched under (app.GoogleHistoryIngress).
+func (r *run) AppendHistoryMessage(
+	ctx context.Context,
+	conversationID string,
+	conversation *gmproto.Conversation,
+	message *gmproto.Message,
+) error {
+	return r.appendHistory(ctx, func(receivedAt time.Time) (bridge.RawIngressRecord, error) {
+		return ingest.GoogleHistoryMessageRecord(
+			r.request.AccountID,
+			r.request.Generation,
+			conversationID,
+			conversation,
+			message,
+			receivedAt,
+		)
+	})
+}
+
+// appendHistory admits the hand-off like a libgm callback, so Stop joins it
+// and nothing commits once the generation has closed admission; the supervisor
+// fence rejects a late commit again. History goes through the sink's history
+// path, which records no connection activity.
+func (r *run) appendHistory(
+	ctx context.Context,
+	build func(time.Time) (bridge.RawIngressRecord, error),
+) error {
+	if ctx == nil {
+		return errors.New("google history: nil context")
+	}
+	if !r.admitCallback() {
+		return fmt.Errorf("google generation %d ended: %w", r.request.Generation, app.ErrGoogleHistoryClosed)
+	}
+	defer r.callbacks.Done()
+	if r.sink == nil {
+		return nil
+	}
+	history, ok := r.sink.(bridge.HistoryIngressSink)
+	if !ok {
+		return bridge.ErrHistoryIngressMissing
+	}
+	record, err := build(time.Now())
+	if err != nil {
+		return err
+	}
+	if err := history.AppendHistoryIngress(ctx, record); err != nil {
+		if errors.Is(err, bridge.ErrStaleGeneration) {
+			return fmt.Errorf("google generation %d retired: %w: %w", r.request.Generation, app.ErrGoogleHistoryClosed, err)
+		}
+		if errors.Is(err, bridge.ErrHistoryIngressDisabled) {
+			return fmt.Errorf("%w: %w", app.ErrGoogleHistoryDisabled, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *run) classifyEvent(evt any) (bridge.OpError, bool) {
@@ -614,6 +673,14 @@ func (r *run) classifyEvent(evt any) (bridge.OpError, bool) {
 			Cause:       errors.New("Google account logged out server-side"),
 		}, true
 	case *events.PingFailed:
+		// A ping (or set-active-session) rejected with HTTP 401 means Google
+		// no longer accepts the session cookies. That is one answer, not a
+		// flaky phone: route it to credential repair now. Waiting for three
+		// failures kept SMS dead for minutes, then spent a transient reconnect
+		// only to learn the same thing from the new generation's long poll.
+		if app.IsGoogleAuthExpiredError(event.Error) {
+			return r.adapter.classifyTransportError(event.Error, "ping", "google_ping_auth_expired"), true
+		}
 		if event.ErrorCount >= 3 {
 			return bridge.OpError{
 				Class:       bridge.FailureTransient,
@@ -678,6 +745,9 @@ func (r *run) recordActivity(evt any, at time.Time, detail string) {
 		r.phoneNotResponding = true
 	case *events.PhoneRespondingAgain:
 		r.phoneNotResponding = false
+		// libgm's pinger got an answer: release intents held while the phone
+		// was silent instead of waiting out the probe window.
+		r.adapter.phoneRecovered("phone_responding_again")
 	}
 	close(r.activity)
 	r.activity = make(chan struct{})
@@ -706,4 +776,5 @@ var (
 	_ bridge.Adapter            = (*Adapter)(nil)
 	_ bridge.CapabilityDeclarer = (*Adapter)(nil)
 	_ bridge.Run                = (*run)(nil)
+	_ app.GoogleHistoryIngress  = (*run)(nil)
 )

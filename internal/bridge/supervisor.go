@@ -22,6 +22,8 @@ var (
 	ErrSupervisorBusy          = errors.New("bridge: supervisor is busy")
 	ErrSupervisorBlocked       = errors.New("bridge: supervisor is blocked")
 	ErrStaleGeneration         = errors.New("bridge: stale connection generation")
+	ErrHistoryIngressMissing   = errors.New("bridge: connection sink cannot accept history ingress")
+	ErrHistoryIngressDisabled  = errors.New("bridge: no ingest sink is configured for history")
 	ErrAccountMismatch         = errors.New("bridge: account does not match supervisor")
 	ErrPairerUnavailable       = errors.New("bridge: pairing is unavailable")
 	ErrPairingInProgress       = errors.New("bridge: pairing is already in progress")
@@ -29,6 +31,7 @@ var (
 	ErrPairingRateLimited      = errors.New("bridge: pairing is temporarily rate limited")
 	ErrFingerprintUnchanged    = errors.New("bridge: input fingerprint is unchanged")
 	ErrCredentialRepairMissing = errors.New("bridge: credential repair is unavailable")
+	ErrNoRepairScheduled       = errors.New("bridge: no credential repair retry is scheduled")
 )
 
 // Timer is the stoppable one-shot timer used by Supervisor. Implementations
@@ -76,7 +79,14 @@ type supervisorOptions struct {
 	repairer     CredentialRepairer
 	pairer       Pairer
 	initialState State
+	observer     SnapshotObserver
 }
+
+// SnapshotObserver is told about published changes of State, Generation,
+// BlockReason, or the credential-repair fields, with the snapshots before and
+// after. It runs on the supervisor's run loop: it must return quickly and must
+// not call back into the supervisor. A panic in it is recovered and ignored.
+type SnapshotObserver func(previous, current Snapshot)
 
 // WithConnectionSink supplies the durable/ephemeral sink behind the
 // generation fence. A nil sink is allowed and records only liveness facts.
@@ -91,6 +101,15 @@ func WithConnectionSink(sink ConnectionSink) SupervisorOption {
 func WithCredentialRepairer(repairer CredentialRepairer) SupervisorOption {
 	return func(options *supervisorOptions) error {
 		options.repairer = repairer
+		return nil
+	}
+}
+
+// WithSnapshotObserver installs an observer for supervisor transitions, such
+// as a logger of repair attempts and their results.
+func WithSnapshotObserver(observer SnapshotObserver) SupervisorOption {
+	return func(options *supervisorOptions) error {
+		options.observer = observer
 		return nil
 	}
 }
@@ -123,6 +142,7 @@ const (
 	commandInputsChanged
 	commandBeginPairing
 	commandSync
+	commandRetryRepair
 )
 
 type supervisorCommand struct {
@@ -143,6 +163,7 @@ const (
 	timerBackoff
 	timerProbeDeadline
 	timerPairExpiry
+	timerRepairRetry
 )
 
 type activityKind uint8
@@ -198,6 +219,7 @@ type Supervisor struct {
 	sink      ConnectionSink
 	repairer  CredentialRepairer
 	pairer    Pairer
+	observer  SnapshotObserver
 
 	commands      chan supervisorCommand
 	activity      chan generationActivity
@@ -273,6 +295,7 @@ func NewSupervisor(
 		sink:          nilIfTypedNil[ConnectionSink](configuration.sink),
 		repairer:      nilIfTypedNil[CredentialRepairer](configuration.repairer),
 		pairer:        nilIfTypedNil[Pairer](configuration.pairer),
+		observer:      configuration.observer,
 		commands:      make(chan supervisorCommand),
 		activity:      make(chan generationActivity, 256),
 		stopRequested: make(chan struct{}),
@@ -305,6 +328,15 @@ func (s *Supervisor) Start(ctx context.Context, request StartRequest) error {
 // credential repair is retried atomically; it is never bypassed by reconnect.
 func (s *Supervisor) RetryBlocked(ctx context.Context) error {
 	return s.sendCommand(ctx, supervisorCommand{kind: commandRetryBlocked})
+}
+
+// RetryCredentialRepairNow starts a scheduled credential-repair retry now,
+// for example when the user presses Reconnect while a failed repair waits out
+// its backoff. The repairer's own pacing still applies. It returns
+// ErrSupervisorBusy while a repair attempt is running and ErrNoRepairScheduled
+// when no retry is waiting.
+func (s *Supervisor) RetryCredentialRepairNow(ctx context.Context) error {
+	return s.sendCommand(ctx, supervisorCommand{kind: commandRetryRepair})
 }
 
 // InputsChanged exits StateBlocked only when the supplied credential, binary,
@@ -566,6 +598,18 @@ func (l *supervisorLoop) handleCommand(command supervisorCommand) error {
 			return nil
 		}
 		return l.startAndDeferReply(command.response)
+	case commandRetryRepair:
+		if l.snapshot.State != StateRepairingCredentials {
+			return fmt.Errorf("%w: state %q", ErrNoRepairScheduled, l.snapshot.State)
+		}
+		if l.repairResults != nil {
+			return fmt.Errorf("%w: a credential repair is running", ErrSupervisorBusy)
+		}
+		if l.timerPurpose != timerRepairRetry {
+			return ErrNoRepairScheduled
+		}
+		l.beginCredentialRepair(l.lastFailure)
+		return nil
 	case commandBeginPairing:
 		return l.beginPairing(command.pair, command.pairSink)
 	case commandSync:
@@ -915,20 +959,30 @@ func (l *supervisorLoop) handleProbeResult(result probeResult) {
 	l.scheduleLivenessCheck()
 }
 
+// beginCredentialRepair starts one repair attempt for failure. It is the only
+// way into a repair, whether for a new expiry, a scheduled retry, or a user
+// retry, so every attempt is counted and timestamped here.
 func (l *supervisorLoop) beginCredentialRepair(failure OpError) {
 	l.clearTimer()
 	l.snapshot.State = StateRepairingCredentials
 	l.snapshot.RetryAt = time.Time{}
 	l.snapshot.ErrorClass = failure.Class
 	l.snapshot.ErrorFingerprint = failure.Fingerprint
+	l.snapshot.RepairAttempts++
+	l.snapshot.LastRepairStartedAt = l.supervisor.clock.Now()
+	l.snapshot.LastRepairFinishedAt = time.Time{}
+	l.snapshot.LastRepairOutcome = RepairOutcomeRunning
+	l.snapshot.LastRepairError = ""
 	l.lastFailure = failure
 	l.repairFailed = false
 	l.publish()
 
 	if l.supervisor.repairer == nil {
 		l.repairFailed = true
-		l.snapshot.State = StateBlocked
-		l.publish()
+		l.snapshot.LastRepairFinishedAt = l.snapshot.LastRepairStartedAt
+		l.snapshot.LastRepairOutcome = RepairOutcomeBlocked
+		l.snapshot.LastRepairError = ErrCredentialRepairMissing.Error()
+		l.block(BlockReasonRepairUnavailable)
 		return
 	}
 
@@ -960,15 +1014,99 @@ func (l *supervisorLoop) handleRepairResult(result repairResult) {
 	if l.snapshot.State != StateRepairingCredentials {
 		return
 	}
-	if result.err != nil {
-		l.repairFailed = true
-		l.snapshot.State = StateBlocked
-		l.publish()
+	now := l.supervisor.clock.Now()
+	l.snapshot.LastRepairFinishedAt = now
+	if result.err == nil {
+		l.repairFailed = false
+		l.snapshot.RepairFailures = 0
+		l.snapshot.LastRepairOutcome = RepairOutcomeSucceeded
+		_ = l.startGeneration()
 		return
 	}
 
-	l.repairFailed = false
-	_ = l.startGeneration()
+	// A failed repair never starts a generation. Only a terminal failure parks
+	// the account; anything else (a Chrome, keychain, or file hiccup, a
+	// timeout) is retried with backoff, so an expired cookie can't strand the
+	// account until a human restarts the app.
+	l.repairFailed = true
+	l.snapshot.LastRepairError = repairErrorText(result.err)
+	failure := classifyFailure(result.err, "repair", "credential_repair_failed")
+	if terminalRepairFailure(failure.Class) {
+		l.snapshot.LastRepairOutcome = RepairOutcomeBlocked
+		l.block(BlockReasonRepairFailed)
+		return
+	}
+	l.snapshot.RepairFailures++
+	delay, err := l.repairRetryDelay()
+	if err != nil {
+		l.snapshot.LastRepairOutcome = RepairOutcomeBlocked
+		l.snapshot.ErrorClass = FailureMisconfigured
+		l.snapshot.ErrorFingerprint = "invalid_jitter_source"
+		l.block(BlockReasonInvalidJitter)
+		return
+	}
+	l.snapshot.LastRepairOutcome = RepairOutcomeRetrying
+	l.snapshot.RetryAt = now.Add(delay)
+	l.replaceTimer(timerRepairRetry, l.snapshot.RetryAt)
+	l.publish()
+}
+
+// terminalRepairFailure reports whether a repair error means no automatic
+// repair can succeed, such as no refresh mechanism or a dead session.
+func terminalRepairFailure(class FailureClass) bool {
+	switch class {
+	case FailureUnpaired, FailureReauthRequired, FailureUpgradeRequired,
+		FailureMisconfigured, FailureUnsupported:
+		return true
+	default:
+		return false
+	}
+}
+
+// repairRetryDelay draws the wait before the next repair attempt: at least
+// the floor, then full jitter over an exponential window that doubles per
+// consecutive failure, capped at max(MaxBackoff, floor).
+func (l *supervisorLoop) repairRetryDelay() (time.Duration, error) {
+	policy := l.supervisor.policy
+	floor := policy.RepairRetryFloor
+	if floor <= 0 {
+		floor = policy.MinBackoff
+	}
+	maximum := policy.MaxBackoff
+	if maximum < floor {
+		maximum = floor
+	}
+	window := backoffCap(floor, maximum, l.snapshot.RepairFailures)
+	if window <= floor {
+		return floor, nil
+	}
+	extra, err := l.drawJitter(window - floor)
+	if err != nil {
+		return 0, err
+	}
+	return floor + extra, nil
+}
+
+// maxRepairErrorText bounds the repair error kept in snapshots and status.
+const maxRepairErrorText = 512
+
+func repairErrorText(err error) string {
+	text := strings.TrimSpace(err.Error())
+	if len(text) > maxRepairErrorText {
+		// ToValidUTF8 drops a rune the cut split in two.
+		text = strings.ToValidUTF8(text[:maxRepairErrorText], "") + "…"
+	}
+	return text
+}
+
+// block parks the supervisor in StateBlocked for reason. Leaving Blocked
+// clears the reason (publish).
+func (l *supervisorLoop) block(reason string) {
+	l.clearTimer()
+	l.snapshot.State = StateBlocked
+	l.snapshot.BlockReason = reason
+	l.snapshot.RetryAt = time.Time{}
+	l.publish()
 }
 
 func (l *supervisorLoop) beginPairing(request PairRequest, sink PairSink) error {
@@ -1116,6 +1254,7 @@ func (l *supervisorLoop) handlePairResult(result pairingResult) {
 		l.snapshot.RetryAt = failure.RetryAt
 	case FailureReauthRequired, FailureUpgradeRequired, FailureMisconfigured, FailureUnsupported:
 		l.snapshot.State = StateBlocked
+		l.snapshot.BlockReason = BlockReasonPairFailed
 	default:
 		l.snapshot.State = StateUnpaired
 	}
@@ -1149,8 +1288,7 @@ func (l *supervisorLoop) routeFailure(failure OpError) {
 	}
 
 	if l.recordFingerprint(failure.Class, failure.Fingerprint) {
-		l.snapshot.State = StateBlocked
-		l.publish()
+		l.block(BlockReasonRepeatedFailure)
 		return
 	}
 
@@ -1164,10 +1302,9 @@ func (l *supervisorLoop) routeFailure(failure OpError) {
 		)
 		delay, err := l.drawJitter(cap)
 		if err != nil {
-			l.snapshot.State = StateBlocked
 			l.snapshot.ErrorClass = FailureMisconfigured
 			l.snapshot.ErrorFingerprint = "invalid_jitter_source"
-			l.publish()
+			l.block(BlockReasonInvalidJitter)
 			return
 		}
 		l.snapshot.State = StateBackoff
@@ -1186,8 +1323,7 @@ func (l *supervisorLoop) routeFailure(failure OpError) {
 	case FailureCredentialsExpired:
 		l.beginCredentialRepair(failure)
 	case FailureReauthRequired, FailureUpgradeRequired, FailureMisconfigured, FailureUnsupported:
-		l.snapshot.State = StateBlocked
-		l.publish()
+		l.block(BlockReasonTerminalFailure)
 	}
 }
 
@@ -1218,6 +1354,8 @@ func (l *supervisorLoop) resetFailureHistory() {
 	l.sameFingerprint = ""
 	l.sameFailureCount = 0
 	l.repairFailed = false
+	l.snapshot.RepairFailures = 0
+	l.snapshot.RepairAttempts = 0
 	l.lastFailure = OpError{}
 	l.snapshot.RetryAt = time.Time{}
 	l.snapshot.ErrorClass = ""
@@ -1275,6 +1413,11 @@ func (l *supervisorLoop) enforceDueDeadline() bool {
 		if l.pairActive && !l.pairExpiresAt.IsZero() &&
 			!l.supervisor.clock.Now().Before(l.pairExpiresAt) {
 			l.expirePairing()
+		}
+	case timerRepairRetry:
+		if l.snapshot.State == StateRepairingCredentials && l.repairResults == nil &&
+			!l.supervisor.closing.Load() {
+			l.beginCredentialRepair(l.lastFailure)
 		}
 	}
 	return true
@@ -1406,9 +1549,34 @@ func (l *supervisorLoop) shutdown() error {
 }
 
 func (l *supervisorLoop) publish() {
+	if l.snapshot.State != StateBlocked {
+		l.snapshot.BlockReason = ""
+	}
 	l.supervisor.snapshotMu.Lock()
+	previous := l.supervisor.snapshot
 	l.supervisor.snapshot = l.snapshot
 	l.supervisor.snapshotMu.Unlock()
+	if l.supervisor.observer != nil && snapshotTransitioned(previous, l.snapshot) {
+		callSnapshotObserver(l.supervisor.observer, previous, l.snapshot)
+	}
+}
+
+// snapshotTransitioned reports a change worth telling an observer about:
+// lifecycle state and the repair record, not liveness bookkeeping.
+func snapshotTransitioned(previous, current Snapshot) bool {
+	return previous.State != current.State ||
+		previous.Generation != current.Generation ||
+		previous.BlockReason != current.BlockReason ||
+		previous.RepairAttempts != current.RepairAttempts ||
+		previous.RepairFailures != current.RepairFailures ||
+		previous.LastRepairOutcome != current.LastRepairOutcome ||
+		!previous.LastRepairStartedAt.Equal(current.LastRepairStartedAt) ||
+		!previous.RetryAt.Equal(current.RetryAt)
+}
+
+func callSnapshotObserver(observer SnapshotObserver, previous, current Snapshot) {
+	defer func() { _ = recover() }()
+	observer(previous, current)
 }
 
 type generationFence struct {
@@ -1437,6 +1605,12 @@ type generationSink struct {
 	generation Generation
 }
 
+// DurableIngress reports whether this generation's AppendIngress commits to a
+// downstream sink (false in legacy-only mode).
+func (s *generationSink) DurableIngress() bool {
+	return s.supervisor.sink != nil
+}
+
 func (s *generationSink) AppendIngress(ctx context.Context, record RawIngressRecord) error {
 	if record.AccountID != s.supervisor.accountID || record.Generation != s.generation {
 		return ErrStaleGeneration
@@ -1444,6 +1618,35 @@ func (s *generationSink) AppendIngress(ctx context.Context, record RawIngressRec
 	return s.forward(ctx, func(sink ConnectionSink) error {
 		return sink.AppendIngress(ctx, record)
 	}, activityEvent, s.supervisor.clock.Now())
+}
+
+// AppendHistoryIngress commits a fetched history frame under the same account,
+// generation, and fence checks as AppendIngress, but records no generation
+// activity: a catch-up reply must not refresh the live channel's liveness
+// deadline or reset its failure history. With no downstream sink (legacy-only
+// mode) it returns ErrHistoryIngressDisabled, so the caller can tell "v2 is
+// not running" from "v2 took it" (live ingress silently drops there instead).
+func (s *generationSink) AppendHistoryIngress(ctx context.Context, record RawIngressRecord) error {
+	if record.AccountID != s.supervisor.accountID || record.Generation != s.generation {
+		return ErrStaleGeneration
+	}
+	if ctx == nil {
+		return errors.New("bridge: connection sink context is nil")
+	}
+	fence := &s.supervisor.gate
+	fence.mu.RLock()
+	defer fence.mu.RUnlock()
+	if !fence.active || fence.generation != s.generation {
+		return ErrStaleGeneration
+	}
+	if s.supervisor.sink == nil {
+		return ErrHistoryIngressDisabled
+	}
+	history, ok := s.supervisor.sink.(HistoryIngressSink)
+	if !ok {
+		return ErrHistoryIngressMissing
+	}
+	return history.AppendHistoryIngress(ctx, record)
 }
 
 func (s *generationSink) EmitEphemeral(ctx context.Context, event EphemeralEvent) error {
@@ -1573,6 +1776,9 @@ func validatePolicy(policy Policy) error {
 	}
 	if policy.MaxSameFingerprint <= 0 {
 		return fmt.Errorf("%w: MaxSameFingerprint must be positive", ErrInvalidPolicy)
+	}
+	if policy.RepairRetryFloor < 0 {
+		return fmt.Errorf("%w: RepairRetryFloor must not be negative", ErrInvalidPolicy)
 	}
 	return nil
 }

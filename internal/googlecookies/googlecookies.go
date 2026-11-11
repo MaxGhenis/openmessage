@@ -71,18 +71,73 @@ func DefaultChromeProfile() string {
 // Refresh reads Google cookies from the Chrome profile and rewrites
 // auth_data.cookies in sessionPath. It never logs or returns cookie values.
 func Refresh(ctx context.Context, profile, sessionPath string) error {
+	_, err := RefreshWithStats(ctx, profile, sessionPath)
+	return err
+}
+
+// RefreshStats counts what a refresh wrote, never the values: how many
+// cookies it installed, and how many of those were new or differed from the
+// session's previous cookies. Changed == 0 means Chrome holds the very
+// cookies Google just rejected, so a reconnect is unlikely to help.
+type RefreshStats struct {
+	Cookies int
+	Changed int
+}
+
+// RefreshWithStats is Refresh, also reporting RefreshStats.
+func RefreshWithStats(ctx context.Context, profile, sessionPath string) (RefreshStats, error) {
+	cookies, err := Load(ctx, profile)
+	if err != nil {
+		return RefreshStats{}, err
+	}
+	return installCookies(sessionPath, cookies)
+}
+
+func installCookies(sessionPath string, cookies map[string]string) (RefreshStats, error) {
+	previous := sessionCookies(sessionPath)
+	if err := UpdateSessionCookies(sessionPath, cookies); err != nil {
+		return RefreshStats{}, err
+	}
+	stats := RefreshStats{Cookies: len(cookies)}
+	for name, value := range cookies {
+		if old, ok := previous[name]; !ok || old != value {
+			stats.Changed++
+		}
+	}
+	return stats, nil
+}
+
+// sessionCookies reads auth_data.cookies from sessionPath for comparison
+// only; an unreadable session counts every refreshed cookie as changed.
+func sessionCookies(sessionPath string) map[string]string {
+	raw, err := os.ReadFile(sessionPath)
+	if err != nil {
+		return nil
+	}
+	var data struct {
+		AuthData struct {
+			Cookies map[string]string `json:"cookies"`
+		} `json:"auth_data"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil
+	}
+	return data.AuthData.Cookies
+}
+
+// Load reads and decrypts the Google cookies of a Chrome profile with the
+// Chrome Safe Storage secret from the login keychain. It is what Refresh
+// writes into session.json and what `pair --google-chrome` pairs with.
+// Callers must never log the returned values.
+func Load(ctx context.Context, profile string) (map[string]string, error) {
 	if profile == "" {
-		return fmt.Errorf("no Chrome profile directory")
+		return nil, fmt.Errorf("no Chrome profile directory")
 	}
 	secret, err := chromeSafeStorageSecret(ctx)
 	if err != nil {
-		return fmt.Errorf("chrome safe storage secret: %w", err)
+		return nil, fmt.Errorf("chrome safe storage secret: %w", err)
 	}
-	cookies, err := LoadChromeCookies(profile, secret)
-	if err != nil {
-		return err
-	}
-	return UpdateSessionCookies(sessionPath, cookies)
+	return LoadChromeCookies(profile, secret)
 }
 
 // DeriveKey derives the AES-128 key Chrome uses for cookie encryption.

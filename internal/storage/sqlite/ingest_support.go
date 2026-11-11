@@ -79,7 +79,7 @@ func (r *MessageRepository) ApplyMessageMutation(
 	case "edit":
 		result, err = tx.ExecContext(ctx, `
 			UPDATE messages
-			SET body = ?, state = 'edited', updated_at_ms = ?
+			SET body = ?, state = 'edited', updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE account_id = ?
 			  AND conversation_id = ?
 			  AND remote_message_id = ?
@@ -87,7 +87,7 @@ func (r *MessageRepository) ApplyMessageMutation(
 	case "delete":
 		result, err = tx.ExecContext(ctx, `
 			UPDATE messages
-			SET state = 'deleted', updated_at_ms = ?
+			SET state = 'deleted', updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE account_id = ?
 			  AND conversation_id = ?
 			  AND remote_message_id = ?

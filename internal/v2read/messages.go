@@ -84,35 +84,3 @@ func (s *Source) GetMessagesAroundMessage(
 	}
 	return s.mapMessages(messages)
 }
-
-func (s *Source) walkConversationMessages(
-	conversationID string,
-	visit func(sqlite.Message),
-) error {
-	var beforeMS int64
-	var beforeID string
-	for {
-		page, err := s.messages.ListMessagesByConversation(
-			context.Background(),
-			conversationID,
-			beforeMS,
-			beforeID,
-			sourceMessagePageSize,
-		)
-		if err != nil {
-			return err
-		}
-		for _, message := range page {
-			visit(message)
-		}
-		if len(page) < sourceMessagePageSize {
-			return nil
-		}
-		last := page[len(page)-1]
-		if last.OccurredAtMS == beforeMS && last.MessageID == beforeID {
-			return errors.New("v2 read message pagination did not advance")
-		}
-		beforeMS = last.OccurredAtMS
-		beforeID = last.MessageID
-	}
-}

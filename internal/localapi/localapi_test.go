@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,6 +64,45 @@ func TestStatusReachability(t *testing.T) {
 		}
 		if status.Auth.DataDir != "/tmp/data" {
 			t.Fatalf("auth data dir = %q", status.Auth.DataDir)
+		}
+	})
+
+	// The freshness block stays raw so a caller can show the daemon's
+	// silence verdict unchanged.
+	t.Run("daemon reports freshness", func(t *testing.T) {
+		const silence = `{"silent_ms":46800000,"stalled":true,"rule":"expected_activity"}`
+		client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"freshness":{"newest_ms":1791473060776,"google":{"stale":true,"silence":`+silence+`}}}`)
+		}))
+		status, _, err := client.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status() = %v", err)
+		}
+		var freshness struct {
+			NewestMS json.RawMessage `json:"newest_ms"`
+			Google   struct {
+				Silence json.RawMessage `json:"silence"`
+			} `json:"google"`
+		}
+		if err := json.Unmarshal(status.Freshness, &freshness); err != nil {
+			t.Fatalf("decode freshness: %v", err)
+		}
+		if string(freshness.NewestMS) != "1791473060776" || string(freshness.Google.Silence) != silence {
+			t.Fatalf("freshness = %s, want newest_ms 1791473060776 and google.silence %s", status.Freshness, silence)
+		}
+	})
+
+	// The send and MCP paths read only the mode fields, so a freshness block
+	// of any JSON shape must not turn a reachable daemon into a probe failure.
+	t.Run("daemon reports a non-object freshness", func(t *testing.T) {
+		for _, freshness := range []string{`[]`, `"stale"`, `7`, `true`, `null`} {
+			client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, `{"v2_primary":true,"freshness":`+freshness+`}`)
+			}))
+			status, reachable, err := client.Status(context.Background())
+			if err != nil || !reachable || !status.V2Primary {
+				t.Fatalf("freshness %s: Status() = %+v, reachable %v, err %v", freshness, status, reachable, err)
+			}
 		}
 	})
 }
@@ -279,5 +319,187 @@ func TestDefaultBaseURLHonorsPortEnv(t *testing.T) {
 	t.Setenv("OPENMESSAGES_PORT", "")
 	if got := DefaultBaseURL(); got != "http://127.0.0.1:7007" {
 		t.Fatalf("DefaultBaseURL() = %q", got)
+	}
+}
+
+func TestReactionsViaOutboxNeedsV2Primary(t *testing.T) {
+	for _, status := range []DaemonStatus{
+		{}, {V2Send: true}, {V2Primary: true}, {V2Send: true, V2Primary: true},
+	} {
+		if got := status.ReactionsViaOutbox(); got != status.V2Primary {
+			t.Fatalf("%+v.ReactionsViaOutbox() = %v, want %v", status, got, status.V2Primary)
+		}
+	}
+}
+
+func TestSubmitReactionPostsToTheOutbox(t *testing.T) {
+	var path string
+	var body map[string]any
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.Method + " " + r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"outbox_id": "out", "state": "queued", "deduplicated": true})
+	}))
+	submission, err := client.SubmitReaction(context.Background(), ReactionSubmission{
+		MessageID: "msg", Emoji: "👍", IdempotencyKey: "key",
+	})
+	if err != nil || submission.OutboxID != "out" || !submission.Deduplicated {
+		t.Fatalf("SubmitReaction() = %+v, %v", submission, err)
+	}
+	if path != "POST /api/v1/outbox/reactions" {
+		t.Fatalf("request = %s", path)
+	}
+	// conversation_id and action are optional and omitted when empty.
+	if len(body) != 3 || body["message_id"] != "msg" || body["emoji"] != "👍" || body["idempotency_key"] != "key" {
+		t.Fatalf("body = %v", body)
+	}
+
+	empty := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"state": "queued"})
+	}))
+	if _, err := empty.SubmitReaction(context.Background(), ReactionSubmission{MessageID: "m", Emoji: "👍", IdempotencyKey: "k"}); err == nil {
+		t.Fatal("expected an error for a response without outbox_id")
+	}
+}
+
+// SetTranscript keeps the legacy store's rules on the wire: a nil model is
+// left out so the daemon keeps the stored one, an empty model is sent so the
+// daemon clears it, and an empty transcript is sent rather than dropped.
+func TestSetTranscriptKeepsTheModelRulesOnTheWire(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []map[string]any
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method != http.MethodPost || r.URL.Path != "/api/transcript" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Errorf("Authorization = %q", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		bodies = append(bodies, body)
+		answer := map[string]any{"success": true, "message_id": body["message_id"], "transcript_length": 2}
+		if len(bodies) == 1 {
+			answer["transcript_model"] = "whisper"
+		}
+		json.NewEncoder(w).Encode(answer)
+	}))
+	client.Token = "secret"
+
+	empty := ""
+	saved, err := client.SetTranscript(context.Background(), "msg", "hi", nil)
+	if err != nil {
+		t.Fatalf("SetTranscript(nil model): %v", err)
+	}
+	if !saved.Success || saved.MessageID != "msg" || saved.TranscriptLength != 2 || saved.TranscriptModel == nil || *saved.TranscriptModel != "whisper" {
+		t.Fatalf("SetTranscript(nil model) = %+v", saved)
+	}
+	older, err := client.SetTranscript(context.Background(), "msg", "", &empty)
+	if err != nil {
+		t.Fatalf("SetTranscript(empty model): %v", err)
+	}
+	if older.TranscriptModel != nil {
+		t.Fatalf("an answer without transcript_model decoded as %q, want nil", *older.TranscriptModel)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if _, sent := bodies[0]["model"]; sent {
+		t.Fatalf("a nil model was sent: %v", bodies[0])
+	}
+	if model, sent := bodies[1]["model"]; !sent || model != "" {
+		t.Fatalf("an empty model was not sent as \"\": %v", bodies[1])
+	}
+	if transcript, sent := bodies[1]["transcript"]; !sent || transcript != "" {
+		t.Fatalf("an empty transcript was not sent as \"\": %v", bodies[1])
+	}
+
+	refused := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{"error": "transcripts are not available while v2 is the serving store"})
+	}))
+	if _, err := refused.SetTranscript(context.Background(), "msg", "hi", nil); err == nil {
+		t.Fatal("expected a ResponseError for a refused transcript")
+	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusConflict {
+		t.Fatalf("SetTranscript() error = %v", err)
+	}
+}
+
+func TestReactDecodesTheQueuedAnswer(t *testing.T) {
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "queued": true, "outbox_id": "out", "state": "not_dispatched"})
+	}))
+	result, err := client.React(context.Background(), "conv", "msg", "👍", "add", "")
+	if err != nil || result != (ReactResult{Success: true, Queued: true, OutboxID: "out", State: "not_dispatched"}) {
+		t.Fatalf("React() = %+v, %v", result, err)
+	}
+
+	refused := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "send reaction: the transport refused the reaction"})
+	}))
+	if _, err := refused.React(context.Background(), "conv", "msg", "👍", "add", ""); err == nil {
+		t.Fatal("expected a ResponseError for a refused reaction")
+	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("React() error = %v", err)
+	}
+
+	// A v2-primary daemon that stored the reaction and then rejected it says
+	// why; the caller gets that alongside the error.
+	rejected := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{
+			"success": false, "outbox_id": "out-rejected", "state": "rejected",
+			"error_class": "recipient_mismatch", "error_code": "send_reaction",
+			"error": "send reaction: the phone's thread for this conversation now names other people, so the app sent nothing",
+		})
+	}))
+	stored, err := rejected.React(context.Background(), "conv", "msg", "👍", "add", "")
+	if _, ok := AsResponseError(err); !ok ||
+		stored != (ReactResult{OutboxID: "out-rejected", State: "rejected", ErrorClass: "recipient_mismatch", ErrorCode: "send_reaction"}) {
+		t.Fatalf("React(rejected) = %+v, %v; want the stored intent with its error class and code", stored, err)
+	}
+}
+
+func TestMessageAttachmentReadsBytesHeadersAndLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/api/v1/messages/msg%2F1/attachments/3" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="Report.html"`)
+		w.Header().Set("X-Content-SHA256", "ABCDEF")
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "")
+
+	attachment, err := client.MessageAttachment(context.Background(), "msg/1", 3, 10)
+	if err != nil {
+		t.Fatalf("MessageAttachment(): %v", err)
+	}
+	if string(attachment.Data) != "0123456789" || attachment.Filename != "Report.html" ||
+		attachment.MIME != "application/octet-stream" || attachment.SHA256 != "abcdef" {
+		t.Fatalf("MessageAttachment() = %+v", attachment)
+	}
+	if _, err := client.MessageAttachment(context.Background(), "msg/1", 3, 9); err == nil || !strings.Contains(err.Error(), "exceeds 9 bytes") {
+		t.Fatalf("MessageAttachment(limit 9) error = %v, want the size limit", err)
+	}
+	if _, err := client.MessageAttachment(context.Background(), "other", 0, 10); !IsDeterministicRejection(err) {
+		t.Fatalf("MessageAttachment(unknown) error = %v, want a 404 ResponseError", err)
+	}
+	if got := client.attachmentHTTP().Timeout; got < attachmentTimeout {
+		t.Fatalf("attachment timeout = %v, want at least %v", got, attachmentTimeout)
+	}
+	if client.HTTP.Timeout != 10*time.Second {
+		t.Fatalf("attachment requests changed the client's default timeout to %v", client.HTTP.Timeout)
 	}
 }

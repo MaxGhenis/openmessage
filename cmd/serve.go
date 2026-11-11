@@ -27,6 +27,7 @@ import (
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/ingest"
@@ -83,6 +84,7 @@ func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
 		Service:  stack.Service,
 		V2Store:  stack.Store,
 		Registry: stack.Registry,
+		Media:    stack.Media,
 	}}
 }
 
@@ -97,6 +99,47 @@ func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
 		Blobs:    stack.Blobs,
 		Registry: stack.Registry,
 	}
+}
+
+// freshnessActivitySource picks the clock /api/status judges platform silence
+// by, following where readers get their messages. On a v2-primary daemon that
+// is the v2 inbox, where transport events land before decoding. Otherwise
+// readers use the legacy store, which also takes rows that never pass through
+// the inbox (backfills, desktop imports), so its incoming-message timestamps
+// are the clock.
+func freshnessActivitySource(stack *v2Stack, legacy *db.Store, v2Primary bool) freshness.ActivitySource {
+	if v2Primary && stack != nil && stack.Store != nil {
+		return freshness.NewInboxActivity(stack.Store, map[string]string{
+			ingest.GoogleCodec:        "google",
+			whatsapplive.IngressCodec: "whatsapp",
+			ingest.SignalJSONRPCCodec: "signal",
+		})
+	}
+	if legacy != nil {
+		return freshness.NewMessageActivity(legacy, freshnessPlatformByStorage)
+	}
+	return nil
+}
+
+// freshnessPlatformByStorage maps stored message platforms to the status
+// platform keys freshness reports under. Google Messages stores SMS and RCS;
+// imports (gchat, imessage) have no live transport and no key.
+var freshnessPlatformByStorage = map[string]string{
+	"sms":      "google",
+	"rcs":      "google",
+	"whatsapp": "whatsapp",
+	"signal":   "signal",
+}
+
+// googleSMSPathMonitor judges whether carrier SMS has stopped reaching the
+// phone while RCS flows. Only the v2 inbox keeps the protobuf type that tells
+// SMS from RCS, and only v2 ingest writes it, so without both there is
+// nothing to judge.
+func googleSMSPathMonitor(stack *v2Stack, ingestEnabled bool) *freshness.SMSPathMonitor {
+	if stack == nil || stack.Store == nil || !ingestEnabled {
+		return nil
+	}
+	return freshness.NewSMSPathMonitor(ingest.GoogleSMSPathLoader(stack.Store))
 }
 
 func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
@@ -237,6 +280,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		} else {
 			logger.Info().Msg("V2 stack disabled (flags off)")
 		}
+		// Pull health compares empty Google pulls against what readers see;
+		// install the count before the supervisor can start a backfill.
+		installGooglePullCounter(a, v2Primary, stack)
 		repairer := newGoogleCredentialRepairer(
 			a.SessionPath,
 			canRefreshGoogleCookies,
@@ -251,6 +297,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
 			supervisorOptions := []bridge.SupervisorOption{
 				bridge.WithCredentialRepairer(repairer),
+				bridge.WithSnapshotObserver(googleSupervisorObserver(logger, publishOverallStatus)),
 			}
 			if stack != nil {
 				supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
@@ -270,6 +317,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			return fmt.Errorf("init Google Messages supervisor: %w", err)
 		}
 		googleControl = newGoogleSupervisorControl(googleSupervisor, a.SessionPath, newGoogleSupervisor)
+		a.SetGoogleSupervisorStatus(func() (app.GoogleSupervisorStatus, bool) {
+			snapshot, ok := googleControl.Snapshot()
+			if !ok {
+				return app.GoogleSupervisorStatus{}, false
+			}
+			return googleSupervisorStatus(snapshot), true
+		})
 		googleStartupCtx, cancelGoogleStartup := context.WithCancel(context.Background())
 		var googleStartupWG sync.WaitGroup
 		defer func() {
@@ -663,6 +717,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	v2Options := v2SendWebOptions(stack, v2Send)
 	v2IngestCounters := v2IngestCountersProvider(stack)
+	// Demo data is a frozen fixture; judging its silence would only report a
+	// demo platform as stalled.
+	var freshnessActivity freshness.ActivitySource
+	if !isDemo {
+		freshnessActivity = freshnessActivitySource(stack, a.Store, v2Primary)
+	}
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
@@ -676,6 +736,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
+				Activity:              freshnessActivity,
+				GoogleSMSPath:         googleSMSPathMonitor(stack, v2Ingest),
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,
@@ -714,6 +776,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				DownloadWhatsAppMedia: a.DownloadWhatsAppMedia,
 				DownloadSignalMedia:   a.DownloadSignalMedia,
 				StartDeepBackfill:     a.StartDeepBackfill,
+				StartWindowBackfill:   a.StartGoogleWindowBackfill,
 				BackfillStatus:        func() any { return a.GetBackfillProgress() },
 				BackfillPhone:         a.BackfillConversationByPhone,
 				SyncGoogleContacts:    a.SyncGoogleContacts,
@@ -839,9 +902,11 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 		if _, err := os.Stat(v2StorePath); err != nil {
 			return fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
 		}
-		opened, err := sqlite.Open(v2StorePath)
+		// Never migrate here: the daemon owns the store, and a migration's
+		// write lock would stall its writes for the whole index build.
+		opened, err := sqlite.OpenWithoutMigrating(v2StorePath)
 		if err != nil {
-			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, err)
+			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, clientStoreOpenError(err))
 		}
 		v2Store = opened
 		defer func() {
@@ -1077,12 +1142,19 @@ var refreshGoogleSessionCookies = func(ctx context.Context, sessionPath string) 
 	if !googlecookies.NativeSupported() {
 		return nil
 	}
-	if err := googlecookies.Refresh(ctx, googlecookies.DefaultChromeProfile(), sessionPath); err != nil {
+	stats, err := googlecookies.RefreshWithStats(ctx, googlecookies.DefaultChromeProfile(), sessionPath)
+	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
 		}
 		return fmt.Errorf("refresh Google cookies: %w", err)
 	}
+	// Counts only, never values. changed=0 means Chrome holds the very
+	// cookies Google just rejected, so the reconnect will likely fail too.
+	zerolog.Ctx(ctx).Info().
+		Int("cookies", stats.Cookies).
+		Int("changed", stats.Changed).
+		Msg("Refreshed Google session cookies from Chrome")
 	return nil
 }
 
@@ -1139,4 +1211,14 @@ func logSyncError(logger zerolog.Logger, lastImportErr map[string]string, platfo
 		event = logger.Debug().Err(err).Str("platform", platform)
 	}
 	event.Msg("Local platform sync unavailable")
+}
+
+// installGooglePullCounter points pull health at the store readers use: v2 on
+// a v2-primary install, else the legacy store.
+func installGooglePullCounter(a *app.App, v2Primary bool, stack *v2Stack) {
+	var reads readsource.ReadSource = a.Store
+	if v2Primary && stack != nil {
+		reads = v2read.New(stack.Store)
+	}
+	a.SetGoogleConversationCounter(func() (int, error) { return reads.ConversationCount("sms") })
 }

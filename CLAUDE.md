@@ -35,10 +35,11 @@ before touching anything. The traps that cost the most:
 - **Read live messages via the HTTP API** (`/api/conversations/<id>/messages`,
   `/api/search`, `/api/status`) — the app holds the WAL'd DB, so a direct
   `sqlite3` reader hits "unable to open database file (14)".
-- **Re-pairing Google Messages:** QR is dead; use Google Account pairing via the
-  cookie method; clear `session.json` from **both** data dirs to reach the
-  pairing screen; don't over-reconnect (it throttles the account). Full recipe
-  in the runbook.
+- **Re-pairing Google Messages:** QR is dead; use Google Account pairing:
+  with the user at the phone, quit the app and run
+  `OPENMESSAGES_DATA_DIR=... openmessage pair --google-chrome` (reads the
+  signed-in Chrome profile's cookies; the user taps the printed emoji).
+  Don't over-reconnect (it throttles the account). Full recipe in the runbook.
 
 ## Local CLI (read-only, no transports)
 
@@ -54,11 +55,55 @@ openmessage status [--json]                                       # per-platform
 ```
 
 `status` is the fast way to check coverage before trusting a search: it lists
-each platform's message count and latest sent/received timestamps, and flags any
-platform whose latest message trails the newest overall by ≥3 days ("Nd behind").
-A stale row means the daemon isn't syncing that platform — searches over that
-window will miss messages. `read` resolves each hit's sender (name → number →
-conversation id) so results are legible without a second lookup, and accepts
+each platform's message count and latest sent/received timestamps, and flags a
+platform that has stopped syncing in the AGE column. "Nd behind": its latest
+message trails the newest overall by ≥3 days. "silent Nh": its transport has
+delivered nothing for N hours, longer than its own baseline explains. That is
+the `internal/freshness` silence rule behind `/api/status`
+`freshness.<platform>.silence`, and it also catches a stall of the newest
+platform, which the relative rule never can (Google, 2026-10-06). When the
+running app serves the same data dir and reports a verdict measured on the
+source this command reads, `status` shows the app's (daemon truth, as for
+sends). Otherwise it judges locally with `freshness.EvaluateSilence` on the
+source the daemon would read: the v2 inbox when reads come from the v2 store,
+the legacy store's incoming messages otherwise. It reuses the stores it already
+opened. The text under the table says who judged and why (the app isn't
+running or didn't answer within 3s, serves another data dir, predates the
+check, or measures v2 while the CLI reads legacy), and names any verdict
+judged without a baseline (only the 72h floor applies) or platform with no
+recorded activity. `--json` adds each row's `behind_days`, `silence` (the
+daemon's field names, built by `freshness.SilenceBlock`) and
+`silence_judged_by` (`daemon` | `local`), plus `silence_note`. sms and rcs rows
+both carry Google's verdict. A stale row means the daemon isn't syncing that
+platform, or the phone behind it has stopped delivering; searches over that
+window will miss messages.
+
+On a v2-primary store `status` also prints a "Google SMS:" line: a ⚠ there
+means no incoming SMS for longer than usual while RCS still arrives, which
+per-platform freshness cannot see; on 2026-10-07 it was the phone's IMS stack
+(runbook: "SMS stopped while RCS works"). `--json` carries it as
+`google_sms_path`. It is judged locally from the v2 inbox, so it never reports
+`google_unreachable`; `/api/status` is the authority.
+
+"Read-only" here means no startup repair sweeps (`repairStartupArtifacts`) and
+no transports. The v2 store is opened with `sqlite.OpenWithoutMigrating`, which
+never migrates: a binary at a different schema version than the store refuses
+it (an older one reports the store as newer than supported; a newer one asks
+you to reopen the app). So on a macOS app install, `/usr/local/bin/openmessage`
+should be a symlink to the app bundle's binary (see the runbook's "MCP config").
+Opening the legacy store still writes: `db.New` runs `migrate()` on every open,
+which drops and recreates three `contact_avatars` indexes. It also keeps one
+row of each group of Signal rows that share a conversation, sender and
+timestamp and deletes the rest with their search index entries (with no group
+to clean, it only reads), and it rebuilds the FTS index in one transaction
+when the index's row count differs from `messages`. Every legacy write path
+keeps the index in step, so that rebuild means something else, such as an
+older build, changed `messages`. The Signal Desktop importer skips a message
+that the cleanup would delete (`SignalDuplicateWouldBeDropped`), so its
+30-minute full rescan doesn't re-add rows for the next open to delete.
+
+`read` resolves each hit's sender (name → number → conversation id) so results
+are legible without a second lookup, and accepts
 `--since`/`--until` (YYYY-MM-DD, local time; `--until` is inclusive to end of
 day) to scope a search to a date window. Date filtering lives in the store via
 `SearchFilter`/`SearchMessagesFiltered`; the legacy `SearchMessages(query,
@@ -80,8 +125,9 @@ openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 sync loops, or schedulers — the app daemon owns all live connections (two
 processes sharing WhatsApp/signal-cli credentials log each other out). Reads
 come from the local store (v2 when the daemon reports v2-primary for the same
-data dir); sends, reactions, and `get_status` route through the running
-daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+data dir); sends, reactions, transcripts, and `get_status` route through the
+running daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth
+semantics.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.
@@ -103,7 +149,17 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_person_story` — cross-platform narrative story for a person (merges + deduplicates)
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
-- `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+- `send_message`, `draft_message`, `list_contacts`, `get_status`
+- `download_media` — resolves a message ID or a `v2msg:<message>:<n>` media_id
+  (v2 reads go through the running app in client mode), downloads a pending
+  v2 attachment into the store, and with `save`/`output_path` writes a 0600
+  copy under the export root; an attachment its platform can no longer
+  deliver comes back as "attachment unavailable" with the reason
+
+Optional API story generation uses `claude-sonnet-5-5` with medium effort and
+a 16,000-token limit when the caller supplies an Anthropic API key. Without a
+key, or if the API fails or refuses the request, it generates a local
+stats-and-quotes story. There is no environment override for the model.
 
 On a v2-primary install the message-read tools (including `get_person_messages`
 and `get_person_messages_range`) serve the v2 store through the canonical read
@@ -115,8 +171,19 @@ local time on every surface (CLI, HTTP, MCP) via `db.ParseDayBound`, and the
 range tool labels rows in that same local time. The stats/story/viz tools
 (`conversation_stats`, `generate_story`,
 `person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
-load full histories from the legacy store, which froze at cutover, so they
-return an error naming the working read tools instead.
+load full histories from the legacy store, so on v2-primary they return an
+error naming the working read tools instead. The message-read tools stopped
+reading that store at cutover, though the web UI's People view still does,
+and the store did not freeze: live transports, local imports and the web UI
+keep writing it, no projector mirrors v2 into it, and it differs from v2 in
+both directions (runbook: "The legacy store keeps taking writes on
+v2-primary"). `set_message_transcript` refuses on v2-primary too: transcripts
+live only in the legacy store (the v2 store has no place for them, and
+`migrate` counts and drops them), and the only places that show a transcript,
+the message-read tools and the web UI's conversation view, read v2 there. The
+People view reads legacy messages but never shows a transcript. In client mode
+on a legacy-primary install the tool saves through the app's
+`POST /api/transcript`.
 
 ### HTTP API
 
@@ -132,6 +199,44 @@ return an error naming the working read tools instead.
   `/api/conversations/<id>/messages`), the HTTP twin of the `search_messages`
   MCP tool. Optional `phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD,
   local time, `until` inclusive to end of day), `limit` (default 50, max 500).
+- `GET /api/media/<message-id|v2msg:<message>:<n>>` and
+  `GET /api/v1/messages/<id>/attachments/<n>` — attachment bytes (a pending
+  v2 attachment is downloaded first; `X-Content-SHA256` carries the digest).
+  An attachment the transport has no copy of is marked unavailable (asked
+  again at most hourly) and answers 410 Gone (404 is an unknown message or
+  ordinal); a transport that is unreachable right now answers 503. v2
+  message reads set `media_unavailable` on such a message. Google often sends
+  an image's message about a second before it names the media; a download
+  asked for in between answers 503 with `Retry-After: 2` and records nothing.
+  An attachment still unnamed 15 minutes after its row was created answers
+  410 instead, also unrecorded, so a reference that arrives later still
+  downloads. An update that names no media keeps the reference already
+  stored. v2 message reads carry `media_version`, a digest of the
+  attachment's remote ID that changes when the media is named (or renamed),
+  and the web UI puts it in the image URL so a failed image loads again. On a
+  v2 store the UI also retries a 503 on the server's Retry-After, about two
+  minutes in all (a HEAD 200 after a failed load gets one more load); on the
+  legacy store a failed load is final.
+- `PUT /api/v1/messages/<id>/attachments/<n>` — import a local copy (raw
+  body, optional `X-Content-SHA256`) of a pending attachment the platform
+  can't deliver, e.g. a Signal attachment signal-cli never stored; checked
+  against the declared size. CLI: `openmessage media import`. See
+  [docs/agent-runbook.md](docs/agent-runbook.md) ("Signal attachments
+  signal-cli never stored").
+- `POST /api/react` — `{conversation_id, message_id, emoji, action}`. On a
+  v2-primary daemon it takes the v2 IDs the read API returns, queues the
+  reaction on the durable outbox and waits up to 8 s: 200 delivered, 202
+  queued and still retrying (don't repeat it), 502/409 not delivered, 422
+  unknown target. Legacy-primary daemons call the platform senders directly.
+- `POST /api/v1/outbox/reactions` — the durable twin (v2-primary only,
+  `idempotency_key` required), returns the outbox submission immediately.
+  Details: [docs/agent-runbook.md](docs/agent-runbook.md) ("Reactions on
+  v2-primary go through the outbox").
+- `POST /api/transcript` — `{message_id, transcript, model?}` saves a
+  transcript in the legacy store (an empty transcript clears it, an omitted
+  model keeps the stored one) and answers with `transcript_model`, the model
+  the message now carries. A v2-primary daemon answers 409: the v2 store keeps
+  no transcripts.
 
 ### Schema
 
