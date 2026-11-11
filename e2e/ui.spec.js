@@ -374,30 +374,60 @@ test('keeps only the newest 100 stored compose drafts', async ({ page }) => {
   expect(stored).not.toHaveProperty('seeded-099');
 });
 
-test('keeps text the store refused, and stores it once the store works again', async ({ page }) => {
-  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
-  const breakStore = () => page.evaluate(() => {
+async function breakComposeDraftStore(page) {
+  await page.evaluate(() => {
     window.__realSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function refuse() {
       throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
     };
   });
-  const fixStore = () => page.evaluate(() => {
+}
+
+async function fixComposeDraftStore(page) {
+  await page.evaluate(() => {
     Storage.prototype.setItem = window.__realSetItem;
   });
+}
+
+test('keeps text the store refused, and stores it with the next write that succeeds', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const marcusConversationID = await conversationIDNamed(page, 'Marcus Johnson');
 
   await openConversation(page, 'Sarah Chen');
   await page.locator('#compose-input').fill('short draft');
-  await breakStore();
+  await breakComposeDraftStore(page);
   await page.locator('#compose-input').fill('a much longer draft the store refused');
   await openConversation(page, 'Marcus Johnson');
-  await fixStore();
-  // A later write that succeeds must not make the page trust the older
-  // stored text for Sarah.
+  await fixComposeDraftStore(page);
+  // Marcus's write succeeds, so the page stores Sarah's refused text too,
+  // and never trusts the older stored text for her.
   await page.locator('#compose-input').fill('a draft for Marcus');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
 
   await openConversation(page, 'Sarah Chen');
   await expect(page.locator('#compose-input')).toHaveValue('a much longer draft the store refused');
+
+  // Once stored, Sarah's draft follows the store again: another tab's
+  // change shows here.
+  await openConversation(page, 'Marcus Johnson');
+  const now = Date.now();
+  await storeComposeDrafts(page, {
+    [sarahConversationID]: { text: 'changed in another tab', updated_at_ms: now },
+    [marcusConversationID]: { text: 'a draft for Marcus', updated_at_ms: now },
+  });
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('changed in another tab');
+});
+
+test('stores refused text when you leave its conversation after the store recovers', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('short draft');
+  await breakComposeDraftStore(page);
+  await page.locator('#compose-input').fill('a much longer draft the store refused');
+  await fixComposeDraftStore(page);
+  // No write has succeeded since the refusal; leaving Sarah is the first.
   await openConversation(page, 'Marcus Johnson');
   expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
 });

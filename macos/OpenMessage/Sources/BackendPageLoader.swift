@@ -27,13 +27,16 @@ final class BackendPageLoader {
     /// retry, window updates (which load only a new backend address) would
     /// leave the window blank. If the backend itself has gone, BackendManager
     /// leaves `.running` and removes the web view, and with it this loader.
+    /// The retry does nothing if a page started loading during the pause, so
+    /// it never replaces a window update's load or a newer backend address.
     func navigationFailed(_ error: Error) {
         guard BackendPageLoadPolicy.shouldRetry(after: error),
               let failedURL = policy.loadFailed() else { return }
         let delay = retryDelay
         Task { [weak self] in
             try? await Task.sleep(for: delay)
-            self?.show(failedURL)
+            guard let self, self.policy.loadedURL == nil else { return }
+            self.show(failedURL)
         }
     }
 }

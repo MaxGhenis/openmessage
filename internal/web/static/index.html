@@ -6267,7 +6267,9 @@ body::after {
   let composeSyncedText = '';
   // Conversations whose latest text this tab failed to store (a full or
   // blocked localStorage). This tab's copy answers for them until a write
-  // succeeds, so a later read can't swap in an older stored draft.
+  // succeeds, so a later read can't swap in an older stored draft. When the
+  // store takes that text later, it replaces whatever another tab stored
+  // for the conversation meanwhile; the macOS app has one tab.
   const composeDraftsOnlyHere = new Set();
   let contextMenuState = null;
   let threadSearchTimer = 0;
@@ -11944,9 +11946,9 @@ body::after {
   }
 
   // Keeps a conversation's text in this tab's copy and in the store. When
-  // the store refuses it, the open box stays marked as edited, so leaving
-  // the conversation tries the store again and other tabs' changes don't
-  // overwrite it.
+  // the store refuses it, the open box stays marked as edited, so other
+  // tabs' changes don't overwrite it, and the next write that succeeds, for
+  // any conversation, tries the store again.
   function rememberComposeText(convoId, value) {
     if (!convoId) return;
     const text = String(value || '');
@@ -11958,8 +11960,21 @@ body::after {
     if (storeComposeDraft(convoId, text)) {
       composeDraftsOnlyHere.delete(convoId);
       if (convoId === activeConvoId) composeSyncedText = text;
+      storeRefusedComposeDrafts();
     } else {
       composeDraftsOnlyHere.add(convoId);
+    }
+  }
+
+  // The store took a write, so it may take the text it refused earlier.
+  // Each conversation gets its own write: one text the store still refuses
+  // (a paste too large for it) doesn't hold back the rest.
+  function storeRefusedComposeDrafts() {
+    for (const convoId of [...composeDraftsOnlyHere]) {
+      const text = composeTextByConversation.get(convoId) || '';
+      if (!storeComposeDraft(convoId, text)) continue;
+      composeDraftsOnlyHere.delete(convoId);
+      if (convoId === activeConvoId && $composeInput.value === text) composeSyncedText = text;
     }
   }
 
