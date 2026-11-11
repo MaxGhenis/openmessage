@@ -281,6 +281,228 @@ test('keeps typed compose text scoped to each thread', async ({ page }) => {
   await expect(page.locator('#compose-input')).toHaveValue(sarahDraft);
 });
 
+// The macOS app builds a new web view whenever its backend restarts, and on
+// 2026-11-07 it reloaded the page every time Signal reconnected. Unsent text
+// must outlive the page.
+test('keeps typed compose text across a reload', async ({ page }) => {
+  const sarahDraft = `Sarah reload draft ${Date.now()}`;
+  const marcusDraft = `Marcus reload draft ${Date.now()}`;
+
+  await openConversation(page, 'Marcus Johnson');
+  await page.locator('#compose-input').fill(marcusDraft);
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(sarahDraft);
+
+  await page.reload();
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue(sarahDraft);
+
+  await openConversation(page, 'Marcus Johnson');
+  await expect(page.locator('#compose-input')).toHaveValue(marcusDraft);
+});
+
+test('forgets compose text once you send it, so a reload brings none back', async ({ page }) => {
+  const outbound = `Playwright sent draft ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+  await expect(page.locator('#messages-area')).toContainText(outbound);
+
+  await page.reload();
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await expect(page.locator('#messages-area')).toContainText(outbound);
+  await expect(page.locator('#compose-input')).toHaveValue('');
+});
+
+const composeDraftsKey = 'openmessage:compose-drafts:v1';
+
+async function conversationIDNamed(page, name) {
+  return page.evaluate(async (wanted) => {
+    const response = await fetch('/api/conversations?limit=200');
+    const conversations = await response.json();
+    return conversations.find(conversation => conversation.Name === wanted).ConversationID;
+  }, name);
+}
+
+async function storedComposeDrafts(page) {
+  return page.evaluate((key) => JSON.parse(window.localStorage.getItem(key) || '{}'), composeDraftsKey);
+}
+
+async function storeComposeDrafts(page, drafts) {
+  await page.evaluate(({ key, drafts }) => {
+    window.localStorage.setItem(key, JSON.stringify(drafts));
+  }, { key: composeDraftsKey, drafts });
+}
+
+test('drops a stored compose draft after 30 days', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const marcusConversationID = await conversationIDNamed(page, 'Marcus Johnson');
+  const monthAgo = Date.now() - 31 * 24 * 60 * 60 * 1000;
+  await storeComposeDrafts(page, {
+    [sarahConversationID]: { text: 'a month-old draft for Sarah', updated_at_ms: monthAgo },
+    [marcusConversationID]: { text: 'a month-old draft for Marcus', updated_at_ms: monthAgo },
+  });
+
+  // Opening a conversation ignores its expired draft.
+  await page.goto(`/?conversation=${encodeURIComponent(sarahConversationID)}`);
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('');
+
+  // The next write prunes every expired draft, not only its own.
+  await page.locator('#compose-input').fill('a fresh draft');
+  const stored = await storedComposeDrafts(page);
+  expect(Object.keys(stored)).toEqual([sarahConversationID]);
+  expect(stored[sarahConversationID].text).toBe('a fresh draft');
+});
+
+test('keeps only the newest 100 stored compose drafts', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const now = Date.now();
+  const seeded = {};
+  for (let i = 0; i < 100; i += 1) {
+    seeded[`seeded-${String(i).padStart(3, '0')}`] = { text: `draft ${i}`, updated_at_ms: now - (i + 1) * 60 * 1000 };
+  }
+  await storeComposeDrafts(page, seeded);
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('the newest draft');
+  const stored = await storedComposeDrafts(page);
+  expect(Object.keys(stored)).toHaveLength(100);
+  expect(stored[sarahConversationID].text).toBe('the newest draft');
+  expect(stored).toHaveProperty('seeded-000');
+  expect(stored).not.toHaveProperty('seeded-099');
+});
+
+async function breakComposeDraftStore(page) {
+  await page.evaluate(() => {
+    window.__realSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function refuse() {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    };
+  });
+}
+
+async function fixComposeDraftStore(page) {
+  await page.evaluate(() => {
+    Storage.prototype.setItem = window.__realSetItem;
+  });
+}
+
+test('keeps text the store refused, and stores it with the next write that succeeds', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const marcusConversationID = await conversationIDNamed(page, 'Marcus Johnson');
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('short draft');
+  await breakComposeDraftStore(page);
+  await page.locator('#compose-input').fill('a much longer draft the store refused');
+  await openConversation(page, 'Marcus Johnson');
+  await fixComposeDraftStore(page);
+  // Marcus's write succeeds, so the page stores Sarah's refused text too,
+  // and never trusts the older stored text for her.
+  await page.locator('#compose-input').fill('a draft for Marcus');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
+
+  // Once stored, Sarah's draft follows the store again: another tab's
+  // change shows here.
+  const now = Date.now();
+  await storeComposeDrafts(page, {
+    [sarahConversationID]: { text: 'changed in another tab', updated_at_ms: now },
+    [marcusConversationID]: { text: 'a draft for Marcus', updated_at_ms: now },
+  });
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('changed in another tab');
+});
+
+test('shows refused text when you reopen its conversation while the store still refuses', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('short draft');
+  await breakComposeDraftStore(page);
+  await page.locator('#compose-input').fill('a much longer draft the store refused');
+  await openConversation(page, 'Marcus Johnson');
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('a much longer draft the store refused');
+
+  await fixComposeDraftStore(page);
+  await openConversation(page, 'Marcus Johnson');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
+});
+
+test('stores refused text when you leave its conversation after the store recovers', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('short draft');
+  await breakComposeDraftStore(page);
+  await page.locator('#compose-input').fill('a much longer draft the store refused');
+  await fixComposeDraftStore(page);
+  // No write has succeeded since the refusal; leaving Sarah is the first.
+  await openConversation(page, 'Marcus Johnson');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
+});
+
+// Tabs share the store. PR #284's review found that one tab could store
+// text another tab had sent, because it kept the drafts it read at load.
+test('never brings back text that another tab sent', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const draft = `send me from the other tab ${Date.now()}`;
+  await storeComposeDrafts(page, { [sarahConversationID]: { text: draft, updated_at_ms: Date.now() } });
+  await page.reload();
+
+  const other = await page.context().newPage();
+  await other.goto('/');
+  await openConversation(other, 'Sarah Chen');
+  await expect(other.locator('#compose-input')).toHaveValue(draft);
+  await other.locator('#send-btn').click();
+  await expect(other.locator('#messages-area')).toContainText(draft);
+  await expect(other.locator('#compose-input')).toHaveValue('');
+
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('');
+  await openConversation(page, 'Marcus Johnson');
+  expect(await storedComposeDrafts(page)).not.toHaveProperty(sarahConversationID);
+  await other.close();
+});
+
+test('empties an open, unedited box when another tab sends its text', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const draft = `open in both tabs ${Date.now()}`;
+  await storeComposeDrafts(page, { [sarahConversationID]: { text: draft, updated_at_ms: Date.now() } });
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue(draft);
+
+  const other = await page.context().newPage();
+  await other.goto('/');
+  await openConversation(other, 'Sarah Chen');
+  await other.locator('#send-btn').click();
+  await expect(other.locator('#messages-area')).toContainText(draft);
+
+  await expect(page.locator('#compose-input')).toHaveValue('');
+  await openConversation(page, 'Marcus Johnson');
+  expect(await storedComposeDrafts(page)).not.toHaveProperty(sarahConversationID);
+  await other.close();
+});
+
+test('keeps a draft another tab typed when this tab only looks at the conversation', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const draft = `typed in the other tab ${Date.now()}`;
+
+  const other = await page.context().newPage();
+  await other.goto('/');
+  await openConversation(other, 'Sarah Chen');
+  await other.locator('#compose-input').fill(draft);
+
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue(draft);
+  await openConversation(page, 'Marcus Johnson');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe(draft);
+  await other.close();
+});
+
 test('opens a deep-linked conversation from the URL', async ({ page }) => {
   const sarahConversationID = await page.evaluate(async () => {
     const response = await fetch('/api/conversations?limit=200');

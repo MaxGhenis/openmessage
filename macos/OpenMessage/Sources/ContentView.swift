@@ -111,7 +111,7 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.webView = webView
         WebViewBridge.shared.webView = webView
         webView.navigationDelegate = context.coordinator
-        webView.load(URLRequest(url: url))
+        context.coordinator.pageLoader.show(url)
         return webView
     }
 
@@ -119,10 +119,9 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.backend = backend
         context.coordinator.notifications = notifications
         context.coordinator.contacts = contacts
-        // Only reload if URL changed
-        if webView.url != url {
-            webView.load(URLRequest(url: url))
-        }
+        // Loads only for a new backend address, never because the page
+        // changed its own URL (see BackendPageLoadPolicy).
+        context.coordinator.pageLoader.show(url)
     }
 
     private static let notificationBridgeScript = """
@@ -185,6 +184,9 @@ struct WebViewContainer: NSViewRepresentable {
         var notifications: NotificationManager
         var contacts: ContactsManager
         weak var webView: WKWebView?
+        lazy var pageLoader = BackendPageLoader { [weak self] request in
+            self?.webView?.load(request)
+        }
 
         init(backend: BackendManager, notifications: NotificationManager, contacts: ContactsManager) {
             self.backend = backend
@@ -236,6 +238,11 @@ struct WebViewContainer: NSViewRepresentable {
                 return
             }
             decisionHandler(.allow)
+        }
+
+        @MainActor
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            pageLoader.navigationFailed(error)
         }
 
         @MainActor

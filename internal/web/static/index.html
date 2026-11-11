@@ -6254,7 +6254,25 @@ body::after {
   let forwardMessage = null;
   let forwarding = false;
   const forwardSendKeys = new Map();
-  const composeTextByConversation = new Map();
+  // Unsent compose text per conversation. localStorage holds it, so a
+  // reload, a relaunch and other tabs all see it (see "Compose Input").
+  const COMPOSE_DRAFTS_STORAGE_KEY = 'openmessage:compose-drafts:v1';
+  const COMPOSE_DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+  const COMPOSE_DRAFTS_LIMIT = 100;
+  // This tab's copy, which stands in when storage can't be read or written.
+  const composeTextByConversation = loadStoredComposeDrafts();
+  // The open conversation's text as this tab last read it from the store or
+  // wrote it there. The box holds something else only after an edit this
+  // tab hasn't stored.
+  let composeSyncedText = '';
+  // Conversations whose latest text this tab failed to store (a full or
+  // blocked localStorage), or whose draft it failed to delete. This tab's
+  // copy answers for them until the store takes that conversation's text,
+  // so a later read can't swap in an older stored draft. When the store
+  // takes it, it replaces whatever another tab stored for the conversation
+  // meanwhile, and a refused delete deletes another tab's newer draft; the
+  // macOS app has one tab.
+  const composeDraftsOnlyHere = new Set();
   let contextMenuState = null;
   let threadSearchTimer = 0;
   let threadSearchRequestID = 0;
@@ -10583,7 +10601,7 @@ body::after {
     const previousConvoId = activeConvoId;
     const isConversationSwitch = previousConvoId !== convo.ConversationID;
     if (isConversationSwitch) {
-      rememberActiveComposeText(previousConvoId);
+      rememberEditedComposeText(previousConvoId);
     }
     activeConvoId = convo.ConversationID;
     activeConversation = convo;
@@ -11780,7 +11798,7 @@ body::after {
     composeSendInFlight = true;
     clearThreadFeedback();
     $composeInput.value = '';
-    composeTextByConversation.delete(sendConvoId);
+    forgetComposeText(sendConvoId);
     if (hasMedia) {
       clearAttachment();
     }
@@ -11849,6 +11867,90 @@ body::after {
   }
 
   // ─── Compose Input ───
+  // Unsent text lives in localStorage, so it outlives the page: the macOS
+  // app builds a new web view whenever the backend restarts, and a
+  // notification tap loads the page afresh. Stored drafts expire after 30
+  // days, and the store keeps only the newest 100.
+  //
+  // Other tabs share the store. Opening a conversation reads its draft from
+  // the store at that moment, leaving one stores the box only if this tab
+  // edited it, and a "storage" event refreshes an unedited box. So text that
+  // another tab sent never comes back here as a draft, and merely viewing a
+  // conversation never overwrites another tab's draft.
+  function loadStoredComposeDrafts() {
+    const drafts = new Map();
+    const now = Date.now();
+    for (const [convoId, draft] of Object.entries(readStoredComposeDrafts())) {
+      if (storedComposeDraftIsLive(draft, now)) drafts.set(convoId, draft.text);
+    }
+    return drafts;
+  }
+
+  // The stored drafts, or null when storage can't be read or holds
+  // something other than an object of drafts.
+  function readComposeDraftStore() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(COMPOSE_DRAFTS_STORAGE_KEY) || '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function readStoredComposeDrafts() {
+    return readComposeDraftStore() || {};
+  }
+
+  // A conversation's unsent text as the store holds it now, which includes
+  // what other tabs stored or cleared since this page loaded. When this tab
+  // can't read the store, or failed to store this conversation's latest
+  // text, its own copy answers.
+  function currentComposeDraft(convoId) {
+    if (!convoId) return '';
+    const stored = composeDraftsOnlyHere.has(convoId) ? null : readComposeDraftStore();
+    if (!stored) return composeTextByConversation.get(convoId) || '';
+    const draft = stored[convoId];
+    const text = storedComposeDraftIsLive(draft, Date.now()) ? draft.text : '';
+    if (text) {
+      composeTextByConversation.set(convoId, text);
+    } else {
+      composeTextByConversation.delete(convoId);
+    }
+    return text;
+  }
+
+  function storedComposeDraftIsLive(draft, now) {
+    return !!draft && typeof draft.text === 'string' && draft.text !== ''
+      && now - Number(draft.updated_at_ms || 0) <= COMPOSE_DRAFT_MAX_AGE_MS;
+  }
+
+  // Changes one conversation's stored draft and says whether the write
+  // succeeded. It re-reads the others first, so a draft another tab stored
+  // since this page loaded survives.
+  function storeComposeDraft(convoId, text) {
+    try {
+      const now = Date.now();
+      const drafts = readStoredComposeDrafts();
+      if (text) {
+        drafts[convoId] = { text, updated_at_ms: now };
+      } else {
+        delete drafts[convoId];
+      }
+      const kept = Object.entries(drafts)
+        .filter(([, draft]) => storedComposeDraftIsLive(draft, now))
+        .sort(([, a], [, b]) => Number(b.updated_at_ms) - Number(a.updated_at_ms))
+        .slice(0, COMPOSE_DRAFTS_LIMIT);
+      window.localStorage.setItem(COMPOSE_DRAFTS_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Keeps a conversation's text in this tab's copy and in the store. When
+  // the store refuses it, the open box stays marked as edited, so other
+  // tabs' changes don't overwrite it, and the next write that succeeds, for
+  // any conversation, tries the store again.
   function rememberComposeText(convoId, value) {
     if (!convoId) return;
     const text = String(value || '');
@@ -11857,15 +11959,91 @@ body::after {
     } else {
       composeTextByConversation.delete(convoId);
     }
+    if (storeComposeDraft(convoId, text)) {
+      composeDraftsOnlyHere.delete(convoId);
+      if (convoId === activeConvoId) composeSyncedText = text;
+      storeRefusedComposeDrafts();
+    } else {
+      composeDraftsOnlyHere.add(convoId);
+      // The box may hold other text than the refused write (a schedule
+      // that left the box alone because its message changed meanwhile), so
+      // leaving stores whatever the box holds.
+      if (convoId === activeConvoId) composeSyncedText = null;
+    }
+  }
+
+  // The store took a write, so it may take the text it refused earlier.
+  // Each conversation gets its own write: one text the store still refuses
+  // (a paste too large for it) doesn't hold back the rest.
+  function storeRefusedComposeDrafts() {
+    for (const convoId of [...composeDraftsOnlyHere]) {
+      const text = composeTextByConversation.get(convoId) || '';
+      if (!storeComposeDraft(convoId, text)) continue;
+      composeDraftsOnlyHere.delete(convoId);
+      if (convoId === activeConvoId && $composeInput.value === text) composeSyncedText = text;
+    }
+  }
+
+  function forgetComposeText(convoId) {
+    rememberComposeText(convoId, '');
   }
 
   function rememberActiveComposeText(convoId = activeConvoId) {
     rememberComposeText(convoId, $composeInput.value);
   }
 
+  // Stores the box when leaving its conversation, but only if this tab
+  // edited it since it last synced with the store. An unedited box can hold
+  // text another tab has since sent, and storing it would bring it back.
+  function rememberEditedComposeText(convoId) {
+    if ($composeInput.value !== composeSyncedText) rememberActiveComposeText(convoId);
+  }
+
   function restoreComposeText(convoId) {
-    $composeInput.value = composeTextByConversation.get(convoId) || '';
+    const text = currentComposeDraft(convoId);
+    $composeInput.value = text;
+    // Text the store refused counts as an unstored edit (see rememberComposeText).
+    composeSyncedText = composeDraftsOnlyHere.has(convoId) ? null : text;
     autoResize();
+  }
+
+  // Another tab changed the stored drafts: show the open conversation's
+  // stored text, unless this tab holds an edit the store doesn't have yet.
+  window.addEventListener('storage', event => {
+    if (event.key !== null && event.key !== COMPOSE_DRAFTS_STORAGE_KEY) return;
+    if (!activeConvoId || $composeInput.value !== composeSyncedText) return;
+    const text = currentComposeDraft(activeConvoId);
+    if (text === composeSyncedText) return;
+    $composeInput.value = text;
+    composeSyncedText = text;
+    autoResize();
+  });
+
+  // After a schedule request succeeds, forget the text it scheduled, and
+  // empty the composer only if it still holds exactly what was scheduled:
+  // the user may have switched conversations or kept typing meanwhile.
+  // Returns whether the scheduled conversation is still open.
+  function settleScheduledCompose(sendConvoId, rawText, scheduledFile, scheduledReply, sendAt) {
+    const sameConversation = activeConvoId === sendConvoId;
+    const sameCompose = sameConversation
+      && $composeInput.value === rawText
+      && (pendingFile && pendingFile.file ? pendingFile.file : null) === scheduledFile
+      && replyToMsg === scheduledReply;
+    if (currentComposeDraft(sendConvoId) === rawText) {
+      forgetComposeText(sendConvoId);
+    }
+    if (sameCompose) {
+      $composeInput.value = '';
+      rememberComposeText(sendConvoId, '');
+      if (scheduledFile) clearAttachment();
+      if (scheduledReply) clearReply();
+      hideScheduleCustom();
+      autoResize();
+    }
+    if (sameConversation) {
+      showThreadFeedback(`Scheduled for ${formatScheduledWhen(sendAt)}.`);
+    }
+    return sameConversation;
   }
 
   function autoResize() {
@@ -11958,25 +12136,7 @@ body::after {
           scheduledV2IntentKeys.delete(intent.fingerprint);
         }
 
-        const sameConversation = activeConvoId === sendConvoId;
-        const sameCompose = sameConversation
-          && $composeInput.value === rawText
-          && (pendingFile && pendingFile.file ? pendingFile.file : null) === scheduledFile
-          && replyToMsg === scheduledReply;
-        if (composeTextByConversation.get(sendConvoId) === rawText) {
-          composeTextByConversation.delete(sendConvoId);
-        }
-        if (sameCompose) {
-          $composeInput.value = '';
-          rememberComposeText(sendConvoId, '');
-          if (scheduledFile) clearAttachment();
-          if (scheduledReply) clearReply();
-          hideScheduleCustom();
-          autoResize();
-        }
-        if (sameConversation) {
-          showThreadFeedback(`Scheduled for ${formatScheduledWhen(sendAt)}.`);
-        }
+        settleScheduledCompose(sendConvoId, rawText, scheduledFile, scheduledReply, sendAt);
         loadOutboxRows();
         return;
       } catch (err) {
@@ -11985,12 +12145,16 @@ body::after {
       }
     }
 
-    const replyId = replyToMsg ? replyToMsg.MessageID : '';
+    const sendConvoId = activeConvoId;
+    const rawText = $composeInput.value;
+    const scheduledFile = hasMedia ? pendingFile.file : null;
+    const scheduledReply = replyToMsg;
+    const replyId = scheduledReply ? scheduledReply.MessageID : '';
     try {
       if (hasMedia) {
         const form = new FormData();
-        form.append('conversation_id', activeConvoId);
-        form.append('file', pendingFile.file);
+        form.append('conversation_id', sendConvoId);
+        form.append('file', scheduledFile);
         form.append('caption', text);
         form.append('reply_to_id', replyId);
         form.append('send_at', String(sendAt));
@@ -11999,21 +12163,17 @@ body::after {
           const msg = await resp.text();
           throw new Error(msg || 'Failed to schedule attachment.');
         }
-        clearAttachment();
       } else {
         await postJSON('/api/schedule', {
-          conversation_id: activeConvoId,
+          conversation_id: sendConvoId,
           body: text,
           reply_to_id: replyId,
           send_at: sendAt,
         });
       }
-      $composeInput.value = '';
-      autoResize();
-      if (replyToMsg) clearReply();
-      hideScheduleCustom();
-      showThreadFeedback(`Scheduled for ${formatScheduledWhen(sendAt)}.`);
-      loadScheduledMessages(activeConvoId);
+      if (settleScheduledCompose(sendConvoId, rawText, scheduledFile, scheduledReply, sendAt)) {
+        loadScheduledMessages(sendConvoId);
+      }
     } catch (err) {
       showThreadFeedback(err.message || 'Failed to schedule message.');
     }
@@ -12803,7 +12963,7 @@ body::after {
 	    clearThreadFeedback();
 	    gifSending = true;
 	    $composeInput.value = '';
-	    composeTextByConversation.delete(sendConvoId);
+	    forgetComposeText(sendConvoId);
 	    clearReply();
 	    autoResize();
 	    const queuedItems = [];
@@ -14690,7 +14850,7 @@ body::after {
   // Helper: deselect current conversation and return to empty state
   function deselectConversation() {
     const previousConvoId = activeConvoId;
-    rememberActiveComposeText(previousConvoId);
+    rememberEditedComposeText(previousConvoId);
     activeConvoId = null;
     activeConvoIsGroup = false;
     activeConversation = null;
@@ -14723,6 +14883,7 @@ body::after {
     renderEmptyState();
     clearTransientComposerState();
     $composeInput.value = '';
+    composeSyncedText = '';
     autoResize();
   }
 
