@@ -243,6 +243,22 @@ struct WebViewContainer: NSViewRepresentable {
         }
 
         @MainActor
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            // The page never arrived, so window updates (which load only a
+            // new backend address) would leave the window blank. Retry after a
+            // pause. If the backend itself has gone, BackendManager leaves
+            // .running and removes this web view, which ends the retries.
+            guard BackendPageLoadPolicy.shouldRetry(after: error),
+                  let failedURL = pageLoads.loadFailed() else { return }
+            Task { @MainActor [weak self, weak webView] in
+                try? await Task.sleep(for: .seconds(2))
+                guard let self, let webView,
+                      let request = self.pageLoads.request(for: failedURL) else { return }
+                webView.load(request)
+            }
+        }
+
+        @MainActor
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Deliver any Platforms-overlay request that arrived while no
             // interactive page existed (window closed, pairing screen, or
