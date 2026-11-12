@@ -1,12 +1,4 @@
 import SwiftUI
-import CoreImage.CIFilterBuiltins
-
-private enum PairingMethod: String, CaseIterable, Identifiable {
-    case google = "Google Account"
-    case qr = "QR Code"
-
-    var id: String { rawValue }
-}
 
 /// Sub-steps within the Google Account method: sign in to Google (native web
 /// view), confirm the emoji on the phone, or fall back to the advanced
@@ -19,9 +11,7 @@ private enum GoogleStep {
 
 struct PairingView: View {
     @ObservedObject var backend: BackendManager
-    @State private var method: PairingMethod = .google
     @State private var googleStep: GoogleStep = .signIn
-    @State private var qrURL: String?
     @State private var pairingEmoji: String?
     @State private var googleInput = ""
     @State private var statusText = ""
@@ -40,43 +30,19 @@ struct PairingView: View {
                 .font(.title)
                 .fontWeight(.medium)
 
-            Picker("Pairing Method", selection: $method) {
-                ForEach(PairingMethod.allCases) { item in
-                    Text(item.rawValue).tag(item)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 420)
-            .disabled(isPairing && qrURL == nil && pairingEmoji == nil)
+            Text("OpenMessage uses Google Account pairing instead of QR codes.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
 
             if pairingSucceeded {
                 successCard
-            } else if method == .qr {
-                qrSection
             } else {
                 googleSection
             }
         }
         .padding(36)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            // QR can auto-generate immediately so the user never sees a blank
-            // placeholder. The Google method loads its own sign-in web view, so
-            // it needs no kick here.
-            if method == .qr && qrURL == nil && !isPairing && !pairingSucceeded {
-                startPairing()
-            }
-        }
-        .onChange(of: method) { _, newValue in
-            resetPairingState()
-            if newValue == .qr {
-                statusText = "Generating QR code…"
-                startPairing()
-            } else {
-                googleStep = .signIn
-                statusText = ""
-            }
-        }
     }
 
     // MARK: - Google Account method
@@ -252,49 +218,6 @@ struct PairingView: View {
         }
     }
 
-    // MARK: - QR method
-
-    private var qrSection: some View {
-        VStack(spacing: 16) {
-            Text("Open Google Messages on your phone, go to\nSettings > Device pairing, and scan this QR code.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .lineSpacing(4)
-
-            if let qrURL, let image = generateQRCode(from: qrURL) {
-                Image(nsImage: image)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 240, height: 240)
-                    .background(.white)
-                    .cornerRadius(12)
-                    .shadow(color: .black.opacity(0.1), radius: 10)
-            } else {
-                placeholderCard(systemName: "qrcode")
-            }
-
-            VStack(spacing: 4) {
-                Text("⚠︎ Google is phasing out QR pairing.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                Text("If your phone no longer shows a QR scanner under Device pairing, use the Google Account tab instead — that's the method Google is keeping.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 420)
-            }
-
-            if !statusText.isEmpty {
-                Text(statusText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-        }
-    }
-
     // MARK: - Shared
 
     private var successCard: some View {
@@ -312,22 +235,6 @@ struct PairingView: View {
         .frame(width: 300, height: 240)
     }
 
-    private func placeholderCard(systemName: String) -> some View {
-        RoundedRectangle(cornerRadius: 16)
-            .fill(.quaternary)
-            .frame(width: 240, height: 240)
-            .overlay {
-                if isPairing {
-                    ProgressView()
-                        .scaleEffect(1.5)
-                } else {
-                    Image(systemName: systemName)
-                        .font(.system(size: 48))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-    }
-
     // MARK: - Pairing engine
 
     private func resetPairingState() {
@@ -335,7 +242,6 @@ struct PairingView: View {
         // (the AsyncStream's onTermination terminates the `pair` process).
         pairingTask?.cancel()
         pairingTask = nil
-        qrURL = nil
         pairingEmoji = nil
         pairingSucceeded = false
         isPairing = false
@@ -346,7 +252,7 @@ struct PairingView: View {
     /// Kick off Gaia (emoji) pairing using cookies harvested from the embedded
     /// Google sign-in, then show the emoji confirmation step.
     private func beginGoogleConfirmation(cookieHeader: String) {
-        guard method == .google, !pairingSucceeded else { return }
+        guard !pairingSucceeded else { return }
         googleStep = .confirm
         statusText = "Connecting to Google…"
         startPairing(googleCookieOverride: cookieHeader)
@@ -357,24 +263,17 @@ struct PairingView: View {
         pairingAttemptID = attemptID
         isPairing = true
         pairingSucceeded = false
-        qrURL = nil
         pairingEmoji = nil
-        statusText = method == .qr ? "Generating QR code…" : "Connecting to Google…"
+        statusText = "Connecting to Google…"
 
         let cookieInput = googleCookieOverride ?? googleInput
 
         pairingTask?.cancel()
         pairingTask = Task {
-            let events = method == .qr
-                ? await backend.startPairing()
-                : await backend.startGooglePairing(cookieInput: cookieInput)
+            let events = await backend.startGooglePairing(cookieInput: cookieInput)
             for await event in events {
                 guard pairingAttemptID == attemptID else { continue }
                 switch event {
-                case .qrURL(let url):
-                    qrURL = url
-                    isPairing = false
-                    statusText = "Scan the QR code with your phone."
                 case .emoji(let emoji):
                     pairingEmoji = emoji
                     isPairing = false
@@ -392,20 +291,5 @@ struct PairingView: View {
                 }
             }
         }
-    }
-
-    private func generateQRCode(from string: String) -> NSImage? {
-        let context = CIContext()
-        let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(string.utf8)
-        filter.correctionLevel = "M"
-
-        guard let output = filter.outputImage else { return nil }
-
-        let scale = 10.0
-        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-
-        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
-        return NSImage(cgImage: cgImage, size: NSSize(width: scaled.extent.width, height: scaled.extent.height))
     }
 }

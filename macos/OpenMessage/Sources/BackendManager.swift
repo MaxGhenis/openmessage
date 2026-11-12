@@ -535,11 +535,6 @@ final class BackendManager: ObservableObject {
         handleDisconnect()
     }
 
-    /// Run the pairing flow. Returns the QR code URL for display.
-    func startPairing() async -> AsyncStream<PairingEvent> {
-        pairingEvents(arguments: ["pair"], stdinText: nil)
-    }
-
     func startGooglePairing(cookieInput: String) async -> AsyncStream<PairingEvent> {
         pairingEvents(arguments: ["pair", "--google-stdin"], stdinText: cookieInput)
     }
@@ -582,26 +577,19 @@ final class BackendManager: ObservableObject {
                     let data = handle.availableData
                     guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
 
-                    // Output may contain multiple lines (QR art + URL)
+                    // Output may contain multiple status lines.
                     for line in text.components(separatedBy: .newlines) {
                         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmed.isEmpty else { continue }
 
-                        // Extract URL from lines like "URL: https://..." or bare URLs
-                        if let range = trimmed.range(of: "https://", options: .caseInsensitive) {
-                            let url = String(trimmed[range.lowerBound...])
-                            continuation.yield(.qrURL(url))
-                        } else if trimmed.hasPrefix("EMOJI:") {
+                        if trimmed.hasPrefix("EMOJI:") {
                             let emoji = trimmed.replacingOccurrences(of: "EMOJI:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
                             continuation.yield(.emoji(emoji))
-                        } else if trimmed.hasPrefix("http://") {
-                            continuation.yield(.qrURL(trimmed))
                         } else if trimmed.lowercased().contains("success") || trimmed.lowercased().contains("paired") {
                             continuation.yield(.success)
                         } else if !trimmed.contains("█") && !trimmed.contains("▀") && !trimmed.contains("▄") {
                             continuation.yield(.log(trimmed))
                         }
-                        // Skip QR art and other log lines to avoid noisy status updates
                     }
                 }
 
@@ -652,7 +640,6 @@ private final class ProcBox: @unchecked Sendable {
 }
 
 enum PairingEvent {
-    case qrURL(String)
     case emoji(String)
     case log(String)
     case success

@@ -1,6 +1,7 @@
 package cmd_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -30,49 +31,38 @@ func buildTestBinary(t *testing.T) (binary, dataDir string) {
 	return binary, dataDir
 }
 
-// TestBuiltBinaryAcceptsPairCommand verifies the compiled binary doesn't crash
-// on startup when given the "pair" command. It should start the pairing flow
-// (which will eventually fail without a phone), not exit with a panic or
-// immediate error.
-func TestBuiltBinaryAcceptsPairCommand(t *testing.T) {
+// TestBuiltBinaryPairExplainsAccountSetup verifies that the former QR default
+// exits promptly with an account-pairing command, preserving an existing session.
+func TestBuiltBinaryPairExplainsAccountSetup(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
-
-	cmd := exec.Command(binary, "pair")
-	cmd.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
-
-	out := &strings.Builder{}
-	cmd.Stdout = out
-	cmd.Stderr = out
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start binary: %v", err)
+	sessionPath := filepath.Join(dataDir, "session.json")
+	const session = `{"test-only":"existing session"}`
+	if err := os.WriteFile(sessionPath, []byte(session), 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	// We only want to confirm the binary doesn't crash on startup. Surviving
-	// the grace period is a pass in itself: pairing may legitimately produce
-	// no output for a while (it contacts Google before printing the QR), so
-	// a kill-then-inspect approach can't tell a quiet healthy process from a
-	// crashed one.
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	select {
-	case err := <-done:
-		// Exited on its own — fine if it said something first (e.g. a
-		// pairing error without a phone), a crash if it was silent.
-		if err != nil && len(out.String()) == 0 {
-			t.Errorf("binary exited immediately with no output: %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "pair")
+	command.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
+	out, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("pair waited instead of showing setup instructions: %v", ctx.Err())
+	}
+	if err == nil {
+		t.Fatal("pair without a method should exit nonzero with instructions")
+	}
+	for _, want := range []string{"QR", "Google Account", "openmessage pair --google", "emoji"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("pair output missing %q: %s", want, out)
 		}
-	case <-time.After(3 * time.Second):
-		// Still running after the grace period: startup succeeded.
-		_ = cmd.Process.Kill()
-		<-done
 	}
-
-	// Should not contain panic traces in either outcome.
-	output := out.String()
-	if strings.Contains(output, "panic:") || strings.Contains(output, "runtime error") {
-		t.Errorf("binary panicked:\n%s", output)
+	after, err := os.ReadFile(sessionPath)
+	if err != nil || string(after) != session {
+		t.Fatalf("pair changed the existing session: %v", err)
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("pair created extra files: %v, %v", entries, err)
 	}
 }
 

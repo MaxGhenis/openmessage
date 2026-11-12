@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -586,15 +587,76 @@ func (h *runPairHarness) run(t *testing.T, args ...string) (string, error) {
 	return out, err
 }
 
+func (h *runPairHarness) runGoogle(t *testing.T) (string, error) {
+	t.Helper()
+	path := filepath.Join(h.dataDir, "test-cookies.json")
+	if err := os.WriteFile(path, []byte(`{"SID":"test-only"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return h.run(t, "--google-file", path)
+}
+
+// Legacy QR entry points must fail before probing a daemon, reading credentials,
+// backing up a session, or starting a transport.
+func TestRunPairQRGuidanceHasNoSideEffects(t *testing.T) {
+	for _, args := range [][]string{nil, {"--qr"}, {"qr"}} {
+		t.Run(fmt.Sprint(args), func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "unused")
+			t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+			deps := pairDeps{
+				now: time.Now,
+				probe: func(context.Context, string) (pairBackendState, error) {
+					t.Fatal("unsupported pairing reached the backend probe")
+					return pairBackendState{}, nil
+				},
+			}
+			err := runPair(zerolog.Nop(), args, deps)
+			if err == nil {
+				t.Fatal("expected Google Account pairing instructions")
+			}
+			for _, want := range []string{"QR", "Google Account", "openmessage pair --google", "emoji"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q missing %q", err, want)
+				}
+			}
+			if _, err := os.Stat(dataDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unsupported pairing created a data directory: %v", err)
+			}
+			assertSwiftSafe(t, err.Error())
+		})
+	}
+}
+
+func TestRunPairQRGuidancePreservesAnyExistingSession(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+	sessionPath := filepath.Join(dataDir, "session.json")
+	property := func(raw []byte) bool {
+		if err := os.WriteFile(sessionPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := runPair(zerolog.Nop(), nil, pairDeps{})
+		after, readErr := os.ReadFile(sessionPath)
+		entries, listErr := os.ReadDir(dataDir)
+		return err != nil && readErr == nil && listErr == nil && bytes.Equal(after, raw) && len(entries) == 1
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 32, Rand: rand.New(rand.NewSource(1112))}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunPairRefusesWhileABackendHoldsTheSession(t *testing.T) {
 	h := newRunPairHarness(t)
 	h.state = holding(h.dataDir)
 	if err := os.WriteFile(filepath.Join(h.dataDir, "session.json"), []byte(`{"old":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := h.run(t)
+	out, err := h.runGoogle(t)
 	if err == nil || !strings.Contains(err.Error(), "stop it first") {
 		t.Fatalf("err = %v, want a refusal", err)
+	}
+	if !strings.Contains(err.Error(), "docker compose run --rm openmessage pair --google") {
+		t.Fatalf("refusal must name the supported account-pairing command: %v", err)
 	}
 	if h.pairs != 0 {
 		t.Fatal("paired despite a backend holding the session")
@@ -609,8 +671,8 @@ func TestRunPairRefusesWhileABackendHoldsTheSession(t *testing.T) {
 func TestRunPairProceedsWhenTheBackendHoldsNoGoogleSession(t *testing.T) {
 	h := newRunPairHarness(t)
 	h.state = pairBackendState{Running: true, StatusKnown: true, DataDir: h.dataDir, NoGoogleSession: true}
-	if _, err := h.run(t); err != nil || h.pairs != 1 || h.pairedMode != pairModeQR {
-		t.Fatalf("err = %v, pairs = %d, mode = %q; want one QR pairing", err, h.pairs, h.pairedMode)
+	if _, err := h.runGoogle(t); err != nil || h.pairs != 1 || h.pairedMode != pairModeGoogle {
+		t.Fatalf("err = %v, pairs = %d, mode = %q; want one Google Account pairing", err, h.pairs, h.pairedMode)
 	}
 }
 
@@ -620,7 +682,7 @@ func TestRunPairBacksUpTheSessionBeforeAskingThePhone(t *testing.T) {
 	if err := os.WriteFile(sessionPath, []byte(`{"old":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := h.run(t)
+	out, err := h.runGoogle(t)
 	if err != nil || h.pairs != 1 {
 		t.Fatalf("err = %v, pairs = %d", err, h.pairs)
 	}
@@ -643,7 +705,7 @@ func TestRunPairStopsBeforeThePhoneWhenTheSessionCannotBeBackedUp(t *testing.T) 
 	if err := os.WriteFile(sessionPath, []byte(`{"old":true}`), 0o000); err != nil {
 		t.Fatal(err)
 	}
-	_, err := h.run(t)
+	_, err := h.runGoogle(t)
 	if err == nil || !strings.Contains(err.Error(), "before pairing") {
 		t.Fatalf("err = %v, want a refusal before pairing", err)
 	}

@@ -2,9 +2,9 @@
 #
 # Usage:
 #     docker compose up -d
-#     docker compose exec openmessage openmessage pair    # one-time
+#     docker compose exec openmessage openmessage pair --google    # one-time
 #     # re-pairing later: docker compose stop, then
-#     #   docker compose run --rm openmessage pair, then up -d
+#     #   docker compose run --rm openmessage pair --google, then up -d
 #     # then connect Claude / other MCP clients to http://localhost:7007/mcp/sse
 
 services:

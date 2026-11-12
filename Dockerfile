@@ -6,7 +6,7 @@
 #
 # Build:   docker build -t openmessage .
 # Run:     docker run -p 7007:7007 -v openmessage-data:/data openmessage
-# Pair:    docker exec -it <container> openmessage pair
+# Pair:    docker exec -it <container> openmessage pair --google
 #          (to re-pair, stop the container and run pair in a fresh one with the same volume)
 # Connect: claude mcp add -s user --transport sse openmessage http://<host>:7007/mcp/sse
 
@@ -38,6 +38,6 @@ ENV OPENMESSAGES_DATA_DIR=/data \
 VOLUME ["/data"]
 EXPOSE 7007
 
-# Default to running the server. Override with `pair`, `import`, etc.
+# Default to running the server. Override with `pair --google`, `import`, etc.
 ENTRYPOINT ["openmessage"]
 CMD ["serve"]

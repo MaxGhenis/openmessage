@@ -133,13 +133,13 @@ export const setupColumns = [
     body: "Run the Go binary directly if you want the same local web UI, MCP server, and pairing flow without the native wrapper.",
     bullets: [
       "Install the release binary for your platform or build from source.",
-      "Pair with your phone using the local pairing command.",
+      "Pair through your Google Account and confirm the emoji on your phone.",
       "Start the web UI and MCP server on localhost."
     ],
     commands: [
       {
         label: "Pair",
-        code: "openmessage pair"
+        code: "openmessage pair --google"
       },
       {
         label: "Serve",

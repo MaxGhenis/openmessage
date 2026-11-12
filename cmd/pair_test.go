@@ -1,52 +1,6 @@
 package cmd
 
-import (
-	"bytes"
-	"os"
-	"strings"
-	"testing"
-)
-
-func TestDisplayQROutputFormat(t *testing.T) {
-	// Capture stdout to verify the output format that the Swift wrapper parses.
-	// The Swift PairingView looks for lines containing "https://" to extract the QR URL.
-
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	testURL := "https://support.google.com/messages/?p=web_computer#?c=testdata"
-	displayQR(testURL)
-
-	w.Close()
-	os.Stdout = old
-
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	// Must contain the URL line that Swift parses
-	if !strings.Contains(output, "URL: "+testURL) {
-		t.Errorf("output missing 'URL: <url>' line\ngot:\n%s", output)
-	}
-
-	// Must contain the URL itself (Swift looks for lines containing "https://")
-	foundURL := false
-	for _, line := range strings.Split(output, "\n") {
-		if strings.Contains(line, "https://") {
-			foundURL = true
-			break
-		}
-	}
-	if !foundURL {
-		t.Error("output contains no line with https:// — Swift wrapper won't find QR URL")
-	}
-
-	// Must contain QR art (block characters used by qrterminal)
-	if !strings.Contains(output, "█") {
-		t.Error("output missing QR code block characters")
-	}
-}
+import "testing"
 
 func TestParseGoogleCookiesInputJSON(t *testing.T) {
 	cookies, err := parseGoogleCookiesInput(`{"SID":"sid-value","SAPISID":"sap-value"}`)
@@ -65,6 +19,16 @@ func TestParseGoogleCookiesInputCurl(t *testing.T) {
 		t.Fatalf("parseGoogleCookiesInput(): %v", err)
 	}
 	if cookies["SID"] != "sid-value" || cookies["SAPISID"] != "sap-value" {
+		t.Fatalf("unexpected cookies: %#v", cookies)
+	}
+}
+
+func TestParseGoogleCookiesInputCurlCookieOption(t *testing.T) {
+	cookies, err := parseGoogleCookiesInput(`curl 'https://messages.google.com/web/config' -b 'SID=test-only; SAPISID=also-test-only'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cookies["SID"] != "test-only" || cookies["SAPISID"] != "also-test-only" {
 		t.Fatalf("unexpected cookies: %#v", cookies)
 	}
 }
