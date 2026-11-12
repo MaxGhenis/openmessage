@@ -223,7 +223,7 @@ func waitForBackendToReleaseSession(
 			if err != nil {
 				return fmt.Errorf("cannot rule out an OpenMessage backend at %s that holds the Google session in %s (%v); stop it and retry", defaultBackendProbeURL(), dataDir, err)
 			}
-			return fmt.Errorf("an OpenMessage backend at %s holds the Google session in %s; stop it first (macOS app: osascript -e 'quit app \"OpenMessage\"'; Docker: stop the container, then docker compose run --rm openmessage pair), because it rewrites session.json and would overwrite the new pairing", defaultBackendProbeURL(), dataDir)
+			return fmt.Errorf("an OpenMessage backend at %s holds the Google session in %s; stop it first (macOS app: osascript -e 'quit app \"OpenMessage\"'; Docker: stop the container, then docker compose run --rm openmessage pair --google), because it rewrites session.json and would overwrite the new pairing", defaultBackendProbeURL(), dataDir)
 		}
 		if !announced {
 			fmt.Printf("Waiting for the OpenMessage backend at %s to stop...\n", defaultBackendProbeURL())

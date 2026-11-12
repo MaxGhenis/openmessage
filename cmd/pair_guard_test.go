@@ -655,6 +655,9 @@ func TestRunPairRefusesWhileABackendHoldsTheSession(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "stop it first") {
 		t.Fatalf("err = %v, want a refusal", err)
 	}
+	if !strings.Contains(err.Error(), "docker compose run --rm openmessage pair --google") {
+		t.Fatalf("refusal must name the supported account-pairing command: %v", err)
+	}
 	if h.pairs != 0 {
 		t.Fatal("paired despite a backend holding the session")
 	}
