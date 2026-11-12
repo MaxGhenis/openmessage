@@ -5,7 +5,6 @@ go 1.25.0
 require (
 	github.com/google/uuid v1.6.0
 	github.com/mark3labs/mcp-go v0.43.2
-	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/libsignal v0.2.2
 	go.mau.fi/mautrix-gmessages v0.2601.0

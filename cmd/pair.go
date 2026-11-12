@@ -13,16 +13,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/mdp/qrterminal/v3"
 	"github.com/rs/zerolog"
-	"go.mau.fi/mautrix-gmessages/pkg/libgm"
-	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
-	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 	utilcurl "go.mau.fi/util/curl"
 	"golang.org/x/term"
 
@@ -32,12 +27,9 @@ import (
 	"github.com/maxghenis/openmessage/internal/localapi"
 )
 
-const maxQRRefreshes = 5
-
 type pairMode string
 
 const (
-	pairModeQR           pairMode = "qr"
 	pairModeGoogle       pairMode = "google"
 	pairModeGoogleChrome pairMode = "google-chrome"
 )
@@ -78,16 +70,16 @@ func RunPair(logger zerolog.Logger, args ...string) error {
 }
 
 func runPair(logger zerolog.Logger, args []string, deps pairDeps) error {
-	dataDir := app.DefaultDataDir()
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
-	}
-
-	sessionPath := dataDir + "/session.json"
 	mode, input, err := resolvePairMode(args)
 	if err != nil {
 		return err
 	}
+
+	dataDir := app.DefaultDataDir()
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	sessionPath := dataDir + "/session.json"
 
 	ctx := context.Background()
 	if err := waitForBackendToReleaseSession(ctx, dataDir, deps.probe, deps.exitWait, deps.now, deps.sleep); err != nil {
@@ -121,12 +113,9 @@ func runPair(logger zerolog.Logger, args []string, deps pairDeps) error {
 	return deps.pair(logger, mode, cookies, sessionPath)
 }
 
-func runPairing(logger zerolog.Logger, mode pairMode, cookies map[string]string, sessionPath string) error {
+func runPairing(logger zerolog.Logger, _ pairMode, cookies map[string]string, sessionPath string) error {
 	cli := client.NewForPairing(logger)
 	defer cli.GM.Disconnect()
-	if mode == pairModeQR {
-		return runQRPairing(logger, cli, sessionPath)
-	}
 	return runGoogleAccountPairing(cli, sessionPath, cookies)
 }
 
@@ -331,91 +320,9 @@ func backupReplacedSession(sessionPath string, now time.Time) (string, error) {
 	return "", fmt.Errorf("no free backup name for %s", base)
 }
 
-func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string) error {
-	var pairDone sync.WaitGroup
-	pairDone.Add(1)
-	var pairErr error
-
-	pairCB := func(data *gmproto.PairedData) {
-		defer pairDone.Done()
-
-		logger.Info().
-			Str("phone_id", data.GetMobile().GetSourceID()).
-			Msg("Pairing successful!")
-
-		sessionData, err := cli.SessionData()
-		if err != nil {
-			pairErr = fmt.Errorf("get session data: %w", err)
-			return
-		}
-		if err := client.SaveSession(sessionPath, sessionData); err != nil {
-			pairErr = fmt.Errorf("save session: %w", err)
-			return
-		}
-		fmt.Println("\nSession saved to", sessionPath)
-		fmt.Println("You can now run: openmessage serve")
-	}
-	cli.GM.PairCallback.Store(&pairCB)
-
-	// Handle Ctrl+C
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Println("\nAborted.")
-		cli.GM.Disconnect()
-		os.Exit(1)
-	}()
-
-	// Start login - shows first QR code
-	qrURL, err := cli.GM.StartLogin()
-	if err != nil {
-		return fmt.Errorf("start login: %w", err)
-	}
-	displayQR(qrURL)
-
-	// Auto-refresh QR codes
-	go func() {
-		for i := 0; i < maxQRRefreshes; i++ {
-			time.Sleep(30 * time.Second)
-			newURL, err := cli.GM.RefreshPhoneRelay()
-			if err != nil {
-				logger.Warn().Err(err).Msg("Failed to refresh QR code")
-				return
-			}
-			fmt.Println("\n--- QR code refreshed ---")
-			displayQR(newURL)
-		}
-	}()
-
-	// Also set event handler for non-pair events during pairing
-	cli.GM.SetEventHandler(func(evt any) {
-		switch evt := evt.(type) {
-		case *events.ListenFatalError:
-			logger.Error().Err(evt.Error).Msg("Fatal error during pairing")
-		case *events.PairSuccessful:
-			// Handled by PairCallback
-		default:
-			logger.Debug().Type("type", evt).Msg("Event during pairing")
-		}
-	})
-
-	pairDone.Wait()
-	return pairErr
-}
-
-func displayQR(url string) {
-	fmt.Println("\nScan this QR code with Google Messages:")
-	fmt.Println("(Settings > Device pairing > Pair a device)")
-	fmt.Println()
-	qrterminal.GenerateHalfBlock(url, qrterminal.L, os.Stdout)
-	fmt.Println()
-	fmt.Println("URL:", url)
-}
-
 func resolvePairMode(args []string) (pairMode, string, error) {
-	if len(args) == 0 {
-		return pairModeQR, "", nil
+	if len(args) == 0 || args[0] == "--qr" || args[0] == "qr" {
+		return "", "", fmt.Errorf("OpenMessage no longer supports Google Messages QR pairing; use Google Account pairing instead: run openmessage pair --google, paste cookies or a cURL request from Messages for web, then confirm the emoji on your phone (macOS: openmessage pair --google-chrome can read a signed-in Chrome profile)")
 	}
 	switch args[0] {
 	case "--google", "google":
@@ -566,6 +473,3 @@ func parseCookieHeader(raw string) (map[string]string, error) {
 	}
 	return parsed, nil
 }
-
-// Ensure PairCallback type matches what libgm expects
-var _ = (*libgm.Client)(nil)

@@ -31,19 +31,29 @@ go build -o openmessage .
 
 ### 2. Pair with your phone
 
+OpenMessage uses **Google Account pairing with emoji confirmation**. QR setup is no longer supported: [Google documents that QR pairing is unavailable in the US](https://support.google.com/messages/answer/9077245?co=GENIE.Platform%3DDesktop&hl=en), and the [upstream transport retired QR login](https://github.com/mautrix/gmessages/releases/tag/v0.2605.0).
+
+On your phone, open **Google Messages > Account menu > Device pairing** and sign in to your Google Account. On your computer, open [Messages for web](https://messages.google.com/web) and sign in to the same account.
+
+For the CLI on any platform:
+
+1. In the browser's developer tools, open **Network**, select a request to `messages.google.com` with a `Cookie` request header, and copy that header's value (or **Copy as cURL** if it includes a `Cookie` header).
+2. Run:
+   ```bash
+   ./openmessage pair --google
+   ```
+3. Paste the cookies, then send end-of-input: **Ctrl-D** on macOS/Linux, or **Ctrl-Z then Enter** on Windows. Tap the matching emoji in Google Messages on your phone when prompted.
+
+The CLI also accepts a JSON object of cookie names and values through stdin or `--google-file path`. Treat this input as a credential; keep it local. The session saves to `~/.local/share/openmessage/session.json` by default, or `OPENMESSAGES_DATA_DIR` when set.
+
+On **macOS**, you can instead read cookies from a signed-in Chrome profile:
+
 ```bash
-./openmessage pair
+./openmessage pair --google-chrome             # Default profile
+./openmessage pair --google-chrome "Profile 1" # Another profile
 ```
 
-By default, a QR code appears in your terminal. On your phone, open **Google Messages > Settings > Device pairing > Pair a device** and scan it. The session saves to `~/.local/share/openmessage/session.json`.
-
-If Google only offers account pairing, you can also pair with Google account cookies copied from browser devtools:
-
-```bash
-pbpaste | ./openmessage pair --google
-```
-
-The CLI accepts either a JSON cookie object or a full `curl` command for `messages.google.com/web/config`, then prompts you to confirm an emoji on your phone.
+The native macOS app offers Google sign-in and an advanced cookie-paste method. If embedded sign-in fails, use the advanced method. Running bare `openmessage pair` prints account-pairing instructions before opening a connection or changing a session.
 
 ### 3. Start the server
 
@@ -265,7 +275,7 @@ go build .           # Build binary
 npm install          # Install Playwright test runner
 npx playwright install chromium
 npm run test:e2e     # Run browser-level web UI tests
-./openmessage pair  # Pair with phone
+./openmessage pair --google # Pair via Google Account and emoji
 ./openmessage serve # Start server
 ./openmessage demo  # Start isolated fake-data demo mode
 ```

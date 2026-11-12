@@ -633,7 +633,7 @@ test('offers a direct Google pairing handoff when Google Messages is unpaired', 
   await expect(page.locator('#gm-reconnect-btn')).toHaveText('Copy pair command');
   await page.locator('#gm-reconnect-btn').click();
 
-  await expect.poll(async () => page.evaluate(() => window.__openMessageClipboard)).toBe('openmessage pair');
+  await expect.poll(async () => page.evaluate(() => window.__openMessageClipboard)).toBe('openmessage pair --google');
   await expect(page.locator('#thread-feedback')).toContainText('Pair command copied.');
 });
 

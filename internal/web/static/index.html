@@ -9094,8 +9094,8 @@ body::after {
       await nativeBridge.startGooglePairing();
       return;
     }
-    await copyTextToClipboard('openmessage pair');
-    showThreadFeedback('Pair command copied. Run `openmessage pair` in Terminal to connect Google Messages.');
+    await copyTextToClipboard('openmessage pair --google');
+    showThreadFeedback('Pair command copied. Run `openmessage pair --google` in Terminal, paste your Messages for web cookies, then confirm the emoji on your phone.');
   }
 
   function closeContextMenu() {

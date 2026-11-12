@@ -1732,8 +1732,14 @@ Key facts:
   UI** surfaces a "Google Messages isn't sending — Re-pair" banner when
   `google.needs_repair` is set (3 consecutive Google send failures while
   connected). Issue #43 tracks adding the same affordance to the native view.
-- **QR pairing is dead** — Google disabled device-pairing QR for many accounts.
-  Use **Google Account pairing**.
+- **New QR pairing is no longer supported by OpenMessage.** Google
+  [documents its withdrawal in the US](https://support.google.com/messages/answer/9077245?co=GENIE.Platform%3DDesktop&hl=en),
+  and the [upstream transport retired QR login](https://github.com/mautrix/gmessages/releases/tag/v0.2605.0).
+  Use **Google Account pairing** with emoji confirmation. Bare `openmessage pair`
+  prints instructions without touching the session; use `pair --google`,
+  `--google-file path`, or (macOS only) `--google-chrome [profile]` to start.
+  Existing sessions still load normally; do not remove one solely because it
+  originated from QR pairing.
 
 ### Re-pair recipe (the one that works)
 
