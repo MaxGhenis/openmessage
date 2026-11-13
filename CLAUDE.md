@@ -128,6 +128,48 @@ come from the local store (v2 when the daemon reports v2-primary for the same
 data dir); sends, reactions, transcripts, and `get_status` route through the
 running daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth
 semantics.
+Every conversation ID a read tool returns, `resolve_contact_routes` included,
+comes from that serving store, and the send tools take exactly those IDs. On
+a v2-primary daemon the outbox takes v2 conversation IDs only and answers any
+other ID, a Google Messages thread number included, with a 404 that says
+`unknown conversation_id`. Reads resolve a remote ID (#155); sends never do,
+and neither does `resolve_contact_routes`, because Google thread numbers are
+device-local and a phone change re-numbers them (#177). The route tool finds
+a person by their number in any written form or by a name only the legacy
+store holds. A query that reads as a phone number (`phoneline.Number`: 7 to
+15 digits, at most one `+` before them, and nothing else but white space,
+dashes, dots, slashes and parentheses) names a line, which both stores match
+as `send_message` matches a recipient, by the last ten digits of each value
+that reads as a number or as a WhatsApp JID of one: their SQL calls the Go
+matcher in `internal/phoneline`, which SQLite knows as `om_phone_line_match`,
+so separators and a country prefix don't matter, a shorter number matches a
+longer one only at its end, digits inside an email address, a Signal UUID, a
+WhatsApp LID or a name match nothing, and the match runs before the limit. A
+name that holds digits, in any script, stays a name, and `send_message`
+refuses it as an SMS recipient. Other text matches a title or the name,
+number, phone or email of a participant entry, never a JSON key: the searches
+decode JSON escapes and ignore only ASCII case, as SQLite's `LIKE` and
+`lower()` do. A value that a name query finds on a card or a legacy thread and
+that reads as no phone number, such as an email address, which the legacy
+Google Chat importer files as a number, or an SMS short code, names whoever
+holds it as a whole address (`SearchConversationsByAddress`, with ASCII case
+and the white space around each value aside), never someone whose own address,
+number or title holds it. Both stores' SQL compares those values by the key
+that `addressmatch.Key` writes, through a Go function SQLite knows as
+`om_address_match`. The tool keys its lookups the same way, so it looks up each
+address once. Call `om_address_match` and `om_phone_line_match` only through
+`addressmatch.SQL` and `phoneline.SQL`, which cast each argument to BLOB. The
+`modernc.org/sqlite` driver hands a Go function a TEXT argument only up to its
+first NUL, so values that differ after one would match. Threads that share a
+time come in conversation ID order in both stores. The route tool ignores the
+account's owner, whom most threads list: a thread that a query matches only
+through the owner's entry or the owner's own messages gives no route. v2's
+conversation search skips the owner's identity. The legacy search skips
+participant entries that carry an `is_me` or `isMe` flag and matches only
+incoming messages' senders. Both skip the owner before their limit and, like
+the address-book lookup, match `%` and `_` literally, but an owner's entry
+without the flag still matches. In client mode the route tool asks the daemon
+whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

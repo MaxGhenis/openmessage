@@ -644,6 +644,52 @@ func TestSearchConversationsByMetadata(t *testing.T) {
 	}
 }
 
+// The legacy store keeps the owner's name and number on the owner's outgoing
+// messages, so a sender match on them would return every thread the owner
+// wrote in. A search for the owner matches no thread through the owner's own
+// messages, while an incoming message's sender still matches.
+func TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "c1",
+		Name:           "+1 (267) 555-0100",
+		Participants:   `[{"name":"","number":"+12675550100"}]`,
+		LastMessageTS:  2001,
+		SourcePlatform: "sms",
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	for _, message := range []*Message{
+		{MessageID: "m1", ConversationID: "c1", SenderName: "Nathan", SenderNumber: "+12675550100", Body: "See you soon", TimestampMS: 2000, SourcePlatform: "sms"},
+		{MessageID: "m2", ConversationID: "c1", SenderName: "Sam Owner", SenderNumber: "+15550009999", IsFromMe: true, Body: "On my way", TimestampMS: 2001, SourcePlatform: "sms"},
+	} {
+		if err := store.UpsertMessage(message); err != nil {
+			t.Fatalf("seed message %s: %v", message.MessageID, err)
+		}
+	}
+	if err := store.UpsertContact(&Contact{ContactID: "contact-owner", Name: "Sam Owner", Number: "+15550009999"}); err != nil {
+		t.Fatalf("seed the owner's contact card: %v", err)
+	}
+
+	for _, query := range []string{"Sam Owner", "+15550009999"} {
+		got, err := store.SearchConversationsByMetadata(query, 10)
+		if err != nil {
+			t.Fatalf("search %q: %v", query, err)
+		}
+		if len(got) != 0 {
+			t.Errorf("search for the owner's %q = %d results (first %q), want none", query, len(got), got[0].ConversationID)
+		}
+	}
+	got, err := store.SearchConversationsByMetadata("Nathan", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 1 || got[0].ConversationID != "c1" {
+		t.Fatalf("search for Nathan = %+v, want c1", got)
+	}
+}
+
 func TestApplyConversationSnapshotGuardsStaleState(t *testing.T) {
 	store := newTestStore(t)
 

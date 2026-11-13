@@ -90,6 +90,11 @@ func (s *routingReadSource) SearchConversationsByMetadata(query string, limit in
 	}}, nil
 }
 
+func (s *routingReadSource) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
+	s.calls["phone_line_search"]++
+	return nil, nil
+}
+
 func (s *routingReadSource) PlatformStats() ([]db.PlatformStat, error) {
 	s.calls["platform_stats"]++
 	return []db.PlatformStat{{Platform: "sms", Count: 42, LatestMS: 200, LatestRecvMS: 100}}, nil

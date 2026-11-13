@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/maxghenis/openmessage/internal/addressmatch"
+	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
 // conversationColumns is the canonical column list for SELECT queries on conversations.
@@ -345,31 +348,197 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 	return scanConversations(rows)
 }
 
+// SearchConversationsByMetadata matches a conversation by its name, a
+// participant entry, or the sender of a message in it. A participant entry
+// matches through the text of its name, number, phone or email, or, for a
+// bare string, the string; JSON keys, flags and IDs match nothing, and the
+// search decodes escapes. Most threads list the account's owner, so a
+// participant match skips entries that is_me or isMe flags as the owner's,
+// or the owner's name or number would find every thread. The owner's
+// outgoing messages carry the owner's name and number too, so sender matches
+// count incoming messages only. The SQL skips both before its LIMIT, so
+// threads that match only through the owner never crowd out a match. The
+// query matches literally: % and _ match only themselves, as in v2's search.
+// Threads that share a time come in conversation ID order, as v2's do, so a
+// limit keeps the same threads whichever store serves the reads.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
+	pattern := "%" + escapeLikePattern(query) + "%"
 	rows, err := s.db.Query(`
 		SELECT DISTINCT `+conversationColumns+`
 		FROM conversations
-		WHERE name LIKE ?
-			OR participants LIKE ?
+		WHERE name LIKE ? ESCAPE '\'
+			OR EXISTS (
+				SELECT 1
+				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
+				WHERE CASE p.type
+					WHEN 'text' THEN p.value LIKE ? ESCAPE '\'
+					WHEN 'object' THEN NOT `+sqlOwnerFlag+` AND EXISTS (
+						SELECT 1
+						FROM json_each(p.value) AS field
+						WHERE field.key IN ('name', 'number', 'phone', 'email')
+							AND field.type = 'text'
+							AND field.value LIKE ? ESCAPE '\'
+					)
+					ELSE 0
+				END
+			)
 			OR conversation_id IN (
 				SELECT DISTINCT conversation_id
 				FROM messages
-				WHERE sender_name LIKE ? OR sender_number LIKE ?
+				WHERE is_from_me = 0 AND (sender_name LIKE ? ESCAPE '\' OR sender_number LIKE ? ESCAPE '\')
 			)
 			OR conversation_id IN (
 				SELECT DISTINCT m.conversation_id
 				FROM messages m
 				JOIN contacts c ON c.number = m.sender_number
-				WHERE c.name LIKE ? OR c.number LIKE ?
+				WHERE m.is_from_me = 0 AND (c.name LIKE ? ESCAPE '\' OR c.number LIKE ? ESCAPE '\')
 			)
-		ORDER BY last_message_ts DESC
+		ORDER BY last_message_ts DESC, conversation_id
 		LIMIT ?
-	`, "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%", limit)
+	`, pattern, pattern, pattern, pattern, pattern, pattern, pattern, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanConversations(rows)
+}
+
+// SearchConversationsByPhoneLine returns the conversations with someone on
+// the phone line that line, a phoneline.Line, names, newest first, then in
+// conversation ID order, and at most limit. Someone counts through the
+// number (or, without one, the phone) of a participant entry without the
+// owner's flag, through a bare string entry, or as the sender of an
+// incoming message, whom the roster may lack. A value counts only where it
+// reads as a phone number or a WhatsApp JID of one, and then matches as
+// send_message matches a recipient, through phoneline, so separators and a
+// country prefix don't matter. The match runs before the LIMIT, so numbers
+// that only contain the line's digits never crowd out one that ends with
+// them.
+func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conversation, error) {
+	rows, err := s.db.Query(phoneLineSearchSQL(phoneline.SQL), line, line, line, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
+// SearchConversationsByPhoneLine runs phoneLineSearchSQL. match writes a call
+// of the SQL function that tests values against the line, as phoneline.SQL
+// does. The query takes the line three times, then the limit.
+// A thread can hold thousands of messages from a few numbers, so match tests
+// each distinct sender number once, in sender_numbers, and the messages from
+// the numbers on the line then give their threads. SQLite pushes no WHERE
+// term down into a MATERIALIZED CTE, so match never reaches the scan of
+// messages.
+func phoneLineSearchSQL(match func(args ...string) string) string {
+	return `
+		WITH sender_numbers AS MATERIALIZED (
+			SELECT DISTINCT sender_number FROM messages
+		)
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE EXISTS (
+				SELECT 1
+				FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
+				WHERE CASE p.type
+					WHEN 'text' THEN ` + match("?", "p.value") + `
+					WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND ` + match("?", sqlEntryText("number"), sqlEntryText("phone")) + `
+					ELSE 0
+				END
+			)
+			OR conversation_id IN (
+				SELECT conversation_id
+				FROM messages
+				WHERE is_from_me = 0 AND sender_number IN (
+					SELECT sender_number FROM sender_numbers WHERE ` + match("?", "sender_number") + `
+				)
+			)
+		ORDER BY last_message_ts DESC, conversation_id
+		LIMIT ?
+	`
+}
+
+// SearchConversationsByAddress returns the conversations with someone who
+// holds address as a whole, newest first, then in conversation ID order, and
+// at most limit. Someone holds it through the number, phone or email text of
+// a participant entry without the owner's flag, through a bare string entry,
+// or as the sender of an incoming message, whom the roster may lack. A value
+// matches address when the two share an addressmatch key. The key drops the
+// white space around a value, which a card or an importer may keep, lowers
+// ASCII letters and keeps every other byte. A value that only contains
+// address, a name, or a title matches nothing: the legacy Google Chat
+// importer files an email address as a number, SMS threads list a short code
+// as one, and another person's address or phone number can hold either. The
+// match runs before the LIMIT. A blank address matches nothing.
+func (s *Store) SearchConversationsByAddress(address string, limit int) ([]*Conversation, error) {
+	key := addressmatch.Key(address)
+	if key == "" || limit <= 0 {
+		return []*Conversation{}, nil
+	}
+	rows, err := s.db.Query(addressSearchSQL, key, key, key, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
+// SearchConversationsByAddress runs addressSearchSQL, which takes the
+// address's key three times, then the limit, and compares each value through
+// addressmatch.SQL. The function can't use the sender_number index, so
+// the query compares each distinct sender number once, in sender_numbers,
+// and then finds the matching numbers' messages through the index.
+var addressSearchSQL = `
+	WITH sender_numbers AS MATERIALIZED (
+		SELECT DISTINCT sender_number FROM messages
+	)
+	SELECT ` + conversationColumns + `
+	FROM conversations
+	WHERE EXISTS (
+			SELECT 1
+			FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
+			WHERE CASE p.type
+				WHEN 'text' THEN ` + addressmatch.SQL("?", "p.value") + `
+				WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND ` + addressmatch.SQL("?", sqlEntryText("number"), sqlEntryText("phone"), sqlEntryText("email")) + `
+				ELSE 0
+			END
+		)
+		OR conversation_id IN (
+			SELECT conversation_id
+			FROM messages
+			WHERE is_from_me = 0 AND sender_number IN (
+				SELECT sender_number FROM sender_numbers WHERE ` + addressmatch.SQL("?", "sender_number") + `
+			)
+		)
+	ORDER BY last_message_ts DESC, conversation_id
+	LIMIT ?
+`
+
+// sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a
+// json_each row over a conversation's participants. Only a JSON true counts,
+// and json_type gives NULL for a missing key, hence IS.
+const sqlOwnerFlag = `(json_type(p.value, '$.is_me') IS 'true' OR json_type(p.value, '$.isMe') IS 'true')`
+
+// sqlEntryText is an object entry's text under key, or NULL when the key is
+// missing or holds anything but text. p is a json_each row over a
+// conversation's participants.
+func sqlEntryText(key string) string {
+	return `CASE json_type(p.value, '$.` + key + `') WHEN 'text' THEN json_extract(p.value, '$.` + key + `') END`
+}
+
+// sqlParticipantEntries is the json_each source for a participants column:
+// the elements of a JSON array, and none for anything else. The JSON
+// functions fail on malformed JSON, such as an empty string, and SQLite can
+// evaluate both sides of an AND, so CASE guards them here and on p.value.
+func sqlParticipantEntries(column string) string {
+	return `json_each(CASE WHEN json_valid(` + column + `) THEN CASE json_type(` + column + `) WHEN 'array' THEN ` + column + ` ELSE '[]' END ELSE '[]' END)`
+}
+
+// escapeLikePattern makes user text match literally inside a LIKE pattern
+// that declares '\' as its escape character.
+func escapeLikePattern(text string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(text)
 }
 
 func scanConversations(rows interface {
