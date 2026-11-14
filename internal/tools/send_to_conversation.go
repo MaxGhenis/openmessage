@@ -29,7 +29,10 @@ func sendToConversationTool(v2Enabled ...bool) mcp.Tool {
 	}
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
-		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+		options = append(options,
+			mcp.WithString("reply_to_id", mcp.Description(replyToIDDescription)),
+			mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)),
+		)
 	}
 	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
@@ -51,8 +54,15 @@ func sendToConversationHandler(a *app.App, v2Options ...*V2Dependencies) server.
 		if message == "" {
 			return errorResult("message is required"), nil
 		}
+		replyToID, err := replyToIDArg(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
 		if v2 != nil {
-			return submitV2Text(ctx, a, v2, args, conversationID, message), nil
+			return submitV2Text(ctx, a, v2, args, conversationID, message, replyToID), nil
+		}
+		if replyToID != "" {
+			return errorResult(legacyReplyRefusal), nil
 		}
 
 		conv, msg, err := sendTextToConversation(a, conversationID, message)

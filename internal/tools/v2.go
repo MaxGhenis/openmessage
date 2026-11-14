@@ -37,6 +37,65 @@ const v2DeliveryDescription = " With v2 sending enabled, this waits for a settle
 
 const v2IdempotencyDescription = "Optional retry key for the exact same send. Every result echoes the key in use; reuse the same key only when repeating a send whose response was lost. Omit it to mint a new intent."
 
+// replyToIDDescription documents reply_to_id on the v2 text-send
+// descriptors. Only the durable outbox submit checks a reply target against
+// the send's conversation, so only the v2 descriptors offer the argument.
+const replyToIDDescription = "Optional message_id of the message to quote-reply to, as get_conversation and search_messages return it. It must name a message of the conversation this send goes to: the app refuses any other ID as reply_target_unavailable and sends nothing. Omit it for a plain message. The reply target belongs to the send's intent: the app refuses an idempotency_key repeated with a different reply_to_id instead of replaying the first send. Where the app sends through its legacy route instead of the durable outbox, the tool refuses a reply_to_id rather than drop it."
+
+// replyTargetUnavailableCode is the outbox's refusal of a reply target, as
+// the app's local API names it (HTTP 422).
+const replyTargetUnavailableCode = "reply_target_unavailable"
+
+// legacyReplyRefusal is why the in-process legacy send path refuses
+// reply_to_id. Only the durable outbox checks that a reply target belongs to
+// the send's conversation. The legacy senders either take no reply ID, so the
+// reply would go out as a plain message the caller didn't ask for, or hand
+// the ID to the platform unchecked, so a quote of another conversation's
+// message could go out.
+const legacyReplyRefusal = "Message NOT sent: reply_to_id needs the durable outbox (v2 sending), which checks that the reply target belongs to this conversation. This server sends through the legacy route, which does not check it, so it refuses the reply rather than send it unchecked or as a plain message. Send without reply_to_id, or run with v2 sending (OPENMESSAGES_V2_SEND=1)."
+
+// replyToIDArg reads the optional reply_to_id argument. Absent, null and
+// blank all mean a plain message, as on the app's HTTP route. Any other
+// non-string value is an error, not a plain message: dropping a reply target
+// the caller named would send something the caller did not ask for.
+func replyToIDArg(args map[string]any) (string, error) {
+	raw, present := args["reply_to_id"]
+	if !present || raw == nil {
+		return "", nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("reply_to_id must be a string, the message_id of the message to reply to (got %T)", raw)
+	}
+	return strings.TrimSpace(value), nil
+}
+
+// replyTargetUnavailableResult reports a reply the outbox refused at submit:
+// its target is no message of the send's conversation that the platform can
+// quote. The refusal comes before anything is queued, so unlike a delivery
+// outcome it is a tool error: sending again with the right target is safe.
+// detail is the in-process refusal's own text; the app's HTTP answer carries
+// only the code.
+func replyTargetUnavailableResult(conversationID, replyToID, detail string) *mcp.CallToolResult {
+	text := fmt.Sprintf(
+		"Message NOT sent: the app refused reply_to_id %q for conversation %q (%s). It names no message of this conversation that the app can quote. Nothing was queued; take the message_id from get_conversation for this conversation, or from search_messages, and send again.",
+		replyToID, conversationID, replyTargetUnavailableCode,
+	)
+	payload := map[string]any{
+		"ok":              false,
+		"error":           text,
+		"error_code":      replyTargetUnavailableCode,
+		"conversation_id": conversationID,
+		"reply_to_id":     replyToID,
+	}
+	if detail != "" {
+		payload["detail"] = detail
+	}
+	result := structuredResult(payload, text)
+	result.IsError = true
+	return result
+}
+
 func activeV2(options []*V2Dependencies) *V2Dependencies {
 	if len(options) == 0 || options[0] == nil || !options[0].Enabled {
 		return nil
@@ -133,6 +192,9 @@ func newMCPIdempotencyKey() (string, error) {
 	}, "-"), nil
 }
 
+// submitV2Text queues one text send on the durable outbox and waits for it to
+// settle. A non-empty replyToID makes it a quote-reply: the submit checks
+// that the target is a message of conversationID before it queues anything.
 func submitV2Text(
 	ctx context.Context,
 	a *app.App,
@@ -140,6 +202,7 @@ func submitV2Text(
 	args map[string]any,
 	conversationID string,
 	body string,
+	replyToID string,
 ) *mcp.CallToolResult {
 	key, err := v2IdempotencyKey(args)
 	if err != nil {
@@ -148,9 +211,13 @@ func submitV2Text(
 	submission, err := v2.submitText(ctx, a, v2wire.TextInput{
 		ConversationID: conversationID,
 		Body:           body,
+		ReplyToID:      replyToID,
 		IdempotencyKey: key,
 	})
 	if err != nil {
+		if errors.Is(err, v2wire.ErrReplyTargetUnavailable) {
+			return replyTargetUnavailableResult(conversationID, replyToID, err.Error())
+		}
 		return errorResult(fmt.Sprintf("failed to submit message: %v", err))
 	}
 	return waitForV2Delivery(ctx, v2, submission, key)

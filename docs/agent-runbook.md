@@ -1033,6 +1033,12 @@ running app:
   #140, with the same do-not-resend idempotency contract. With the app closed,
   send tools return an actionable "start the OpenMessage app" error — they
   never fall back to opening their own connections.
+- **Quote-replies go through the outbox too.** `send_to_conversation` and
+  `send_message` pass `reply_to_id` to `/api/v1/outbox/messages`, which
+  answers `422 reply_target_unavailable` and queues nothing when the target
+  names no message of the send's conversation. Against an app without v2
+  sending the tools refuse `reply_to_id` rather than hand it to `/api/send`,
+  which does not check that the target belongs to the conversation.
 - **Transcripts save through the daemon too** (`/api/transcript`), so
   `set_message_transcript` never writes the live `messages.db` from the
   client. `draft_message` and `import_messages` still write it from the

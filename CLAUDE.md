@@ -150,6 +150,15 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
 - `send_message`, `draft_message`, `list_contacts`, `get_status`
+- `send_to_conversation` and `send_message` take an optional `reply_to_id`
+  with v2 sending: the `message_id` that `get_conversation` or
+  `search_messages` returns. The outbox submit (`v2wire.SubmitTextV2`, or
+  `SubmitText` on the mirror) refuses a target outside the send's
+  conversation as `reply_target_unavailable` before it queues anything, and
+  client mode passes on the app's 422. The legacy send routes don't check a
+  target, so the tools refuse `reply_to_id` there, and so does
+  `send_message`'s in-process SMS route, which asks the phone for the thread
+  before any check could run
 - `download_media` — resolves a message ID or a `v2msg:<message>:<n>` media_id
   (v2 reads go through the running app in client mode), downloads a pending
   v2 attachment into the store, and with `save`/`output_path` writes a 0600

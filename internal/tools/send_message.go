@@ -55,7 +55,10 @@ func sendMessageTool(v2Enabled ...bool) mcp.Tool {
 	}
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
-		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+		options = append(options,
+			mcp.WithString("reply_to_id", mcp.Description(sendMessageReplyToIDDescription)),
+			mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)),
+		)
 	}
 	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
@@ -63,6 +66,17 @@ func sendMessageTool(v2Enabled ...bool) mcp.Tool {
 	)
 	return mcp.NewTool("send_message", options...)
 }
+
+// sendMessageReplyToIDDescription documents reply_to_id on the v2
+// send_message descriptor. send_message finds its conversation from the
+// recipient, so the reply target must belong to that thread.
+const sendMessageReplyToIDDescription = "Optional message_id of the message to quote-reply to, as get_conversation and search_messages return it. It must name a message of the thread this send goes to (this recipient on this platform); the app refuses any other ID as reply_target_unavailable and sends nothing. Prefer send_to_conversation for a reply in a thread you already have. A server that runs its own transports refuses SMS/RCS replies here, since it asks the phone to get or create the thread before any check could run, and the legacy send route refuses every reply_to_id; neither drops it."
+
+// directSMSReplyRefusal is why the in-process SMS route refuses reply_to_id.
+// The route asks the phone to get or create the number's thread, which would
+// run, and could create a thread, before the outbox checks the reply target
+// against it. send_to_conversation names the thread up front.
+const directSMSReplyRefusal = "Message NOT sent: send_message can't quote-reply over SMS/RCS on this server. It asks the phone to get or create the number's thread, which would come before any check of the reply target against that thread. Use send_to_conversation with reply_to_id and the conversation_id that get_conversation or search_messages gave for the message."
 
 func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHandlerFunc {
 	v2 := activeV2(v2Options)
@@ -78,6 +92,10 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 		if message == "" {
 			return errorResult("message is required"), nil
 		}
+		replyToID, err := replyToIDArg(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
 
 		switch platform {
 		case "whatsapp":
@@ -89,7 +107,10 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 				if err := ensureDirectConversationExists(a, conversationID, "whatsapp", name, number, isGroup, time.Now().UnixMilli()); err != nil {
 					return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
 				}
-				return submitV2Text(ctx, a, v2, args, conversationID, message), nil
+				return submitV2Text(ctx, a, v2, args, conversationID, message, replyToID), nil
+			}
+			if replyToID != "" {
+				return errorResult(legacyReplyRefusal), nil
 			}
 			msg, err := sendWhatsAppText(a, conversationID, message, "")
 			if err != nil {
@@ -120,7 +141,10 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 				if err := ensureDirectConversationExists(a, conversationID, "signal", name, number, isGroup, time.Now().UnixMilli()); err != nil {
 					return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
 				}
-				return submitV2Text(ctx, a, v2, args, conversationID, message), nil
+				return submitV2Text(ctx, a, v2, args, conversationID, message, replyToID), nil
+			}
+			if replyToID != "" {
+				return errorResult(legacyReplyRefusal), nil
 			}
 			msg, err := sendSignalText(a, conversationID, message, "")
 			if err != nil {
@@ -150,6 +174,12 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 			if !looksLikePhoneNumber(recipient) {
 				return errorResult(fmt.Sprintf("SMS recipient must be a phone number with country code (e.g. +15551234567), got %q", recipient)), nil
 			}
+			if replyToID != "" {
+				if v2 == nil {
+					return errorResult(legacyReplyRefusal), nil
+				}
+				return errorResult(directSMSReplyRefusal), nil
+			}
 			conv, err := getOrCreateGoogleConversation(a, recipient)
 			if err != nil {
 				if !a.HandleGoogleAuthExpiredError(err) {
@@ -164,7 +194,8 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 				return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
 			}
 			if v2 != nil {
-				return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message), nil
+				// No reply here: the route refused reply_to_id above.
+				return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message, ""), nil
 			}
 			myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
 			payload := app.BuildSendPayload(conv.GetConversationID(), message, "", myParticipantID, simPayload)

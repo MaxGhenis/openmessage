@@ -142,7 +142,7 @@ To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web
 | `get_conversation` | Messages in a specific conversation |
 | `search_messages` | Full-text search across all messages |
 | `send_message` | Send a direct text by platform. Defaults to SMS/RCS and also supports direct WhatsApp/Signal recipients |
-| `send_to_conversation` | Send a text reply directly to an existing conversation ID |
+| `send_to_conversation` | Send a text to an existing conversation ID. With v2 sending, `reply_to_id` quote-replies to one of its messages |
 | `send_media_to_conversation` | Send a local file attachment to an existing conversation ID |
 | `send_group_message` | Send to a group conversation by conversation ID |
 | `react_to_message` | Add, remove, or switch a reaction on an existing message |
@@ -169,6 +169,7 @@ To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web
 - Search WhatsApp for a keyword: `search_messages(query="airbnb")`
 - Send a direct Signal message: `send_message(platform="signal", recipient="+15551230000", message="On my way")`
 - Send a text into a route-aware thread: `send_to_conversation(conversation_id="whatsapp:15551234567@s.whatsapp.net", message="On my way")`
+- Quote-reply in a thread (v2 sending): `send_to_conversation(conversation_id="<id>", message="Agreed", reply_to_id="<message_id>")`, with both IDs from `get_conversation`
 - Send a photo from disk: `send_media_to_conversation(conversation_id="signal-group:abc123", file_path="/tmp/photo.jpg", caption="Here")`
 - React to a message: `react_to_message(conversation_id="signal-group:abc123", message_id="signal:...", emoji="🔥")`
 - Resolve a person's available routes before sending: `resolve_contact_routes(query="Taylor")`

@@ -91,15 +91,25 @@ func daemonAmbiguousResult(idempotencyKey string, cause error) *mcp.CallToolResu
 	}, text)
 }
 
+// legacyDaemonReplyRefusal is why client mode refuses reply_to_id when the app
+// sends through its legacy /api/send route. That route hands the ID to the
+// platform without checking that it names a message of the conversation, so
+// a quote of another conversation's message could go out; only the app's
+// durable outbox checks it.
+const legacyDaemonReplyRefusal = "Message NOT sent: the running OpenMessage app sends through its legacy route, which does not check that a reply target belongs to the conversation, so this tool refuses reply_to_id there rather than send the reply unchecked or as a plain message. Send without reply_to_id, or run the app with v2 sending (OPENMESSAGES_V2_SEND=1), whose durable outbox checks it."
+
 // daemonSubmitTextAndWait submits one durable text send to the daemon outbox
 // and waits (bounded) for it to settle, mirroring the in-process v2 result
-// contract so agents see identical semantics in both serve modes.
+// contract so agents see identical semantics in both serve modes. A non-empty
+// replyToID makes it a quote-reply, which the app checks against
+// conversationID before it queues anything.
 func daemonSubmitTextAndWait(
 	ctx context.Context,
 	daemon *localapi.Client,
 	args map[string]any,
 	conversationID string,
 	body string,
+	replyToID string,
 ) *mcp.CallToolResult {
 	key, err := v2IdempotencyKey(args)
 	if err != nil {
@@ -108,9 +118,13 @@ func daemonSubmitTextAndWait(
 	submission, err := daemon.SubmitText(ctx, localapi.TextSubmission{
 		ConversationID: conversationID,
 		Body:           body,
+		ReplyToID:      replyToID,
 		IdempotencyKey: key,
 	})
 	if err != nil {
+		if localapi.IsReplyTargetUnavailable(err) {
+			return replyTargetUnavailableResult(conversationID, replyToID, "")
+		}
 		if localapi.IsDeterministicRejection(err) {
 			return errorResult(fmt.Sprintf("send rejected by the app: %v", err))
 		}
@@ -228,12 +242,19 @@ func daemonSendToConversationHandler(options Options) server.ToolHandlerFunc {
 		if message == "" {
 			return errorResult("message is required"), nil
 		}
+		replyToID, err := replyToIDArg(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
 		status, failure := daemonStatusOrResult(ctx, daemon)
 		if failure != nil {
 			return failure, nil
 		}
 		if status.SendsViaOutbox() {
-			return daemonSubmitTextAndWait(ctx, daemon, args, conversationID, message), nil
+			return daemonSubmitTextAndWait(ctx, daemon, args, conversationID, message, replyToID), nil
+		}
+		if replyToID != "" {
+			return errorResult(legacyDaemonReplyRefusal), nil
 		}
 		return daemonLegacySendText(ctx, daemon, args, conversationID, message), nil
 	}
@@ -251,6 +272,10 @@ func daemonSendMessageHandler(options Options) server.ToolHandlerFunc {
 		}
 		if message == "" {
 			return errorResult("message is required"), nil
+		}
+		replyToID, err := replyToIDArg(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
 		}
 
 		var conversationID string
@@ -290,7 +315,10 @@ func daemonSendMessageHandler(options Options) server.ToolHandlerFunc {
 			return failure, nil
 		}
 		if status.SendsViaOutbox() {
-			return daemonSubmitTextAndWait(ctx, daemon, args, conversationID, message), nil
+			return daemonSubmitTextAndWait(ctx, daemon, args, conversationID, message, replyToID), nil
+		}
+		if replyToID != "" {
+			return errorResult(legacyDaemonReplyRefusal), nil
 		}
 		return daemonLegacySendText(ctx, daemon, args, conversationID, message), nil
 	}

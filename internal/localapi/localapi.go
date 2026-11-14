@@ -705,6 +705,24 @@ func IsDeterministicRejection(err error) bool {
 	}
 }
 
+// IsReplyTargetUnavailable reports whether err is the daemon refusing a send's
+// reply_to_id: HTTP 422 with {"error":"reply_target_unavailable"}. The daemon
+// answers so when the target names no message of the send's conversation that
+// its platform can quote, and it refuses before queueing anything.
+func IsReplyTargetUnavailable(err error) bool {
+	responseErr, ok := AsResponseError(err)
+	if !ok || responseErr.StatusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(responseErr.Body), &body) != nil {
+		return false
+	}
+	return body.Error == "reply_target_unavailable"
+}
+
 // IsAuthError reports whether err is the daemon refusing our control token.
 func IsAuthError(err error) bool {
 	responseErr, ok := AsResponseError(err)
