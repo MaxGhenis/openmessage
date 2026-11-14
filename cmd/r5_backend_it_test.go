@@ -704,7 +704,7 @@ func assertR5IntegrityReport(
 		t.Errorf("target counts = %+v", report.Target.Counts)
 	}
 	if report.Target.Counts["identities"] != 8 || report.Target.Counts["conversation_participants"] != 8 ||
-		report.Target.Counts["message_attachments"] != 2 {
+		report.Target.Counts["message_attachments"] != 3 {
 		t.Errorf("identity/participant/attachment target counts = %+v", report.Target.Counts)
 	}
 	if report.Media.LegacyAttachments != 2 || report.Media.PendingAttachments != 2 ||

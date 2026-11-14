@@ -74,6 +74,18 @@ func TestFirstAttachmentMIMEReadsStoredAttachmentsThenTheOutbox(t *testing.T) {
 	); err != nil {
 		t.Fatalf("EnqueueOutgoingMessage(): %v", err)
 	}
+	// A media message queued before sends carried their image has only the
+	// outbox's.
+	unattached := outboxTestMediaItem("reply-target-unattached")
+	if _, _, err := outbox.EnqueueOutgoingMediaMessage(
+		context.Background(),
+		unattached,
+		outboxTestOutgoingMessage(unattached, ""),
+		outboxTestAttachment(),
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(unattached): %v", err)
+	}
+	mustExec(t, store.db, `DELETE FROM message_attachments WHERE message_id = ?`, unattached.LocalMessageID)
 	// A stored attachment row outranks the outbox's for the same message.
 	shadowed := outboxTestMediaItem("reply-target-shadowed")
 	if _, _, err := outbox.EnqueueOutgoingMediaMessage(
@@ -84,7 +96,7 @@ func TestFirstAttachmentMIMEReadsStoredAttachmentsThenTheOutbox(t *testing.T) {
 	); err != nil {
 		t.Fatalf("EnqueueOutgoingMediaMessage(shadowed): %v", err)
 	}
-	insertAttachment(shadowed.LocalMessageID, 0, "audio/aac")
+	mustExec(t, store.db, `UPDATE message_attachments SET mime = 'audio/aac' WHERE message_id = ?`, shadowed.LocalMessageID)
 
 	for _, test := range []struct {
 		messageID string
@@ -94,6 +106,7 @@ func TestFirstAttachmentMIMEReadsStoredAttachmentsThenTheOutbox(t *testing.T) {
 		{messageID: "message-ordinals", wantMIME: "image/jpeg", wantOK: true},
 		{messageID: "message-none"},
 		{messageID: media.LocalMessageID, wantMIME: "image/png", wantOK: true},
+		{messageID: unattached.LocalMessageID, wantMIME: "image/png", wantOK: true},
 		{messageID: text.LocalMessageID},
 		{messageID: shadowed.LocalMessageID, wantMIME: "audio/aac", wantOK: true},
 		{messageID: "message-missing"},

@@ -602,10 +602,7 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 	})
 
 	mux.Handle("/", withPrimaryFixtureProjection(
-		withConfirmedMediaProjection(
-			withSyntheticReadReceipts(base, &syntheticReadReceipts),
-			v2Store,
-		),
+		withSyntheticReadReceipts(base, &syntheticReadReceipts),
 		store,
 	))
 
@@ -618,76 +615,6 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 		_ = os.RemoveAll(dataDir)
 	}
 	return server, cleanup, nil
-}
-
-// withConfirmedMediaProjection closes the e2e adapter's confirmation seam.
-// The production media outbox durably owns the uploaded blob, but a confirmed
-// outgoing message is not yet given a message_attachments row. V2-primary
-// reads therefore cannot produce the final /api/media URL. Project the already
-// confirmed durable attachment before serving a thread; no transport result or
-// state is fabricated here.
-func withConfirmedMediaProjection(next http.Handler, store *sqlite.Store) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/messages") {
-			if err := projectConfirmedMediaAttachments(r.Context(), store); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func projectConfirmedMediaAttachments(ctx context.Context, store *sqlite.Store) error {
-	outbox, err := sqlite.NewOutboxRepository(store, time.Now)
-	if err != nil {
-		return err
-	}
-	messages, err := sqlite.NewMessageRepository(store, time.Now)
-	if err != nil {
-		return err
-	}
-	attachments, err := sqlite.NewMessageAttachmentRepository(store, time.Now)
-	if err != nil {
-		return err
-	}
-	rows, err := outbox.ListConfirmedSince(ctx, -1, 1000)
-	if err != nil {
-		return err
-	}
-	for _, row := range rows {
-		if row.Kind != sqlite.OutboxKindMedia || row.LocalMessageID == nil {
-			continue
-		}
-		message, err := messages.GetMessage(ctx, *row.LocalMessageID)
-		if err != nil {
-			return fmt.Errorf("project confirmed media %q: get message: %w", row.OutboxID, err)
-		}
-		attachment, err := outbox.GetOutboxAttachment(ctx, row.OutboxID)
-		if err != nil {
-			return fmt.Errorf("project confirmed media %q: get attachment: %w", row.OutboxID, err)
-		}
-		size := attachment.SizeBytes
-		if err := messages.ImportMessage(ctx, sqlite.MessageProjection{
-			Message: message,
-			Attachments: []sqlite.MessageAttachment{{
-				MessageID: message.MessageID,
-				Ordinal:   attachment.Ordinal,
-				Filename:  attachment.Filename,
-				MIME:      attachment.MIME,
-				SizeBytes: &size,
-			}},
-		}); err != nil {
-			return fmt.Errorf("project confirmed media %q: import attachment: %w", row.OutboxID, err)
-		}
-		if err := attachments.MarkDownloaded(
-			ctx, message.MessageID, attachment.Ordinal, attachment.BlobHash,
-			attachment.SizeBytes, attachment.MIME,
-		); err != nil {
-			return fmt.Errorf("project confirmed media %q: publish blob: %w", row.OutboxID, err)
-		}
-	}
-	return nil
 }
 
 func v2ConversationIDForLegacy(store *db.Store, legacyID string) string {
