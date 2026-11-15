@@ -37,6 +37,9 @@ const (
 	// settleRowFault fails Confirm and MarkStoreFailed after the text's
 	// transport call, so the store loses the call's outcome.
 	settleRowFault
+	// failedRecoveryRowFault fails the recovery of the text's expired lease,
+	// so the text keeps it.
+	failedRecoveryRowFault
 	rowFaultCount
 )
 
@@ -63,6 +66,11 @@ var rowFaultTriggers = map[rowFault]struct{ event, action string }{
 		`UPDATE OF state ON outbox WHEN NEW.state IN ('confirmed', 'store_failed') AND OLD.outbox_id = '%s'`,
 		`RAISE(ABORT, '` + injectedDispatchFault + `')`,
 	},
+	failedRecoveryRowFault: {
+		`UPDATE OF state ON outbox WHEN OLD.state = 'dispatching'
+			AND NEW.state IN ('not_dispatched', 'uncertain') AND OLD.outbox_id = '%s'`,
+		`RAISE(ABORT, '` + injectedDispatchFault + `')`,
+	},
 }
 
 const maxLeaseScriptTexts = 6
@@ -70,10 +78,14 @@ const maxLeaseScriptTexts = 6
 // leaseScript holds one generated history: the texts the test queues over
 // several passes, and the dispatcher's batch limit. Before each pass the clock
 // steps (back, a little, or past several retry delays) and the test may queue
-// new texts; during the pass, each queued text's writes may fail.
+// new texts; during the pass, each queued text's writes may fail. Beside
+// that, each recovery of text i's expired lease fails in every pass before
+// RecoveryFailsUntil[i], as it would on a row with a CHECK it cannot meet,
+// until someone repairs it.
 type leaseScript struct {
-	Limit  int
-	Passes []leaseScriptPass
+	Limit              int
+	Passes             []leaseScriptPass
+	RecoveryFailsUntil []int
 }
 
 type leaseScriptPass struct {
@@ -118,6 +130,12 @@ func (leaseScript) Generate(r *rand.Rand, _ int) reflect.Value {
 		}
 		script.Passes = append(script.Passes, pass)
 	}
+	script.RecoveryFailsUntil = make([]int, maxLeaseScriptTexts)
+	for text := range script.RecoveryFailsUntil {
+		if r.Intn(2) == 0 {
+			script.RecoveryFailsUntil[text] = 1 + r.Intn(len(script.Passes))
+		}
+	}
 	return reflect.ValueOf(script)
 }
 
@@ -139,6 +157,9 @@ func (leaseScript) Generate(r *rand.Rand, _ int) reflect.Value {
 //     remembers of the text's last set-aside, not from the row;
 //   - a due text the store can neither lease nor set aside stays as it was,
 //     and fails its pass; nothing else fails a pass but a lost outcome;
+//   - a text whose expired lease the store fails to recover stays as it was,
+//     holds back no other text and fails no pass, and DispatchHealth counts
+//     each such failure once;
 //   - no fix path calls the transport again for an intent a call may have
 //     sent: each text reaches the transport at most once, as these
 //     transports never prove a call sent nothing, and a called text never
@@ -215,6 +236,13 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 		if err := setRowFaults(raw, texts, pass.Faults); err != nil {
 			return err
 		}
+		recoveryFails := make([]bool, len(texts))
+		for text := range texts {
+			recoveryFails[text] = index < script.RecoveryFailsUntil[text]
+		}
+		if err := setRecoveryFaults(raw, texts, recoveryFails); err != nil {
+			return err
+		}
 		before, err := outboxRows(ctx, service, texts)
 		if err != nil {
 			return fmt.Errorf("pass %d: %w", index, err)
@@ -224,14 +252,16 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		requestsBefore := requestsByID(sender)
+		recoveriesBefore := service.DispatchHealth().FailedRecoveries
 		passErr := service.dispatchPass(ctx)
 		after, err := outboxRows(ctx, service, texts)
 		if err != nil {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		requestsAfter := requestsByID(sender)
-		if err := checkLeasePass(now, script.Limit, pass.Faults, before, after,
-			requestsBefore, requestsAfter, passErr, lostOutcome, chains); err != nil {
+		failedRecoveries := service.DispatchHealth().FailedRecoveries - recoveriesBefore
+		if err := checkLeasePass(now, script.Limit, pass.Faults, recoveryFails, before, after,
+			requestsBefore, requestsAfter, passErr, failedRecoveries, lostOutcome, chains); err != nil {
 			return fmt.Errorf("pass %d at %d: %w", index, now.UnixMilli(), err)
 		}
 		if err := checkUpdatedAt(raw, updatedAt); err != nil {
@@ -242,6 +272,9 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 	// The faults stop, every lease expires and every retry comes due. Each
 	// pass sends up to the batch limit.
 	if err := setRowFaults(raw, texts, nil); err != nil {
+		return err
+	}
+	if err := setRecoveryFaults(raw, texts, nil); err != nil {
 		return err
 	}
 	rows, err := outboxRows(ctx, service, texts)
@@ -295,6 +328,9 @@ const (
 	unreachedLeaseOutcome leaseOutcome = iota
 	// Its called lease expired, and recovery makes it uncertain.
 	recoveredLeaseOutcome
+	// Its called lease expired, and its recovery fails, so it keeps the
+	// lease.
+	unrecoveredLeaseOutcome
 	setAsideLeaseOutcome
 	stuckLeaseOutcome
 	sentLeaseOutcome
@@ -311,9 +347,11 @@ func checkLeasePass(
 	now time.Time,
 	limit int,
 	faults []rowFault,
+	recoveryFails []bool,
 	before, after []sqlite.OutboxItem,
 	requestsBefore, requestsAfter map[string]int,
 	passErr error,
+	failedRecoveries int64,
 	lostOutcome map[string]bool,
 	chains map[string]leaseChain,
 ) error {
@@ -327,8 +365,12 @@ func checkLeasePass(
 
 	outcomes := make([]leaseOutcome, len(before))
 	var due []int
+	var unrecovered int64
 	for text, was := range before {
 		switch {
+		case expiredCalledLease(was, now) && (faultOf(text) == failedRecoveryRowFault || recoveryFails[text]):
+			outcomes[text] = unrecoveredLeaseOutcome
+			unrecovered++
 		case expiredCalledLease(was, now):
 			outcomes[text] = recoveredLeaseOutcome
 		case was.State == sqlite.OutboxDispatching && dueAt(was, now):
@@ -376,6 +418,8 @@ func checkLeasePass(
 	case passErr != nil && !strings.Contains(passErr.Error(), injectedDispatchFault) &&
 		!strings.Contains(passErr.Error(), "the update changed no row"):
 		return fmt.Errorf("pass failed for a reason no fault explains: %w", passErr)
+	case failedRecoveries != unrecovered:
+		return fmt.Errorf("pass counted %d failed recoveries, want %d", failedRecoveries, unrecovered)
 	}
 
 	for text, was := range before {
@@ -394,7 +438,7 @@ func checkLeasePass(
 		}
 
 		switch outcomes[text] {
-		case unreachedLeaseOutcome, stuckLeaseOutcome:
+		case unreachedLeaseOutcome, stuckLeaseOutcome, unrecoveredLeaseOutcome:
 			if !reflect.DeepEqual(row, was) {
 				return fmt.Errorf("text %d the pass should leave as it was (outcome %d) changed from %+v to %+v",
 					text, outcomes[text], was, row)
@@ -496,6 +540,30 @@ func setRowFaults(raw *sql.DB, texts []Submission, faults []rowFault) error {
 				SELECT %s;
 			END`, text, fmt.Sprintf(trigger.event, texts[text].OutboxID), trigger.action)); err != nil {
 			return fmt.Errorf("create fault trigger: %w", err)
+		}
+	}
+	return nil
+}
+
+// setRecoveryFaults replaces the triggers that fail the recovery of a text's
+// expired lease with one for each text whose recoveryFails entry is set; nil
+// drops them all.
+func setRecoveryFaults(raw *sql.DB, texts []Submission, recoveryFails []bool) error {
+	for text := range maxLeaseScriptTexts {
+		if _, err := raw.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS recovery_fault_%d`, text)); err != nil {
+			return fmt.Errorf("drop recovery fault trigger: %w", err)
+		}
+	}
+	trigger := rowFaultTriggers[failedRecoveryRowFault]
+	for text, fails := range recoveryFails {
+		if !fails {
+			continue
+		}
+		if _, err := raw.Exec(fmt.Sprintf(`CREATE TRIGGER recovery_fault_%d BEFORE %s
+			BEGIN
+				SELECT %s;
+			END`, text, fmt.Sprintf(trigger.event, texts[text].OutboxID), trigger.action)); err != nil {
+			return fmt.Errorf("create recovery fault trigger: %w", err)
 		}
 	}
 	return nil

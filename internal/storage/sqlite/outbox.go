@@ -282,10 +282,25 @@ const (
 	ReconcileOutcomeNotFound   ReconcileOutcome = "notfound"
 )
 
-// RecoveredLeases reports how expired dispatch leases were classified.
+// RecoveredLeases reports how expired dispatch leases were classified, and
+// which expired leases the call could not recover.
 type RecoveredLeases struct {
 	NotDispatched int
 	Uncertain     int
+	// Failed holds the expired leases whose recovery failed on the row itself,
+	// in the order the call met them. The call left each such row as it was.
+	Failed []LeaseRecoveryFailure
+}
+
+// LeaseRecoveryFailure reports an expired lease whose recovery write failed
+// on the row itself (see isRowLeaseFailure).
+type LeaseRecoveryFailure struct {
+	OutboxID string
+	// TransportCalled reports whether the row's transport call had started.
+	// Recovery then makes the row uncertain, and otherwise makes it due again.
+	TransportCalled bool
+	// Err says why the recovery write failed.
+	Err error
 }
 
 // OutboxRepository owns durable outbound intent, leasing, and phase changes.
@@ -1582,12 +1597,12 @@ func setAsideOutboxRow(
 }
 
 // isRowLeaseFailure reports whether err, from leasing or setting aside one due
-// row, belongs to that row rather than to the store: SQLite refused the write
-// as a constraint the row cannot meet (CHECK, NOT NULL, STRICT type, a
-// trigger's RAISE) or a value of the wrong type (SQLITE_MISMATCH) or size
-// (SQLITE_TOOBIG), a trigger skipped the write, or the row's stored values do
-// not read back. Busy, locked, I/O, corruption, an interrupted statement and a
-// canceled context are the store's.
+// row or recovering one expired lease, belongs to that row rather than to the
+// store: SQLite refused the write as a constraint the row cannot meet (CHECK,
+// NOT NULL, STRICT type, a trigger's RAISE) or a value of the wrong type
+// (SQLITE_MISMATCH) or size (SQLITE_TOOBIG), a trigger skipped the write, or
+// the row's stored values do not read back. Busy, locked, I/O, corruption, an
+// interrupted statement and a canceled context are the store's.
 func isRowLeaseFailure(err error) bool {
 	if errors.Is(err, errOutboxRowUnreadable) || errors.Is(err, errOutboxRowUnchanged) {
 		return true
@@ -2545,9 +2560,21 @@ func (r *OutboxRepository) MarkStoreFailed(
 	return r.requireLeaseMutation(ctx, "mark store failed", outboxID, result)
 }
 
-// RecoverExpiredLeases makes expired pre-call leases immediately retryable and
-// makes expired post-call leases uncertain. Both classifications commit in one
-// transaction.
+// RecoverExpiredLeases ends every expired dispatch lease. A lease whose
+// transport call never started makes its row not_dispatched, due at once; a
+// lease whose call started makes its row uncertain, so nothing sends it again.
+//
+// The call recovers each expired lease under its own savepoint, so a recovery
+// write that fails on the row itself (see isRowLeaseFailure) undoes only that
+// row's write, and the call goes on to the other expired leases. It leaves
+// such a row as it was: dispatching, with its lease expired and its
+// transport_called_at_ms and attempt_count unchanged. LeaseDueBatch and
+// RetryNotDispatched pass over a dispatching row, and MarkTransportCalled
+// refuses an expired lease, so the row waits, unsent, and the next call tries
+// its recovery again. Failed reports each such row.
+//
+// Any other failure (busy, locked, I/O, corruption, cancellation) belongs to
+// the store, not the row, and fails the whole call, committing nothing.
 func (r *OutboxRepository) RecoverExpiredLeases(
 	ctx context.Context,
 	now time.Time,
@@ -2562,7 +2589,91 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 	}
 	defer tx.Rollback()
 
-	preCall, err := tx.ExecContext(ctx, `
+	// The call reads every expired lease before it writes any, and meets each
+	// once. A row it leaves as it was stays expired, so a second read would
+	// meet it again.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT outbox_id, transport_called_at_ms IS NOT NULL
+		FROM outbox
+		WHERE state = 'dispatching'
+		  AND lease_expires_at_ms <= ?
+		ORDER BY lease_expires_at_ms, outbox_id
+	`, nowMS)
+	if err != nil {
+		return RecoveredLeases{}, fmt.Errorf("recover expired outbox leases: select expired leases: %w", err)
+	}
+	expired, err := collectRows(rows, func(row rowScanner) (LeaseRecoveryFailure, error) {
+		var lease LeaseRecoveryFailure
+		err := row.Scan(&lease.OutboxID, &lease.TransportCalled)
+		return lease, err
+	})
+	if err != nil {
+		return RecoveredLeases{}, fmt.Errorf("recover expired outbox leases: scan expired leases: %w", err)
+	}
+
+	var recovered RecoveredLeases
+	for _, lease := range expired {
+		failed, err := recoverExpiredLease(ctx, tx, lease.OutboxID, lease.TransportCalled, nowMS)
+		switch {
+		case err != nil:
+			return RecoveredLeases{}, fmt.Errorf("recover expired outbox leases: %w", err)
+		case failed != nil:
+			lease.Err = failed
+			recovered.Failed = append(recovered.Failed, lease)
+		case lease.TransportCalled:
+			recovered.Uncertain++
+		default:
+			recovered.NotDispatched++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return RecoveredLeases{}, fmt.Errorf("recover expired outbox leases: commit: %w", err)
+	}
+	return recovered, nil
+}
+
+// recoverExpiredLease recovers one expired lease under its own savepoint. A
+// recovery write that fails on the row (isRowLeaseFailure) comes back as
+// failed, after recoverExpiredLease undoes it. Any other error fails the
+// caller's whole transaction.
+func recoverExpiredLease(
+	ctx context.Context,
+	tx *sql.Tx,
+	id string,
+	transportCalled bool,
+	nowMS int64,
+) (failed, err error) {
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT recover_lease`); err != nil {
+		return nil, fmt.Errorf("recover outbox item %q: open savepoint: %w", id, err)
+	}
+	recoverErr := recoverOutboxLease(ctx, tx, id, transportCalled, nowMS)
+	if recoverErr != nil {
+		if !isRowLeaseFailure(recoverErr) {
+			return nil, recoverErr
+		}
+		// A trigger's RAISE(ROLLBACK) ends the whole transaction instead; then
+		// no savepoint remains, and this fails the call.
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO recover_lease`); err != nil {
+			return nil, errors.Join(recoverErr, fmt.Errorf("roll back to savepoint: %w", err))
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE recover_lease`); err != nil {
+		return nil, errors.Join(recoverErr, fmt.Errorf("recover outbox item %q: release savepoint: %w", id, err))
+	}
+	return recoverErr, nil
+}
+
+// recoverOutboxLease ends one expired lease with the outcome its transport
+// call allows: not_dispatched and due at once before the call started,
+// uncertain after it.
+func recoverOutboxLease(
+	ctx context.Context,
+	tx *sql.Tx,
+	id string,
+	transportCalled bool,
+	nowMS int64,
+) error {
+	query := `
 		UPDATE outbox
 		SET state = 'not_dispatched',
 			next_attempt_at_ms = ?,
@@ -2571,14 +2682,14 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
 			updated_at_ms = MAX(updated_at_ms, ?)
-		WHERE state = 'dispatching'
+		WHERE outbox_id = ?
+		  AND state = 'dispatching'
 		  AND lease_expires_at_ms <= ?
-		  AND transport_called_at_ms IS NULL
-	`, nowMS, nowMS, nowMS)
-	if err != nil {
-		return RecoveredLeases{}, fmt.Errorf("recover expired pre-call outbox leases: %w", err)
-	}
-	postCall, err := tx.ExecContext(ctx, `
+		  AND transport_called_at_ms IS NULL`
+	arguments := []any{nowMS, nowMS, id, nowMS}
+	phase := "pre-call"
+	if transportCalled {
+		query = `
 		UPDATE outbox
 		SET state = 'uncertain',
 			next_attempt_at_ms = NULL,
@@ -2587,28 +2698,32 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
 			updated_at_ms = MAX(updated_at_ms, ?)
-		WHERE state = 'dispatching'
+		WHERE outbox_id = ?
+		  AND state = 'dispatching'
 		  AND lease_expires_at_ms <= ?
-		  AND transport_called_at_ms IS NOT NULL
-	`, nowMS, nowMS)
+		  AND transport_called_at_ms IS NOT NULL`
+		arguments = []any{nowMS, id, nowMS}
+		phase = "post-call"
+	}
+	result, err := tx.ExecContext(ctx, query, arguments...)
 	if err != nil {
-		return RecoveredLeases{}, fmt.Errorf("recover expired post-call outbox leases: %w", err)
+		return fmt.Errorf("recover %s outbox lease %q: %w", phase, id, err)
 	}
-	preCallCount, err := preCall.RowsAffected()
+	affected, err := result.RowsAffected()
 	if err != nil {
-		return RecoveredLeases{}, fmt.Errorf("recover expired pre-call outbox leases: read rows affected: %w", err)
+		return fmt.Errorf("recover %s outbox lease %q: read rows affected: %w", phase, id, err)
 	}
-	postCallCount, err := postCall.RowsAffected()
-	if err != nil {
-		return RecoveredLeases{}, fmt.Errorf("recover expired post-call outbox leases: read rows affected: %w", err)
+	switch affected {
+	case 1:
+		return nil
+	case 0:
+		// The transaction holds the write lock and just read the row as an
+		// expired lease in this phase, so only a trigger's RAISE(IGNORE) skips
+		// the write.
+		return fmt.Errorf("recover %s outbox lease %q: %w", phase, id, errOutboxRowUnchanged)
+	default:
+		return fmt.Errorf("recover %s outbox lease %q: affected %d rows, want 1", phase, id, affected)
 	}
-	if err := tx.Commit(); err != nil {
-		return RecoveredLeases{}, fmt.Errorf("recover expired outbox leases: commit: %w", err)
-	}
-	return RecoveredLeases{
-		NotDispatched: int(preCallCount),
-		Uncertain:     int(postCallCount),
-	}, nil
 }
 
 // FindByID returns an outbox row by its globally unique ID.

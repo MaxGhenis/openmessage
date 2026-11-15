@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -23,6 +24,7 @@ type resilienceFixture struct {
 	submission Submission
 	failures   chan FailedDispatchPass
 	leases     chan FailedLease
+	recoveries chan FailedRecovery
 
 	stopped chan struct{}
 	runErr  error
@@ -30,34 +32,49 @@ type resilienceFixture struct {
 
 func newResilienceFixture(t *testing.T, key, trigger string) *resilienceFixture {
 	t.Helper()
+	f := prepareResilienceFixture(t, key, sendStep{result: bridge.SendResult{RemoteMessageID: "remote-" + key}})
+	if _, err := f.raw.ExecContext(context.Background(), trigger); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	f.submission = mustSendText(t, f.service, SendTextCommand{
+		CommonCommand: testCommonCommand(key),
+		Body:          "sent once the store recovers",
+	})
+	f.start(t)
+	return f
+}
+
+// prepareResilienceFixture opens the store and the service, whose sender
+// answers with steps in turn, and leaves the test to queue its rows before it
+// starts Run.
+func prepareResilienceFixture(t *testing.T, key string, steps ...sendStep) *resilienceFixture {
+	t.Helper()
 	clock := newNotifyingReconcileClock(messagingTestTime)
 	store, raw := openReconcileTestStore(t, clock.Now())
-	sender := &scriptedTextSender{steps: []sendStep{{result: bridge.SendResult{RemoteMessageID: "remote-" + key}}}}
+	sender := &scriptedTextSender{steps: steps}
 	registry := newScriptedRegistry(bridge.Platform("resilience-"+key), sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
 	// The manual clock does not drive timers, so keep the real waits short.
 	service.pollDelay, service.maxPollDelay = 10*time.Millisecond, 40*time.Millisecond
-	if _, err := raw.ExecContext(context.Background(), trigger); err != nil {
-		t.Fatalf("create failure trigger: %v", err)
-	}
-	submission := mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand(key),
-		Body:          "sent once the store recovers",
-	})
-	drainTimerSignals(clock)
-
-	f := &resilienceFixture{
+	return &resilienceFixture{
 		clock:      clock,
 		service:    service,
 		raw:        raw,
 		sender:     sender,
-		submission: submission,
 		failures:   make(chan FailedDispatchPass, 64),
 		leases:     make(chan FailedLease, 64),
+		recoveries: make(chan FailedRecovery, 64),
 		stopped:    make(chan struct{}),
 	}
-	service.OnPassFailure(func(err error, pass FailedDispatchPass) {
+}
+
+// start hooks the fixture's channels to the service and starts Run, which
+// the test's cleanup stops.
+func (f *resilienceFixture) start(t *testing.T) {
+	t.Helper()
+	drainTimerSignals(f.clock)
+	f.service.OnPassFailure(func(err error, pass FailedDispatchPass) {
 		if err == nil || err.Error() != pass.Error {
 			t.Errorf("OnPassFailure(%v, %+v): error and pass disagree", err, pass)
 		}
@@ -66,15 +83,21 @@ func newResilienceFixture(t *testing.T, key, trigger string) *resilienceFixture 
 		default:
 		}
 	})
-	service.OnLeaseFailure(func(lease FailedLease) {
+	f.service.OnLeaseFailure(func(lease FailedLease) {
 		select {
 		case f.leases <- lease:
 		default:
 		}
 	})
+	f.service.OnRecoveryFailure(func(recovery FailedRecovery) {
+		select {
+		case f.recoveries <- recovery:
+		default:
+		}
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		f.runErr = service.Run(ctx)
+		f.runErr = f.service.Run(ctx)
 		close(f.stopped)
 	}()
 	t.Cleanup(func() {
@@ -88,7 +111,6 @@ func newResilienceFixture(t *testing.T, key, trigger string) *resilienceFixture 
 			t.Error("Run() did not stop after cancellation")
 		}
 	})
-	return f
 }
 
 // passEnded waits until Run finishes a pass and arms its next timer, and
@@ -116,10 +138,17 @@ func (f *resilienceFixture) dropTrigger(t *testing.T, name string) {
 // passes through on the way to a retry.
 func (f *resilienceFixture) confirmed(t *testing.T) {
 	t.Helper()
+	f.confirmedOutbox(t, f.submission.OutboxID)
+}
+
+// confirmedOutbox waits for the text in outboxID to be confirmed while Run
+// keeps running.
+func (f *resilienceFixture) confirmedOutbox(t *testing.T, outboxID string) {
+	t.Helper()
 	deadline := time.After(5 * time.Second)
 	for {
 		changes := f.service.Changes()
-		delivery, err := f.service.Get(context.Background(), f.submission.OutboxID)
+		delivery, err := f.service.Get(context.Background(), outboxID)
 		if err != nil {
 			t.Fatalf("Get(): %v", err)
 		}
@@ -131,7 +160,7 @@ func (f *resilienceFixture) confirmed(t *testing.T) {
 		case <-f.stopped:
 			t.Fatalf("Run() returned %v before the text was confirmed", f.runErr)
 		case <-deadline:
-			t.Fatalf("text not confirmed; row = %+v", mustOutboxItem(t, f.service, f.submission.OutboxID))
+			t.Fatalf("text not confirmed; row = %+v", mustOutboxItem(t, f.service, outboxID))
 		}
 	}
 }
@@ -301,6 +330,94 @@ func TestRunRecoversALeaseItsFailedPassLeftBehind(t *testing.T) {
 	f.confirmed(t)
 	if got := f.sender.requestCount(); got != 1 {
 		t.Fatalf("transport requests = %d, want 1", got)
+	}
+}
+
+// An expired lease whose recovery write keeps failing must not fail the
+// passes that meet it or hold the sends behind it. Run reports the row on
+// every pass, through OnRecoveryFailure and DispatchHealth, sends the text
+// queued after it, and recovers the row once its write works: the lease
+// whose transport call never started sends once, and the one whose call
+// started becomes uncertain and never sends.
+func TestRunReportsALeaseWhoseRecoveryFailsAndSendsPastIt(t *testing.T) {
+	f := prepareResilienceFixture(t, "key-recovery",
+		sendStep{result: bridge.SendResult{RemoteMessageID: "remote-later"}},
+		sendStep{result: bridge.SendResult{RemoteMessageID: "remote-stranded"}},
+	)
+	uncalled := strandTextLease(t, f.service, f.clock.manualClock, "key-stranded-uncalled", false)
+	called := strandTextLease(t, f.service, f.clock.manualClock, "key-stranded-called", true)
+	if _, err := f.raw.ExecContext(context.Background(), failRecoveryTrigger(uncalled.OutboxID, called.OutboxID)); err != nil {
+		t.Fatalf("create recovery failure trigger: %v", err)
+	}
+	f.clock.Advance(2 * time.Second)
+	f.submission = mustSendText(t, f.service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-later"),
+		Body:          "queued after the leases expired",
+	})
+	f.start(t)
+
+	// The first pass reports both rows, in expiry order, and still sends the
+	// later text.
+	f.confirmed(t)
+	nowMS := f.clock.Now().UnixMilli()
+	for _, want := range []sqlite.OutboxItem{uncalled, called} {
+		var recovery FailedRecovery
+		select {
+		case recovery = <-f.recoveries:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no recovery failure reported for %s", want.OutboxID)
+		}
+		wantCalled := want.TransportCalledAtMS != nil
+		if recovery.OutboxID != want.OutboxID || recovery.TransportCalled != wantCalled || recovery.AtMS != nowMS ||
+			!strings.Contains(recovery.Error, "injected recovery failure") {
+			t.Fatalf("recovery failure = %+v, want %s (transport called %t) at %d", recovery, want.OutboxID, wantCalled, nowMS)
+		}
+	}
+	// Every pass tries both rows again, and none fails. Two passes end after
+	// the drain, and the second starts after the count is read.
+	before := f.service.DispatchHealth().FailedRecoveries
+	drainTimerSignals(f.clock)
+	f.passEnded(t)
+	f.passEnded(t)
+	health := f.service.DispatchHealth()
+	if health.FailedRecoveries < before+2 || health.LastFailedRecovery == nil ||
+		health.LastFailedRecovery.OutboxID != called.OutboxID || !health.LastFailedRecovery.TransportCalled ||
+		health.FailedPasses != 0 || health.ConsecutiveFailedPasses != 0 || health.FailedLeases != 0 {
+		t.Fatalf("health while the recoveries fail = %+v, want both counted on every pass, the called row last, and no failed pass or lease", health)
+	}
+	for _, stranded := range []sqlite.OutboxItem{uncalled, called} {
+		if got := mustOutboxItem(t, f.service, stranded.OutboxID); !reflect.DeepEqual(got, stranded) {
+			t.Fatalf("row whose recovery fails = %+v, want it as it was, %+v", got, stranded)
+		}
+	}
+	if got := f.sender.requestCount(); got != 1 {
+		t.Fatalf("transport requests while the recoveries fail = %d, want 1 (the later text)", got)
+	}
+
+	f.dropTrigger(t, "fail_recovery")
+	f.confirmedOutbox(t, uncalled.OutboxID)
+	if got := mustOutboxItem(t, f.service, called.OutboxID); got.State != sqlite.OutboxUncertain {
+		t.Fatalf("called row once its recovery works = %+v, want uncertain", got)
+	}
+	requests := requestsByID(f.sender)
+	if len(requests) != 2 || requests[uncalled.TransportRequestID] != 1 ||
+		requests[mustOutboxItem(t, f.service, f.submission.OutboxID).TransportRequestID] != 1 {
+		t.Fatalf("transport requests = %v, want one each for the later text and the uncalled row", requests)
+	}
+	// The count keeps its history and stops growing.
+	settled := f.service.DispatchHealth()
+	drainTimerSignals(f.clock)
+	f.passEnded(t)
+	f.passEnded(t)
+	if after := f.service.DispatchHealth(); after.FailedRecoveries != settled.FailedRecoveries ||
+		after.LastFailedRecovery == nil || after.FailedPasses != 0 {
+		t.Fatalf("health once the recoveries work = %+v, want the %d failed recoveries kept and no failed pass",
+			after, settled.FailedRecoveries)
+	}
+	select {
+	case pass := <-f.failures:
+		t.Fatalf("a pass failed: %+v", pass)
+	default:
 	}
 }
 

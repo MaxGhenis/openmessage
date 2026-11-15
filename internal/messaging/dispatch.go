@@ -76,13 +76,15 @@ func (s *MessageService) Run(ctx context.Context) error {
 // intent uncertain, and recovery requeues only a lease whose transport call
 // never started (MarkTransportCalled commits before every call); a lease whose
 // call started becomes uncertain.
+//
+// An expired lease whose recovery fails on its own row does not hold the
+// pass: the store leaves that row as it was, still dispatching and so never
+// sent, and recovers the others; the pass records the failure
+// (DispatchHealth and the OnRecoveryFailure hook) and goes on to send. The
+// next pass tries the row's recovery again.
 func (s *MessageService) dispatchPass(ctx context.Context) error {
-	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
-	if err != nil {
+	if err := s.recoverExpiredLeases(ctx); err != nil {
 		return fmt.Errorf("recover expired leases: %w", err)
-	}
-	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
-		s.signalChange()
 	}
 	if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
 		return fmt.Errorf("reconcile store-failed deliveries: %w", err)
@@ -149,11 +151,8 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 		}
 		if lease.LeaseExpiresAtMS != nil && *lease.LeaseExpiresAtMS <= s.clock.Now().UnixMilli() {
 			mutationCtx, cancel := s.storageMutationContext(ctx)
-			recovered, recoverErr := s.outbox.RecoverExpiredLeases(mutationCtx, s.clock.Now())
+			recoverErr := s.recoverExpiredLeases(mutationCtx)
 			cancel()
-			if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
-				s.signalChange()
-			}
 			if recoverErr != nil {
 				return processed, errors.Join(fmt.Errorf("recover leases expired during dispatch: %w", recoverErr), stuck)
 			}
@@ -183,6 +182,35 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 	return processed, stuck
 }
 
+// recoverExpiredLeases ends every expired lease (RecoverExpiredLeases) and
+// records each one whose recovery failed on its own row (DispatchHealth and
+// the OnRecoveryFailure hook). The store leaves such a row as it was:
+// dispatching, its lease expired. No call can start for it: LeaseDueBatch
+// takes only queued or not_dispatched rows, and MarkTransportCalled refuses
+// an expired lease. Cancel and RetryNotDispatched refuse it too. It holds
+// back no other row, since LeaseDueBatch passes over it, and EarliestDue
+// never wakes Run for it. So the row waits, unsent, until a later pass
+// recovers it. Only a failure of the store comes back as an error.
+func (s *MessageService) recoverExpiredLeases(ctx context.Context) error {
+	now := s.clock.Now()
+	recovered, err := s.outbox.RecoverExpiredLeases(ctx, now)
+	if err != nil {
+		return err
+	}
+	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
+		s.signalChange()
+	}
+	for _, failure := range recovered.Failed {
+		s.recoveryFailures.add(FailedRecovery{
+			OutboxID:        failure.OutboxID,
+			AtMS:            now.UnixMilli(),
+			Error:           failure.Err.Error(),
+			TransportCalled: failure.TransportCalled,
+		})
+	}
+	return nil
+}
+
 // recordFailedLeases records each due row whose lease failed on its own row
 // and returns an error naming the rows the store could not set aside either.
 func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error {
@@ -193,7 +221,7 @@ func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error 
 	var stuck []error
 	setAside := false
 	for _, failure := range failed {
-		s.leaseFailures.fail(failure, now)
+		s.leaseFailures.add(newFailedLease(failure, now))
 		if failure.SetAsideErr != nil {
 			stuck = append(stuck, fmt.Errorf(
 				"could neither lease outbox item %q (%w) nor set it aside (%w)",

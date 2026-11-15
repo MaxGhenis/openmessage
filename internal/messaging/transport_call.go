@@ -45,9 +45,10 @@ const (
 	abandonReasonShutdown = "shutdown"
 )
 
-// DispatchHealth reports the dispatch loop's transport calls and failed
-// passes, so a slow or abandoned call, or a loop that keeps failing on
-// storage, is visible in /api/status instead of looking like an idle outbox.
+// DispatchHealth reports the dispatch loop's transport calls, failed passes,
+// and the rows whose lease or lease recovery failed, so a slow or abandoned
+// call, a loop that keeps failing on storage, or a row the store cannot move
+// is visible in /api/status instead of looking like an idle outbox.
 type DispatchHealth struct {
 	// InFlight is the call the dispatch loop is waiting on, if any.
 	InFlight *InFlightTransportCall `json:"in_flight,omitempty"`
@@ -72,6 +73,14 @@ type DispatchHealth struct {
 	FailedLeases int64 `json:"failed_leases"`
 	// LastFailedLease is the most recent failed lease, if any.
 	LastFailedLease *FailedLease `json:"last_failed_lease,omitempty"`
+	// FailedRecoveries counts the expired leases whose recovery failed on
+	// their own row since the service started; a row whose recovery fails in
+	// three passes counts three times. The store left each such row as it
+	// was, dispatching with its lease expired, so nothing sends it, and
+	// recovered the other expired leases; the pass went on to send.
+	FailedRecoveries int64 `json:"failed_recoveries"`
+	// LastFailedRecovery is the most recent failed recovery, if any.
+	LastFailedRecovery *FailedRecovery `json:"last_failed_recovery,omitempty"`
 }
 
 // InFlightTransportCall describes the transport call in progress.
@@ -187,12 +196,13 @@ func (t *transportCalls) health(now time.Time) DispatchHealth {
 	return health
 }
 
-// DispatchHealth snapshots the dispatch loop's transport calls, failed passes
-// and failed leases.
+// DispatchHealth snapshots the dispatch loop's transport calls, failed passes,
+// failed leases and failed lease recoveries.
 func (s *MessageService) DispatchHealth() DispatchHealth {
 	health := s.transport.health(s.clock.Now())
 	s.passes.report(&health)
-	s.leaseFailures.report(&health)
+	health.FailedLeases, health.LastFailedLease = s.leaseFailures.read()
+	health.FailedRecoveries, health.LastFailedRecovery = s.recoveryFailures.read()
 	return health
 }
 

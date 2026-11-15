@@ -31,6 +31,9 @@ const (
 	markCalledDispatchFault
 	// settleDispatchFault fails Confirm and MarkStoreFailed, after the call.
 	settleDispatchFault
+	// recoveryDispatchFault fails RecoverExpiredLeases's write to an expired
+	// lease, from before or after the call, so the row keeps its lease.
+	recoveryDispatchFault
 	dispatchFaultCount
 )
 
@@ -40,6 +43,8 @@ var dispatchFaultConditions = map[dispatchFault]string{
 	leaseDispatchFault:      `UPDATE OF state ON outbox WHEN NEW.state = 'dispatching'`,
 	markCalledDispatchFault: `UPDATE OF transport_called_at_ms ON outbox WHEN NEW.transport_called_at_ms IS NOT NULL`,
 	settleDispatchFault:     `UPDATE OF state ON outbox WHEN NEW.state IN ('confirmed', 'store_failed')`,
+	recoveryDispatchFault: `UPDATE OF state ON outbox
+		WHEN OLD.state = 'dispatching' AND NEW.state IN ('not_dispatched', 'uncertain')`,
 }
 
 // checkedTables are the tables whose CHECK requires updated_at_ms >=
@@ -53,11 +58,14 @@ var checkedTables = []string{
 // SendText's two clock reads (scheduled_for_ms, then created_at_ms), the
 // first pass's time relative to the first read, then passes, each after a
 // clock step and with at most one fault. A negative step is a wall clock set
-// back; a long one carries a lease past its expiry.
+// back; a long one carries a lease past its expiry. In the passes before
+// RecoveryFailsUntil, every recovery of an expired lease fails too, as it
+// would on a row with a CHECK it cannot meet, until someone repairs it.
 type dispatchScript struct {
-	SubmitReadGapMS int64
-	FirstPassMS     int64
-	Passes          []dispatchScriptPass
+	SubmitReadGapMS    int64
+	FirstPassMS        int64
+	Passes             []dispatchScriptPass
+	RecoveryFailsUntil int
 }
 
 type dispatchScriptPass struct {
@@ -84,6 +92,9 @@ func (dispatchScript) Generate(r *rand.Rand, _ int) reflect.Value {
 		}
 		script.Passes = append(script.Passes, pass)
 	}
+	if len(script.Passes) > 0 && r.Intn(2) == 0 {
+		script.RecoveryFailsUntil = 1 + r.Intn(len(script.Passes))
+	}
 	return reflect.ValueOf(script)
 }
 
@@ -97,6 +108,10 @@ func (dispatchScript) Generate(r *rand.Rand, _ int) reflect.Value {
 //     that is due when it runs;
 //   - a failed lease never fails its pass: the store sets the due row aside,
 //     uncalled, until a later retry;
+//   - a failed lease recovery never fails its pass: the expired lease stays
+//     as it was, whether its call started or not, and DispatchHealth counts
+//     the failure once and names the row; a pass counts no failed recovery
+//     but such a one;
 //   - Run keeps running after a failed pass: it reports the failure to
 //     OnPassFailure and DispatchHealth, waits the poll delay doubled for each
 //     earlier failure in the same run of failures, up to the longest poll
@@ -201,6 +216,10 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 		if err := setDispatchFault(raw, pass.Fault); err != nil {
 			return err
 		}
+		recoveryFails := index < script.RecoveryFailsUntil
+		if err := setRecoveryFault(raw, recoveryFails); err != nil {
+			return err
+		}
 		before, err := service.outbox.FindByID(ctx, submission.OutboxID)
 		if err != nil {
 			return fmt.Errorf("pass %d: read row: %w", index, err)
@@ -210,6 +229,7 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		requestsBefore := sender.requestCount()
+		failedRecoveries := service.DispatchHealth().FailedRecoveries
 		wait, err := run.pass()
 		if err != nil {
 			return fmt.Errorf("pass %d at %d with fault %d: %w", index, now.UnixMilli(), pass.Fault, err)
@@ -223,13 +243,28 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		if passErr != nil && (pass.Fault == noDispatchFault || pass.Fault == leaseDispatchFault ||
-			!strings.Contains(passErr.Error(), injectedDispatchFault)) {
+			pass.Fault == recoveryDispatchFault || !strings.Contains(passErr.Error(), injectedDispatchFault)) {
 			return fmt.Errorf("pass %d at %d with fault %d failed: %w", index, now.UnixMilli(), pass.Fault, passErr)
 		}
-		if pass.Fault == noDispatchFault && dueAt(before, now) && after.State != sqlite.OutboxConfirmed {
+		expiredLease := before.State == sqlite.OutboxDispatching &&
+			before.LeaseExpiresAtMS != nil && *before.LeaseExpiresAtMS <= now.UnixMilli()
+		unrecovered := (pass.Fault == recoveryDispatchFault || recoveryFails) && expiredLease
+		if health := service.DispatchHealth(); unrecovered {
+			if !reflect.DeepEqual(after, before) || health.FailedRecoveries != failedRecoveries+1 ||
+				health.LastFailedRecovery == nil || health.LastFailedRecovery.OutboxID != submission.OutboxID ||
+				health.LastFailedRecovery.TransportCalled != (before.TransportCalledAtMS != nil) {
+				return fmt.Errorf("pass %d at %d left an expired lease whose recovery failed, %+v, as %+v with health %+v; "+
+					"want it as it was and the failure counted once", index, now.UnixMilli(), before, after, health)
+			}
+		} else if health.FailedRecoveries != failedRecoveries {
+			return fmt.Errorf("pass %d at %d with fault %d counted %d failed recoveries, want none",
+				index, now.UnixMilli(), pass.Fault, health.FailedRecoveries-failedRecoveries)
+		}
+		if (pass.Fault == noDispatchFault || pass.Fault == recoveryDispatchFault) && !unrecovered &&
+			dueAt(before, now) && after.State != sqlite.OutboxConfirmed {
 			return fmt.Errorf("pass %d at %d left a due row %+v as %+v", index, now.UnixMilli(), before, after)
 		}
-		if pass.Fault == leaseDispatchFault && dueAt(before, now) && !setAsideAfterLeaseFailure(after, now) {
+		if pass.Fault == leaseDispatchFault && !unrecovered && dueAt(before, now) && !setAsideAfterLeaseFailure(after, now) {
 			return fmt.Errorf("pass %d at %d left a due row whose lease failed %+v as %+v, want it set aside",
 				index, now.UnixMilli(), before, after)
 		}
@@ -255,6 +290,9 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 
 	// The faults stop, every lease expires and every retry comes due.
 	if err := setDispatchFault(raw, noDispatchFault); err != nil {
+		return err
+	}
+	if err := setRecoveryFault(raw, false); err != nil {
 		return err
 	}
 	settled, err := service.outbox.FindByID(ctx, submission.OutboxID)
@@ -541,6 +579,24 @@ func setDispatchFault(raw *sql.DB, fault dispatchFault) error {
 			SELECT RAISE(ABORT, '` + injectedDispatchFault + `');
 		END`); err != nil {
 		return fmt.Errorf("create fault trigger: %w", err)
+	}
+	return nil
+}
+
+// setRecoveryFault adds, when on, a trigger that fails every recovery of an
+// expired lease, beside the pass's own fault, and drops it otherwise.
+func setRecoveryFault(raw *sql.DB, on bool) error {
+	if _, err := raw.Exec(`DROP TRIGGER IF EXISTS property_recovery_fault`); err != nil {
+		return fmt.Errorf("drop recovery fault trigger: %w", err)
+	}
+	if !on {
+		return nil
+	}
+	if _, err := raw.Exec(`CREATE TRIGGER property_recovery_fault BEFORE ` + dispatchFaultConditions[recoveryDispatchFault] + `
+		BEGIN
+			SELECT RAISE(ABORT, '` + injectedDispatchFault + `');
+		END`); err != nil {
+		return fmt.Errorf("create recovery fault trigger: %w", err)
 	}
 	return nil
 }
