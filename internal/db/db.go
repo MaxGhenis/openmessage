@@ -4,13 +4,31 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/rs/zerolog"
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
 	db         *sql.DB
 	ftsEnabled bool
+	// logger reports what the store recovers from without returning an error,
+	// such as a search index query that fails. The zero value logs nothing.
+	logger zerolog.Logger
+
+	// The message count the search router last read, and when (see
+	// searchedMessageCount).
+	messageCountMu     sync.Mutex
+	messageCount       int
+	messageCountReadAt time.Time
+}
+
+// SetLogger sets where the store reports errors it recovers from. Call it
+// before the store is shared.
+func (s *Store) SetLogger(logger zerolog.Logger) {
+	s.logger = logger
 }
 
 type Conversation struct {
