@@ -625,6 +625,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			events.PublishMessages("")
 		}
 	}
+	if !isDemo && transports {
+		// Cancelled before a.Close runs (deferred calls run last first), so
+		// no pass starts on a closed store.
+		reclaimCtx, cancelReclaim := context.WithCancel(context.Background())
+		defer cancelReclaim()
+		go newLegacyFreePageReclaimer(a.Store, logger).run(reclaimCtx, legacyReclaimFirstDelay, legacyReclaimInterval)
+	}
 	if transports {
 		go func() {
 			// First full rescan 2 minutes after startup so a crash-restart

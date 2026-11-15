@@ -107,12 +107,16 @@ type Draft struct {
 }
 
 func New(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", withImmediateWriteTransactions(dsn))
+	db, err := sql.Open("sqlite", withJournalSizeLimit(withImmediateWriteTransactions(dsn)))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	// modernc.org/sqlite requires single connection to avoid "malformed" errors
 	db.SetMaxOpenConns(1)
+	if err := createWithIncrementalAutoVacuum(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set WAL mode: %w", err)
@@ -158,11 +162,56 @@ func withImmediateWriteTransactions(dsn string) string {
 	if dsn == "" || strings.Contains(dsn, "_txlock=") {
 		return dsn
 	}
+	return withDSNOption(dsn, "_txlock=immediate")
+}
+
+// JournalSizeLimitBytes caps the WAL file that a checkpoint leaves behind.
+// After a checkpoint SQLite writes its WAL from the start again but never
+// shrinks the file, so without a limit the file keeps the largest size it
+// ever reached for as long as any process keeps the store open
+// (messages.db-wal stood at 1 GB on 2026-11-03). Once a checkpoint has copied
+// every frame back and no reader still needs them, the next write starts the
+// WAL over, and with this limit set its commit truncates the file to the
+// limit (or to that one transaction, if larger).
+const JournalSizeLimitBytes = 64 << 20
+
+// withJournalSizeLimit sets journal_size_limit through the DSN. The pragma
+// holds per connection, and the driver applies DSN pragmas to every
+// connection the pool opens, including one that replaces a dropped
+// connection; a PRAGMA run once after sql.Open reaches only the first. An
+// empty DSN stays empty, as in withImmediateWriteTransactions.
+func withJournalSizeLimit(dsn string) string {
+	if dsn == "" || strings.Contains(dsn, "journal_size_limit") {
+		return dsn
+	}
+	return withDSNOption(dsn, fmt.Sprintf("_pragma=journal_size_limit(%d)", JournalSizeLimitBytes))
+}
+
+func withDSNOption(dsn, option string) string {
 	sep := "?"
 	if strings.Contains(dsn, "?") {
 		sep = "&"
 	}
-	return dsn + sep + "_txlock=immediate"
+	return dsn + sep + option
+}
+
+// createWithIncrementalAutoVacuum gives a store that has no pages yet
+// incremental auto-vacuum, so ReclaimFreePages can return the pages that
+// deleted rows free without rewriting the file. SQLite fixes the mode when
+// it writes the file's first page, and the switch to WAL writes it, so this
+// must run first. An existing store keeps its mode until Compact rewrites it.
+func createWithIncrementalAutoVacuum(db *sql.DB) error {
+	var pages int64
+	if err := db.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
+		return fmt.Errorf("read page count: %w", err)
+	}
+	if pages > 0 {
+		return nil
+	}
+	if _, err := db.Exec("PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
+		return fmt.Errorf("set incremental auto-vacuum: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
