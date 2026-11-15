@@ -199,7 +199,7 @@ func TestDescribedReplyRefStatesWhoSentTheQuotedMessage(t *testing.T) {
 //   - The reply-only fields (Text and the attachment fields) stay empty.
 //   - The mapping is deterministic: a retried attempt carries the same ref.
 func TestReactionTargetRefInvariants(t *testing.T) {
-	for seed := int64(1); seed <= 40; seed++ {
+	for seed := int64(1); seed <= int64(propertyCases(40, 10)); seed++ {
 		seed := seed
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			checkReactionTargetRefInvariants(t, seed)

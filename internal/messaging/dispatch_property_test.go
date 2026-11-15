@@ -124,6 +124,15 @@ func TestDispatchInvariantsHoldForAnyTimingAndFaults(t *testing.T) {
 	}
 }
 
+// propertyCases is cases in the plain test job and raceCases under -race,
+// for a property test that brings its own seeds (see raceDetectorEnabled).
+func propertyCases(cases, raceCases int) int {
+	if raceDetectorEnabled {
+		return raceCases
+	}
+	return cases
+}
+
 // dispatchPropertyConfig returns the cases and seed for a dispatch property
 // test: fewer cases under -race, where the pure-Go SQLite engine runs about
 // tenfold slower. OPENMESSAGE_PROPERTY_CASES and OPENMESSAGE_PROPERTY_SEED

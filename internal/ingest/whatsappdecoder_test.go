@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
@@ -704,10 +703,7 @@ func TestWhatsAppMigratedReactionsConvergeWithLiveDecoderAndWorker(t *testing.T)
 
 func assertReactionDBRow(t *testing.T, path, messageID, key string, isSelf int, label, emoji string, count int) {
 	t.Helper()
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openSQLiteInspector(t, path)
 	defer db.Close()
 	var gotCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM reactions WHERE message_id = ? AND reactor_key = ?`, messageID, key).Scan(&gotCount); err != nil {

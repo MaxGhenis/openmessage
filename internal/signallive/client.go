@@ -145,6 +145,10 @@ var (
 	// usually recovers within seconds. Swapped by tests to keep them fast.
 	accountProbeRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second}
 
+	// receiveRetryDelay is how long the receive loop waits after a failed
+	// call before it tries again. Swapped by tests to keep them fast.
+	receiveRetryDelay = 500 * time.Millisecond
+
 	signalCLILookPath     = exec.LookPath
 	signalCLIStat         = os.Stat
 	probeSignalCLIVersion = func(ctx context.Context) ([]byte, error) {
@@ -1940,7 +1944,7 @@ func (b *Bridge) runReceiveLoop(
 						Int("confirmations", consecutiveAccountInvalid).
 						Int("required", receiveAccountInvalidLimit).
 						Msg("Signal receive reported an invalid account; retrying once before parking reauth")
-					time.Sleep(500 * time.Millisecond)
+					time.Sleep(receiveRetryDelay)
 					continue
 				}
 				// Don't clear b.account — we want the UI to
@@ -2010,7 +2014,7 @@ func (b *Bridge) runReceiveLoop(
 				}
 			}
 			b.logger.Debug().Err(receiveErr).Int("failures", consecutiveFailures).Msg("Signal receive polling failed")
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(receiveRetryDelay)
 			continue
 		}
 		consecutiveFailures = 0

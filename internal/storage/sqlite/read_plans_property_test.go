@@ -317,7 +317,18 @@ func queryConversationIDs(t *testing.T, db *sql.DB, query string, args ...any) [
 	return ids
 }
 
-var readPlanQuickConfig = &quick.Config{MaxCount: 30}
+// propertyCases is cases in the plain test job and raceCases under -race.
+// Every case of these properties seeds and migrates a fresh store, which the
+// race detector slows about tenfold (see raceDetectorEnabled); on CI's race
+// job this package took 479 s of go test's 600 s per-package limit.
+func propertyCases(cases, raceCases int) int {
+	if raceDetectorEnabled {
+		return raceCases
+	}
+	return cases
+}
+
+var readPlanQuickConfig = &quick.Config{MaxCount: propertyCases(30, 8)}
 
 // Invariant: the row-value keyset cursor selects exactly the rows of the
 // OR-form cursor, in the same order, for every cursor and limit; and paging a

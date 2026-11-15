@@ -601,10 +601,7 @@ func i01InboxPayload(
 
 func i01OpenInspector(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("sql.Open(inspector): %v", err)
-	}
+	database := openSQLiteInspector(t, path)
 	database.SetMaxOpenConns(1)
 	if err := database.Ping(); err != nil {
 		_ = database.Close()
