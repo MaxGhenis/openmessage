@@ -46,10 +46,12 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 		t.Fatalf("decoded store instance ID has %d bytes, want 16", len(decodedID))
 	}
 
+	// Ordinary tables only: the FTS5 search indexes are virtual tables backed
+	// by shadow tables, neither of which can be STRICT; they are checked below.
 	rows, err := store.db.Query(`
 		SELECT name
-		FROM sqlite_schema
-		WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+		FROM pragma_table_list
+		WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%'
 		ORDER BY name
 	`)
 	if err != nil {
@@ -95,6 +97,38 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 	}
 	if !slices.Equal(tables, wantTables) {
 		t.Fatalf("user tables = %v, want %v", tables, wantTables)
+	}
+	var virtualTables, shadowTables []string
+	for _, kind := range []struct {
+		tableType string
+		into      *[]string
+	}{{"virtual", &virtualTables}, {"shadow", &shadowTables}} {
+		rows, err := store.db.Query(`
+			SELECT name FROM pragma_table_list
+			WHERE schema = 'main' AND type = ? ORDER BY name
+		`, kind.tableType)
+		if err != nil {
+			t.Fatalf("query %s tables: %v", kind.tableType, err)
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatalf("scan %s table: %v", kind.tableType, err)
+			}
+			*kind.into = append(*kind.into, name)
+		}
+		rows.Close()
+	}
+	wantVirtual := slices.Sorted(slices.Values(searchIndexes))
+	if !slices.Equal(virtualTables, wantVirtual) {
+		t.Fatalf("virtual tables = %v, want the search indexes %v", virtualTables, wantVirtual)
+	}
+	var wantShadow []string
+	for _, index := range wantVirtual {
+		wantShadow = append(wantShadow, index+"_config", index+"_data", index+"_idx")
+	}
+	if !slices.Equal(shadowTables, wantShadow) {
+		t.Fatalf("shadow tables = %v, want %v", shadowTables, wantShadow)
 	}
 
 	for _, table := range wantTables {
@@ -164,6 +198,7 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 	assertPragmaInt(t, store.db, "foreign_keys", 1)
 	assertPragmaInt(t, store.db, "busy_timeout", busyTimeoutMS)
 	assertPragmaInt(t, store.db, "synchronous", 1)
+	assertPragmaInt(t, store.db, "recursive_triggers", 1)
 	var journalMode string
 	if err := store.db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
 		t.Fatalf("read journal_mode: %v", err)

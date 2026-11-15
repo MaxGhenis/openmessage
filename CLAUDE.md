@@ -238,6 +238,14 @@ on a legacy-primary install the tool saves through the app's
   the message now carries. A v2-primary daemon answers 409: the v2 store keeps
   no transcripts.
 
+On a v2 store every search is a SQLite `LIKE '%q%'` substring match (ASCII
+case-insensitive; `%`/`_` are wildcards in message search) in recency order.
+Migration 0012 (`substring_search`) answers searches across conversations and
+conversation-name search from FTS5 trigram indexes kept in step by triggers, or
+from a read of the newest 2,000 messages, without changing which rows match
+(`internal/storage/sqlite/substring_search.go`; the runbook's "What a v2 search
+matches" covers checking and rebuilding the indexes).
+
 ### Schema
 
 Messages and conversations have `source_platform` (sms/gchat/imessage/whatsapp/signal/telegram) and messages have `source_id` for dedup. Unified contacts table maps people across platforms.

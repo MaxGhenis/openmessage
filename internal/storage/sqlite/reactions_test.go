@@ -25,11 +25,7 @@ func TestNewReactionRepositoryRequiresStoreAndClock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open(): %v", err)
 	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close(): %v", err)
-		}
-	})
+	closeTestStore(t, store)
 	if _, err := NewReactionRepository(store, nil); err == nil {
 		t.Fatal("NewReactionRepository(nil clock) succeeded")
 	}
@@ -643,11 +639,7 @@ func openReactionTestRepository(
 	if err != nil {
 		t.Fatalf("Open(): %v", err)
 	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close(): %v", err)
-		}
-	})
+	closeTestStore(t, store)
 	repository, err := NewReactionRepository(store, now)
 	if err != nil {
 		t.Fatalf("NewReactionRepository(): %v", err)
