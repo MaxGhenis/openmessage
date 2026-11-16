@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 
@@ -498,9 +499,10 @@ func TestBridgeSendMediaRequestStreamsAttachmentAndRemovesTempFileOnSuccess(t *t
 	if attachmentPath == "" {
 		t.Fatal("signal-cli received no anchored attachment path")
 	}
-	if _, err := os.Stat(attachmentPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temporary attachment still exists after success: %v", err)
-	}
+	// signal-cli names the attachment after the path's base name, so the
+	// recipient sees the sender's filename only if the staged file keeps it.
+	assertStagedSignalAttachment(t, bridge.configDir, attachmentPath, "photo.png")
+	assertStagedSignalAttachmentRemoved(t, bridge.configDir, attachmentPath)
 	wantArgs := []string{
 		"--output=json",
 		"-a", "+15551230000",
@@ -600,9 +602,8 @@ func TestBridgeSendMediaRequestClassifiesStructuredAndOpaqueFailures(t *testing.
 			if attachmentPath == "" {
 				t.Fatal("signal-cli received no attachment path")
 			}
-			if _, statErr := os.Stat(attachmentPath); !errors.Is(statErr, os.ErrNotExist) {
-				t.Fatalf("temporary attachment still exists after error: %v", statErr)
-			}
+			assertStagedSignalAttachment(t, bridge.configDir, attachmentPath, "photo.png")
+			assertStagedSignalAttachmentRemoved(t, bridge.configDir, attachmentPath)
 		})
 	}
 }
@@ -655,9 +656,368 @@ func TestBridgeSendMediaRequestSucceedsOnMixedRecipientResults(t *testing.T) {
 	if attachmentPath == "" {
 		t.Fatal("signal-cli received no attachment path")
 	}
-	if _, statErr := os.Stat(attachmentPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("temporary attachment still exists after mixed-result success: %v", statErr)
+	assertStagedSignalAttachment(t, bridge.configDir, attachmentPath, "photo.png")
+	assertStagedSignalAttachmentRemoved(t, bridge.configDir, attachmentPath)
+}
+
+// assertStagedSignalAttachment checks that the path handed to signal-cli is
+// <configDir>/outgoing-attachments/signal-*/<wantName>: one per-send
+// directory directly under the cache, holding a file with the sanitized name.
+func assertStagedSignalAttachment(t *testing.T, configDir, attachmentPath, wantName string) {
+	t.Helper()
+	if got := filepath.Base(attachmentPath); got != wantName {
+		t.Fatalf("signal-cli attachment base name = %q, want %q (path %q)", got, wantName, attachmentPath)
 	}
+	sendDir := filepath.Dir(attachmentPath)
+	cacheDir := filepath.Join(configDir, signalOutgoingAttachmentDir)
+	if filepath.Dir(sendDir) != cacheDir {
+		t.Fatalf("staged attachment %q is not in a per-send directory directly under %q", attachmentPath, cacheDir)
+	}
+	if !strings.HasPrefix(filepath.Base(sendDir), signalSendDirPrefix) {
+		t.Fatalf("per-send directory %q lacks the %q prefix", sendDir, signalSendDirPrefix)
+	}
+}
+
+// assertStagedSignalAttachmentRemoved checks that a finished send left neither
+// its file nor its per-send directory behind.
+func assertStagedSignalAttachmentRemoved(t *testing.T, configDir, attachmentPath string) {
+	t.Helper()
+	if _, err := os.Stat(attachmentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged attachment still exists after the send: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(attachmentPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("per-send directory still exists after the send: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(configDir, signalOutgoingAttachmentDir))
+	if err != nil {
+		t.Fatalf("read outgoing attachment directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("outgoing attachment directory holds %d entries after the send, want none", len(entries))
+	}
+}
+
+// A hostile or awkward filename must still reach signal-cli as a plain base
+// name inside the send's own directory: no traversal out of the cache, no
+// control characters, no name the file system rejects.
+func TestBridgeSendMediaRequestSanitizesAttachmentFilename(t *testing.T) {
+	output, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read send result fixture: %v", err)
+	}
+	longStem := strings.Repeat("a", 300)
+	longMultibyte := strings.Repeat("é", 200) // 400 bytes
+	tests := []struct {
+		name     string
+		filename string
+		want     string
+	}{
+		{name: "original name kept", filename: "Quarterly Briefing (Final) 2026.pdf", want: "Quarterly Briefing (Final) 2026.pdf"},
+		{name: "unicode kept", filename: "résumé 日本.pdf", want: "résumé 日本.pdf"},
+		{name: "parent traversal", filename: "../../x.pdf", want: "x.pdf"},
+		{name: "absolute path", filename: "/etc/passwd", want: "passwd"},
+		{name: "windows traversal", filename: `..\..\x.pdf`, want: "x.pdf"},
+		{name: "mixed separators", filename: `a/b\c.pdf`, want: "c.pdf"},
+		{name: "empty", filename: "", want: "attachment"},
+		{name: "whitespace", filename: "   ", want: "attachment"},
+		{name: "dot", filename: ".", want: "attachment"},
+		{name: "dot dot", filename: "..", want: "attachment"},
+		{name: "trailing separator", filename: "dir/", want: "attachment"},
+		{name: "trailing dot dot", filename: "a/..", want: "attachment"},
+		{name: "control characters", filename: "re\x00port\n\t.pdf", want: "report.pdf"},
+		{name: "surrounding space", filename: "  notes.txt  ", want: "notes.txt"},
+		{name: "long name keeps extension", filename: longStem + ".pdf", want: longStem[:maxSignalAttachmentNameBytes-len(".pdf")] + ".pdf"},
+		{name: "long multibyte name stays valid UTF-8", filename: longMultibyte + ".pdf", want: strings.Repeat("é", 125) + ".pdf"},
+		{name: "cut after a space drops it", filename: strings.Repeat("a", 254) + " " + strings.Repeat("b", 10), want: strings.Repeat("a", 254)},
+		{name: "cut after a no-break space drops it", filename: strings.Repeat("a", 253) + "\u00a0" + strings.Repeat("b", 10), want: strings.Repeat("a", 253)},
+		{name: "dropped long extension and cut after a space", filename: strings.Repeat("a", 254) + " ." + strings.Repeat("b", 70), want: strings.Repeat("a", 254)},
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bridge := &Bridge{
+				account:   "+15551230000",
+				connected: true,
+				configDir: t.TempDir(),
+				logger:    zerolog.Nop(),
+			}
+			var attachmentPath string
+			var attachmentContent []byte
+			runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+				for _, arg := range args {
+					if strings.HasPrefix(arg, "--attachment=") {
+						attachmentPath = strings.TrimPrefix(arg, "--attachment=")
+						data, readErr := os.ReadFile(attachmentPath)
+						if readErr != nil {
+							return nil, readErr
+						}
+						attachmentContent = data
+						break
+					}
+				}
+				return output, nil
+			}
+
+			if _, err := bridge.SendMediaRequest(
+				"signal:+15551234567",
+				strings.NewReader("pdf-bytes"),
+				int64(len("pdf-bytes")),
+				tc.filename,
+				"application/pdf",
+				"",
+				ReplyTarget{},
+			); err != nil {
+				t.Fatalf("SendMediaRequest(%q): %v", tc.filename, err)
+			}
+			if !utf8.ValidString(filepath.Base(attachmentPath)) {
+				t.Fatalf("staged name %q is not valid UTF-8", filepath.Base(attachmentPath))
+			}
+			if n := len(filepath.Base(attachmentPath)); n > maxSignalAttachmentNameBytes {
+				t.Fatalf("staged name is %d bytes, over the %d-byte limit", n, maxSignalAttachmentNameBytes)
+			}
+			assertStagedSignalAttachment(t, bridge.configDir, attachmentPath, tc.want)
+			if string(attachmentContent) != "pdf-bytes" {
+				t.Fatalf("signal-cli read %q, want pdf-bytes", attachmentContent)
+			}
+			assertStagedSignalAttachmentRemoved(t, bridge.configDir, attachmentPath)
+		})
+	}
+}
+
+// Two sends of the same filename must not share or overwrite a staged file.
+func TestBridgeSendMediaStagesSameFilenameInSeparateDirectories(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	output, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read send result fixture: %v", err)
+	}
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		return output, nil
+	}
+
+	// The legacy path retains each successful file for local download.
+	first, err := bridge.SendMedia("signal:+15551234567", []byte("first"), "same.pdf", "application/pdf", "", "")
+	if err != nil {
+		t.Fatalf("first SendMedia(): %v", err)
+	}
+	second, err := bridge.SendMedia("signal:+15551234567", []byte("second"), "same.pdf", "application/pdf", "", "")
+	if err != nil {
+		t.Fatalf("second SendMedia(): %v", err)
+	}
+	firstPath, err := decodeSignalLocalAttachmentRef(first.MediaID)
+	if err != nil {
+		t.Fatalf("decode first local attachment: %v", err)
+	}
+	secondPath, err := decodeSignalLocalAttachmentRef(second.MediaID)
+	if err != nil {
+		t.Fatalf("decode second local attachment: %v", err)
+	}
+	if firstPath == secondPath {
+		t.Fatalf("both sends staged the same path %q", firstPath)
+	}
+	for path, want := range map[string]string{firstPath: "first", secondPath: "second"} {
+		assertStagedSignalAttachment(t, bridge.configDir, path, "same.pdf")
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read retained attachment %q: %v", path, readErr)
+		}
+		if string(data) != want {
+			t.Fatalf("retained attachment %q = %q, want %q", path, data, want)
+		}
+	}
+}
+
+// The sync echo of a legacy web send swaps the local reference for Signal's
+// attachment id and removes the retained copy. It removes only files this
+// bridge staged: a per-send file (and its directory, once empty) or a flat
+// file from before per-send directories. Anything else a stored MediaID can
+// name, such as Signal Desktop's own attachment files, must survive.
+func TestCleanupLocalSignalAttachmentRemovesOnlyStagedFiles(t *testing.T) {
+	configDir := t.TempDir()
+	bridge := &Bridge{configDir: configDir, logger: zerolog.Nop()}
+	cacheDir := filepath.Join(configDir, signalOutgoingAttachmentDir)
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		t.Fatalf("create cache dir: %v", err)
+	}
+	write := func(path string) string {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatalf("create dir for %q: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("pdf"), 0600); err != nil {
+			t.Fatalf("write %q: %v", path, err)
+		}
+		return path
+	}
+	exists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+
+	// A per-send file goes, and so does its emptied directory.
+	sendDir := filepath.Join(cacheDir, signalSendDirPrefix+"1")
+	nested := write(filepath.Join(sendDir, "report.pdf"))
+	bridge.cleanupLocalSignalAttachment(encodeSignalLocalAttachmentRef(nested))
+	if exists(nested) || exists(sendDir) {
+		t.Fatalf("per-send file or directory survived cleanup (file %v, dir %v)", exists(nested), exists(sendDir))
+	}
+
+	// A flat file from before per-send directories goes; the cache stays.
+	flat := write(filepath.Join(cacheDir, "signal-123456.pdf"))
+	bridge.cleanupLocalSignalAttachment(encodeSignalLocalAttachmentRef(flat))
+	if exists(flat) {
+		t.Fatal("pre-existing flat attachment survived cleanup")
+	}
+	if !exists(cacheDir) {
+		t.Fatal("cleanup of a flat attachment removed the shared cache directory")
+	}
+
+	// A per-send directory that still holds something else is not removed
+	// recursively.
+	busyDir := filepath.Join(cacheDir, signalSendDirPrefix+"2")
+	target := write(filepath.Join(busyDir, "a.pdf"))
+	sibling := write(filepath.Join(busyDir, "b.pdf"))
+	bridge.cleanupLocalSignalAttachment(encodeSignalLocalAttachmentRef(target))
+	if exists(target) || !exists(sibling) || !exists(busyDir) {
+		t.Fatalf("cleanup of one file in a non-empty per-send directory: target %v, sibling %v, dir %v; want false, true, true",
+			exists(target), exists(sibling), exists(busyDir))
+	}
+
+	// Paths this bridge never staged are left alone, files included.
+	desktop := write(filepath.Join(t.TempDir(), "Signal", "attachments.noindex", "ab", "abcdef"))
+	lookalike := write(filepath.Join(t.TempDir(), signalOutgoingAttachmentDir, signalSendDirPrefix+"3", "x.pdf"))
+	victim := write(filepath.Join(configDir, "victim.pdf"))
+	tooDeep := write(filepath.Join(cacheDir, signalSendDirPrefix+"4", "sub", "x.pdf"))
+	notPerSend := write(filepath.Join(cacheDir, "other", "x.pdf"))
+	for _, ref := range []string{
+		desktop,
+		lookalike,
+		filepath.Join(cacheDir, signalSendDirPrefix+"5", "..", "..", "victim.pdf"), // traversal out of the cache
+		tooDeep,
+		notPerSend,
+		cacheDir,
+	} {
+		bridge.cleanupLocalSignalAttachment(encodeSignalLocalAttachmentRef(ref))
+	}
+	for name, path := range map[string]string{
+		"Signal Desktop attachment":             desktop,
+		"look-alike cache outside configDir":    lookalike,
+		"traversal target":                      victim,
+		"nested below a per-send directory":     tooDeep,
+		"directory without the per-send prefix": notPerSend,
+		"the cache directory itself":            cacheDir,
+	} {
+		if !exists(path) {
+			t.Errorf("cleanup removed %s at %q", name, path)
+		}
+	}
+}
+
+// The Signal Desktop importer stores signallocal: references to Signal
+// Desktop's own attachment files, and an imported row can carry the
+// timestamp a sync echo matches. The echo must not delete that file.
+func TestSentMessageSyncKeepsAttachmentFilesItDidNotStage(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		store:     store,
+		logger:    zerolog.Nop(),
+	}
+
+	desktopFile := filepath.Join(t.TempDir(), "Signal", "attachments.noindex", "ab", "abcdef")
+	if err := os.MkdirAll(filepath.Dir(desktopFile), 0700); err != nil {
+		t.Fatalf("create desktop attachment dir: %v", err)
+	}
+	if err := os.WriteFile(desktopFile, []byte("png-bytes"), 0600); err != nil {
+		t.Fatalf("write desktop attachment: %v", err)
+	}
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "signal:1700000000123",
+		ConversationID: "signal:+15551234567",
+		SenderName:     "Me",
+		SenderNumber:   "+15551230000",
+		Body:           "[Photo]",
+		TimestampMS:    1700000000123,
+		Status:         "sent",
+		IsFromMe:       true,
+		SourcePlatform: "signal",
+		SourceID:       "1700000000123",
+		MimeType:       "image/png",
+		MediaID:        encodeSignalLocalAttachmentRef(desktopFile),
+	}); err != nil {
+		t.Fatalf("UpsertMessage(): %v", err)
+	}
+
+	payload := `{"account":"+15551230000","envelope":{"source":"+15551230000","sourceNumber":"+15551230000","timestamp":1700000000123,"syncMessage":{"sentMessage":{"destinationNumber":"+15551234567","timestamp":1700000000123,"message":"","attachments":[{"contentType":"image/png","id":"remote-attachment-1"}]}}}}`
+	if err := bridge.handleReceiveOutput("+15551230000", []byte(payload+"\n")); err != nil {
+		t.Fatalf("handleReceiveOutput(): %v", err)
+	}
+	if _, err := os.Stat(desktopFile); err != nil {
+		t.Fatalf("sync echo deleted an attachment file the bridge never staged: %v", err)
+	}
+}
+
+// A long name whose cut lands after a space must not end in whitespace: the
+// legacy MediaID trims the path, so a trailing space would leave the stored
+// reference naming a file that does not exist, breaking the local download
+// and leaking the retained copy.
+func TestLegacySendMediaLongFilenameStaysDownloadableAndCleanable(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	output, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read send result fixture: %v", err)
+	}
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	var attachmentPath string
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--attachment=") {
+				attachmentPath = strings.TrimPrefix(arg, "--attachment=")
+			}
+		}
+		return output, nil
+	}
+
+	filename := strings.Repeat("a", 254) + " " + strings.Repeat("b", 10)
+	msg, err := bridge.SendMedia("signal:+15551234567", []byte("pdf-bytes"), filename, "application/pdf", "", "")
+	if err != nil {
+		t.Fatalf("SendMedia(): %v", err)
+	}
+	assertStagedSignalAttachment(t, bridge.configDir, attachmentPath, strings.Repeat("a", 254))
+	stored, err := decodeSignalLocalAttachmentRef(msg.MediaID)
+	if err != nil {
+		t.Fatalf("decode retained local attachment: %v", err)
+	}
+	if stored != attachmentPath {
+		t.Fatalf("stored MediaID path = %q, want the path signal-cli read %q", stored, attachmentPath)
+	}
+	data, _, err := bridge.DownloadMedia(msg)
+	if err != nil || string(data) != "pdf-bytes" {
+		t.Fatalf("DownloadMedia() = %q, %v; want pdf-bytes", data, err)
+	}
+	bridge.cleanupLocalSignalAttachment(msg.MediaID)
+	assertStagedSignalAttachmentRemoved(t, bridge.configDir, attachmentPath)
 }
 
 // Web-sent media rows persist the transport timestamp as their MessageID
@@ -702,6 +1062,11 @@ func TestSentMessageSyncDoesNotDuplicateWebSentMedia(t *testing.T) {
 	if err := store.UpsertMessage(msg); err != nil {
 		t.Fatalf("UpsertMessage(): %v", err)
 	}
+	retainedPath, err := decodeSignalLocalAttachmentRef(msg.MediaID)
+	if err != nil {
+		t.Fatalf("decode retained local attachment: %v", err)
+	}
+	assertStagedSignalAttachment(t, bridge.configDir, retainedPath, "photo.png")
 
 	// History sync replays the same send as a SentMessage transcript with the
 	// same sender timestamp.
@@ -726,6 +1091,9 @@ func TestSentMessageSyncDoesNotDuplicateWebSentMedia(t *testing.T) {
 	if fromMe != 1 {
 		t.Fatalf("outgoing rows after history-sync replay = %d, want exactly 1 (duplicate on re-pair)", fromMe)
 	}
+	// The echo now serves the attachment from Signal, so the retained copy
+	// and its per-send directory are gone.
+	assertStagedSignalAttachmentRemoved(t, bridge.configDir, retainedPath)
 }
 
 func TestBridgeSendMediaRequestRejectsOversizeReaderBeforeCommand(t *testing.T) {
@@ -2624,6 +2992,7 @@ func TestLegacySendMediaCharacterizationPreservesTransportAndLocalAttachment(t *
 	if err != nil {
 		t.Fatalf("decode retained local attachment: %v", err)
 	}
+	assertStagedSignalAttachment(t, bridge.configDir, attachmentPath, "photo.png")
 	wantArgs := []string{
 		bridge.configDir,
 		"--output=json",
