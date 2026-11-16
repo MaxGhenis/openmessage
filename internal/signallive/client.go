@@ -1285,7 +1285,9 @@ type signalMediaRequestResult struct {
 // path. The former removes its staged attachment and per-send directory on
 // every outcome; the latter retains the successful file because its db.Message
 // MediaID still serves that exact local attachment through the legacy download
-// endpoint, until the send's sync echo replaces the reference.
+// endpoint. Only a sync echo of the send, which normally comes only with a
+// re-link history sync, replaces that reference and removes the file; nothing
+// else sweeps it.
 func (b *Bridge) sendMediaRequest(
 	conversationID string,
 	content io.Reader,
@@ -2987,7 +2989,7 @@ func (b *Bridge) handleSentMessage(account string, env *signalEnvelope, synthesi
 	}
 	if len(sent.Attachments) > 0 {
 		if existingMsg != nil {
-			cleanupLocalSignalAttachment(existingMsg.MediaID)
+			b.cleanupLocalSignalAttachment(existingMsg.MediaID)
 		}
 		msg.MimeType = strings.TrimSpace(sent.Attachments[0].ContentType)
 		msg.MediaID = encodeSignalAttachmentRef(sent.Attachments[0].ID)
@@ -4575,8 +4577,9 @@ const (
 	// signalAttachmentFallbackName stands in for a filename with no usable
 	// base name.
 	signalAttachmentFallbackName = "attachment"
-	// maxSignalAttachmentNameBytes is the longest file name APFS and ext4
-	// accept. The outbox allows 512-byte filenames.
+	// maxSignalAttachmentNameBytes is NAME_MAX on Linux file systems such as
+	// ext4, which count bytes. APFS allows 255 characters, so a 255-byte cap
+	// fits both. The outbox allows 512-byte filenames.
 	maxSignalAttachmentNameBytes = 255
 )
 
@@ -4611,7 +4614,14 @@ func signalAttachmentFilename(filename string) string {
 	for cut > 0 && !utf8.RuneStart(stem[cut]) {
 		cut--
 	}
-	return stem[:cut] + ext
+	// A cut can land after a space. Drop it: a name ending in whitespace
+	// reads badly to recipients, and the legacy path's MediaID trims the
+	// path, so it would name a file that does not exist.
+	name := strings.TrimRightFunc(stem[:cut], unicode.IsSpace) + ext
+	if name == "" || name == "." || name == ".." {
+		return signalAttachmentFallbackName
+	}
+	return name
 }
 
 // isSignalSendDir reports whether dir is a per-send staging directory that
@@ -4631,18 +4641,37 @@ func removeStagedSignalAttachment(path string) {
 	_ = os.Remove(path)
 }
 
-func cleanupLocalSignalAttachment(mediaID string) {
+// cleanupLocalSignalAttachment removes the retained copy of a legacy web
+// send once its sync echo serves the attachment from Signal. The path comes
+// from a stored MediaID, which is not always one this bridge staged: the
+// Signal Desktop importer stores signallocal: references to Signal Desktop's
+// own attachment files, and its rows can match a sync echo. So only a file
+// this bridge staged is removed: one directly in outgoing-attachments (rows
+// written before per-send directories) or one inside a signal-* per-send
+// directory there, whose directory is then removed if it is empty.
+func (b *Bridge) cleanupLocalSignalAttachment(mediaID string) {
 	path, err := decodeSignalLocalAttachmentRef(mediaID)
-	if err != nil || path == "" {
+	if err != nil || path == "" || b == nil || strings.TrimSpace(b.configDir) == "" {
 		return
 	}
-	_ = os.Remove(path)
-	// The path comes from a stored MediaID, so remove only an emptied
-	// per-send directory, never recursively. Rows written before per-send
-	// directories point at files directly in outgoing-attachments, which
-	// must stay.
-	if dir := filepath.Dir(path); isSignalSendDir(dir) {
-		_ = os.Remove(dir)
+	cacheDir := filepath.Join(b.configDir, signalOutgoingAttachmentDir)
+	rel, err := filepath.Rel(cacheDir, filepath.Clean(path))
+	if err != nil {
+		return
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return
+		}
+	}
+	switch {
+	case len(parts) == 1:
+		_ = os.Remove(filepath.Join(cacheDir, parts[0]))
+	case len(parts) == 2 && strings.HasPrefix(parts[0], signalSendDirPrefix):
+		sendDir := filepath.Join(cacheDir, parts[0])
+		_ = os.Remove(filepath.Join(sendDir, parts[1]))
+		_ = os.Remove(sendDir) // non-recursive: only once it is empty
 	}
 }
 
