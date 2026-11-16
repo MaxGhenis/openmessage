@@ -22,6 +22,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 	"rsc.io/qr"
@@ -1280,9 +1282,10 @@ type signalMediaRequestResult struct {
 }
 
 // sendMediaRequest is shared by the durable adapter path and the retained web
-// path. The former removes its transport temp file on every outcome; the latter
-// retains the successful file because its db.Message MediaID still serves that
-// exact local attachment through the legacy download endpoint.
+// path. The former removes its staged attachment and per-send directory on
+// every outcome; the latter retains the successful file because its db.Message
+// MediaID still serves that exact local attachment through the legacy download
+// endpoint, until the send's sync echo replaces the reference.
 func (b *Bridge) sendMediaRequest(
 	conversationID string,
 	content io.Reader,
@@ -1312,7 +1315,7 @@ func (b *Bridge) sendMediaRequest(
 	removeAttachment := true
 	defer func() {
 		if removeAttachment {
-			_ = os.Remove(attachmentPath)
+			removeStagedSignalAttachment(attachmentPath)
 		}
 	}()
 
@@ -4520,23 +4523,29 @@ func (b *Bridge) writeLocalAttachmentReader(content io.Reader, size int64, filen
 	if size <= 0 {
 		return "", errors.New("Signal attachment size must be positive")
 	}
-	cacheDir := filepath.Join(b.configDir, "outgoing-attachments")
+	cacheDir := filepath.Join(b.configDir, signalOutgoingAttachmentDir)
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
 		return "", fmt.Errorf("create Signal attachment cache: %w", err)
 	}
-	pattern := "signal-*"
-	if ext := strings.TrimSpace(filepath.Ext(filename)); ext != "" {
-		pattern += ext
-	}
-	file, err := os.CreateTemp(cacheDir, pattern)
+	// signal-cli names an attachment after its file's base name, and
+	// recipients see that name. Stage the file under the sender's filename
+	// inside a directory of its own, so the name survives and two sends of
+	// the same name never collide.
+	sendDir, err := os.MkdirTemp(cacheDir, signalSendDirPrefix+"*")
 	if err != nil {
+		return "", fmt.Errorf("create Signal attachment temp dir: %w", err)
+	}
+	path := filepath.Join(sendDir, signalAttachmentFilename(filename))
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		_ = os.RemoveAll(sendDir)
 		return "", fmt.Errorf("create Signal attachment temp file: %w", err)
 	}
 	remove := true
 	defer func() {
 		_ = file.Close()
 		if remove {
-			_ = os.Remove(file.Name())
+			_ = os.RemoveAll(sendDir)
 		}
 	}()
 	written, err := io.Copy(file, io.LimitReader(content, size+1))
@@ -4550,11 +4559,76 @@ func (b *Bridge) writeLocalAttachmentReader(content io.Reader, size int64, filen
 		return "", fmt.Errorf("Signal attachment ended at %d bytes; expected %d", written, size)
 	}
 	if err := file.Close(); err != nil {
-		_ = os.Remove(file.Name())
 		return "", fmt.Errorf("close Signal attachment temp file: %w", err)
 	}
 	remove = false
-	return file.Name(), nil
+	return path, nil
+}
+
+const (
+	// signalOutgoingAttachmentDir, under the Signal config dir, holds the
+	// attachments staged for signal-cli sends.
+	signalOutgoingAttachmentDir = "outgoing-attachments"
+	// signalSendDirPrefix names the per-send directory each staged
+	// attachment sits in.
+	signalSendDirPrefix = "signal-"
+	// signalAttachmentFallbackName stands in for a filename with no usable
+	// base name.
+	signalAttachmentFallbackName = "attachment"
+	// maxSignalAttachmentNameBytes is the longest file name APFS and ext4
+	// accept. The outbox allows 512-byte filenames.
+	maxSignalAttachmentNameBytes = 255
+)
+
+// signalAttachmentFilename reduces a caller's filename to the base name the
+// staged file gets: the last element after either path separator, without
+// control characters or surrounding space, capped at the file system's name
+// limit with its extension kept. A name with nothing usable left, such as
+// "", "..", or "dir/", becomes "attachment".
+func signalAttachmentFilename(filename string) string {
+	if i := strings.LastIndexAny(filename, `/\`); i >= 0 {
+		filename = filename[i+1:]
+	}
+	filename = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, filename)
+	filename = strings.TrimSpace(filename)
+	if filename == "" || filename == "." || filename == ".." {
+		return signalAttachmentFallbackName
+	}
+	if len(filename) <= maxSignalAttachmentNameBytes {
+		return filename
+	}
+	ext := filepath.Ext(filename)
+	if len(ext) > maxSignalAttachmentNameBytes/4 {
+		ext = ""
+	}
+	stem := filename[:len(filename)-len(ext)]
+	cut := maxSignalAttachmentNameBytes - len(ext)
+	for cut > 0 && !utf8.RuneStart(stem[cut]) {
+		cut--
+	}
+	return stem[:cut] + ext
+}
+
+// isSignalSendDir reports whether dir is a per-send staging directory that
+// writeLocalAttachmentReader created.
+func isSignalSendDir(dir string) bool {
+	return strings.HasPrefix(filepath.Base(dir), signalSendDirPrefix) &&
+		filepath.Base(filepath.Dir(dir)) == signalOutgoingAttachmentDir
+}
+
+// removeStagedSignalAttachment removes a send's staged attachment together
+// with its per-send directory.
+func removeStagedSignalAttachment(path string) {
+	if dir := filepath.Dir(path); isSignalSendDir(dir) {
+		_ = os.RemoveAll(dir)
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func cleanupLocalSignalAttachment(mediaID string) {
@@ -4563,6 +4637,13 @@ func cleanupLocalSignalAttachment(mediaID string) {
 		return
 	}
 	_ = os.Remove(path)
+	// The path comes from a stored MediaID, so remove only an emptied
+	// per-send directory, never recursively. Rows written before per-send
+	// directories point at files directly in outgoing-attachments, which
+	// must stay.
+	if dir := filepath.Dir(path); isSignalSendDir(dir) {
+		_ = os.Remove(dir)
+	}
 }
 
 func sanitizeSignalOutput(line string) string {
