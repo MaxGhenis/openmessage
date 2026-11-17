@@ -99,6 +99,11 @@ type StatusChecker func() bool
 // UnpairFunc deletes the session and disconnects.
 type UnpairFunc func() error
 
+type googleTextClient interface {
+	GetConversation(string) (*gmproto.Conversation, error)
+	SendMessage(*gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
+}
+
 // APIOptions holds optional callbacks for the API handler.
 type APIOptions struct {
 	Auth                  *ControlAuth
@@ -107,6 +112,7 @@ type APIOptions struct {
 	Reads                 readsource.ReadSource
 	V2Primary             bool
 	Client                func() *client.Client
+	googleText            googleTextClient
 	Events                *EventBroker
 	EventHeartbeat        time.Duration
 	IdentityName          string
@@ -200,6 +206,15 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return opts.Client()
 		}
 		return cli
+	}
+	getGoogleTextClient := func() googleTextClient {
+		if opts.googleText != nil {
+			return opts.googleText
+		}
+		if current := getClient(); current != nil && current.GM != nil {
+			return current.GM
+		}
+		return nil
 	}
 	currentConnected := func() bool {
 		connected := getClient() != nil
@@ -1797,14 +1812,14 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			})
 			return
 		}
-		cli := getClient()
+		cli := getGoogleTextClient()
 		if cli == nil {
 			releaseIdempotentSend(idempotencyKey)
 			httpError(w, app.ErrNotConnected, 503)
 			return
 		}
 		// Fetch conversation to get SIM and participant info
-		conv, err := cli.GM.GetConversation(req.ConversationID)
+		conv, err := cli.GetConversation(req.ConversationID)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
@@ -1824,7 +1839,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Bool("has_sim", simPayload != nil).
 			Msg("Sending message")
 
-		resp, err := cli.GM.SendMessage(payload)
+		resp, err := cli.SendMessage(payload)
 		if err != nil {
 			authExpired := markGoogleAuthExpired(err)
 			if !authExpired {
@@ -1870,24 +1885,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		recordGoogleSend(true)
-		// Store sent message in DB immediately so UI shows it
-		now := time.Now().UnixMilli()
-		if err := recordOutgoingMessage(&db.Message{
-			MessageID:      payload.TmpID,
-			ConversationID: req.ConversationID,
-			Body:           req.Message,
-			IsFromMe:       true,
-			TimestampMS:    now,
-			Status:         "OUTGOING_SENDING",
-			ReplyToID:      req.ReplyToID,
-		}, ""); err != nil {
-			completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusLocalStoreFailed)
-			writeLocalStoreFailedSend(w, payload.TmpID, err)
-			return
-		}
-		completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusSent)
-		publishMessages(req.ConversationID)
-		publishConversations()
+		// Google sync owns the canonical row. The acknowledgement has no
+		// message ID, and the echo may already be stored or lack a TmpID.
+		completeIdempotentSend(idempotencyKey, "", db.OutgoingSendStatusSent)
 		writeJSON(w, map[string]any{
 			"status":  resp.GetStatus().String(),
 			"success": success,
@@ -2510,14 +2510,14 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			})
 			return
 		}
-		cli := getClient()
+		cli := getGoogleTextClient()
 		if cli == nil {
 			httpError(w, app.ErrNotConnected, 503)
 			return
 		}
 
 		// Use the same send logic as /api/send
-		conv, err := cli.GM.GetConversation(draft.ConversationID)
+		conv, err := cli.GetConversation(draft.ConversationID)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
@@ -2535,7 +2535,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Str("draft_id", req.DraftID).
 			Msg("Sending draft message")
 
-		resp, err := cli.GM.SendMessage(payload)
+		resp, err := cli.SendMessage(payload)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
@@ -2563,21 +2563,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		recordGoogleSend(true)
-		now := time.Now().UnixMilli()
-		if err := recordOutgoingMessage(&db.Message{
-			MessageID:      payload.TmpID,
-			ConversationID: draft.ConversationID,
-			Body:           req.Body,
-			IsFromMe:       true,
-			TimestampMS:    now,
-			Status:         "OUTGOING_SENDING",
-		}, req.DraftID); err != nil {
+		// Google sync owns the message row, as in /api/send.
+		if err := store.DeleteDraft(req.DraftID); err != nil {
 			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
 			return
 		}
-		publishMessages(draft.ConversationID)
 		publishDrafts(draft.ConversationID)
-		publishConversations()
 		writeJSON(w, map[string]any{
 			"status":  resp.GetStatus().String(),
 			"success": success,
