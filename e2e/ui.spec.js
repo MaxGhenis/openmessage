@@ -144,7 +144,7 @@ test('links WhatsApp with a phone number pairing code when unpaired', async ({ p
 
   await page.locator('#wa-pair-code-toggle').click();
   await expect(page.locator('#wa-pair-code-form')).toBeVisible();
-  await page.locator('#wa-pair-code-input').fill('+16505551234');
+  await page.locator('#wa-pair-code-input').fill('+16505550116');
   await page.locator('#wa-pair-code-btn').click();
 
   // The UI renders the 8-char code dash-split like WhatsApp shows it.
@@ -753,7 +753,7 @@ test('renders clickable links with a social preview card', async ({ page, reques
       body: 'Read this example.com/story',
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
     },
   });
 
@@ -837,7 +837,7 @@ test('opens contact details from the thread header name', async ({ page }) => {
 
   await page.locator('#chat-header-name').click();
   await expect(page.locator('#contact-popover')).toBeVisible();
-  await expect(page.locator('#contact-popover')).toContainText('+14155551234');
+  await expect(page.locator('#contact-popover')).toContainText('+14155550105');
 });
 
 test('shows the group member count and member list from the header', async ({ page }) => {
@@ -852,7 +852,7 @@ test('shows the group member count and member list from the header', async ({ pa
 
   const names = page.locator('#contact-popover .contact-popover-member-name');
   await expect(names).toHaveText(['Mia Torres', 'Noah Patel']);
-  await expect(page.locator('#contact-popover')).toContainText('+12025557777');
+  await expect(page.locator('#contact-popover')).toContainText('+12025550112');
   await expect(page.locator('#contact-popover .contact-popover-copy')).toHaveCount(2);
   // Small groups skip the filter input.
   await expect(page.locator('#contact-popover-filter')).toHaveCount(0);
@@ -933,17 +933,17 @@ test('starts a new WhatsApp chat with a number from the platform picker', async 
 
   await page.locator('.new-msg-platform-chip[data-platform="whatsapp"]').click();
   await expect(page.locator('#new-msg-helper')).toContainText('Starts a WhatsApp chat');
-  await page.locator('#new-msg-phone').fill('+1 415 555 9876');
+  await page.locator('#new-msg-phone').fill('+1 415 555 0117');
   await page.locator('#new-msg-go').click();
 
-  await expect(page.locator('#chat-header-name')).toHaveText('+14155559876');
+  await expect(page.locator('#chat-header-name')).toHaveText('+14155550117');
   await expect(page.locator('#chat-header-source')).toContainText('WhatsApp');
   await expect(page.locator('#new-msg-overlay')).not.toHaveClass(/show/);
 });
 
 test('start button reflects the picked platform when other routes exist', async ({ page }) => {
   await page.locator('#new-msg-btn').click();
-  await page.locator('#new-msg-phone').fill('+14155551234'); // Sarah Chen: SMS-only
+  await page.locator('#new-msg-phone').fill('+14155550105'); // Sarah Chen: SMS-only
   // SMS pick opens the existing route.
   await expect(page.locator('#new-msg-go')).toHaveText(/Open .+ route/);
   // WhatsApp pick starts a new WhatsApp chat instead of opening the SMS route.
@@ -1052,7 +1052,7 @@ test('favorites conversations from the header and row context menu', async ({ pa
       conversation_id: 'conv2',
       body: `Favorite badge check ${Date.now()}`,
       sender_name: 'Marcus Johnson',
-      sender_number: '+12125559876',
+      sender_number: '+12125550106',
       timestamp_ms: 1738956601000,
     },
   });
@@ -1165,7 +1165,7 @@ test('hydrates cached Google contact photos into avatars', async ({ page, reques
   await request.post('/_e2e/avatar', {
     data: {
       source_platform: 'sms',
-      phone_number: '+14155551234',
+      phone_number: '+14155550105',
       display_name: 'Sarah Chen',
       image_base64: 'R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
       image_hash: 'sarah-e2e-avatar',
@@ -2206,7 +2206,7 @@ test('renders read receipts for read messages', async ({ page, request }) => {
       conversation_id: 'conv1',
       is_from_me: true,
       sender_name: 'Me',
-      sender_number: '+14155550000',
+      sender_number: '+14155550118',
       status: 'READ',
     },
   });
@@ -2249,13 +2249,13 @@ test('ignores stale avatar fetches when reusing an avatar node', async ({ page }
 
     window.__openMessageTestHooks.renderAvatarElement(host, {
       name: 'Sarah Chen',
-      numbers: ['+14155551234'],
+      numbers: ['+14155550105'],
       text: 'S',
       background: '#111827',
     });
     window.__openMessageTestHooks.renderAvatarElement(host, {
       name: 'Marcus Johnson',
-      numbers: ['+12125559876'],
+      numbers: ['+12125550106'],
       text: 'M',
       background: '#1f2937',
     });
@@ -2473,7 +2473,7 @@ test('refreshes the active thread from SSE invalidations', async ({ page, reques
       body: inbound,
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
     },
   });
 
@@ -2491,7 +2491,7 @@ test('keeps unchanged thread and sidebar nodes mounted for inbound live messages
       body: inbound,
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
     },
   });
 
@@ -2602,7 +2602,7 @@ test('shows and clears a typing indicator from live typing events', async ({ pag
     data: {
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
       typing: true,
     },
   });
@@ -2614,7 +2614,7 @@ test('shows and clears a typing indicator from live typing events', async ({ pag
     data: {
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
       typing: false,
     },
   });
@@ -2635,7 +2635,7 @@ test('shows a desktop notification for an unseen inbound message when enabled', 
       body: inbound,
       conversation_id: 'conv2',
       sender_name: 'Marcus Johnson',
-      sender_number: '+12125559876',
+      sender_number: '+12125550106',
     },
   });
 
@@ -2657,7 +2657,7 @@ test('suppresses desktop notifications for the active visible thread', async ({ 
       body: inbound,
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
     },
   });
 
@@ -2683,7 +2683,7 @@ test('lets you mute a thread from the header notification menu', async ({ page, 
       body: inbound,
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
     },
   });
 
@@ -2710,7 +2710,7 @@ test('supports mentions-only notifications from the conversation context menu', 
       body: mutedInbound,
       conversation_id: 'conv2',
       sender_name: 'Marcus Johnson',
-      sender_number: '+12125559876',
+      sender_number: '+12125550106',
     },
   });
 
@@ -2722,7 +2722,7 @@ test('supports mentions-only notifications from the conversation context menu', 
       conversation_id: 'conv2',
       mentions_me: true,
       sender_name: 'Marcus Johnson',
-      sender_number: '+12125559876',
+      sender_number: '+12125550106',
     },
   });
 
@@ -2758,7 +2758,7 @@ test('preserves draft edits during SSE refresh', async ({ page, request }) => {
       body: inbound,
       conversation_id: 'conv1',
       sender_name: 'Sarah Chen',
-      sender_number: '+14155551234',
+      sender_number: '+14155550105',
     },
   });
 

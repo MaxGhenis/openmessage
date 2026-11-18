@@ -73,7 +73,7 @@ func TestWhatsAppDecoderMessageFrameTable(t *testing.T) {
 	mediaEnvelope := waBaseMessageEnvelope()
 	mediaEnvelope.MessageID = "media-message"
 	mediaEnvelope.IsFromMe = true
-	mediaEnvelope.SenderJID = "14155550999:7@s.whatsapp.net"
+	mediaEnvelope.SenderJID = "14155550114:7@s.whatsapp.net"
 	mediaMessage := &waE2E.Message{
 		ImageMessage: &waE2E.ImageMessage{
 			Caption:       proto.String("captured photo"),
@@ -1021,7 +1021,7 @@ func waHistoryFixture() *waHistorySync.HistorySync {
 			ID: proto.String(waCanonicalChatJID),
 			Messages: []*waHistorySync.HistorySyncMsg{
 				message("history-first", "first historical body", 1_700_000_001, false, waSenderJID),
-				message("history-second", "second historical body", 1_700_000_002, true, "14155550999@s.whatsapp.net"),
+				message("history-second", "second historical body", 1_700_000_002, true, "14155550114@s.whatsapp.net"),
 			},
 		}},
 	}

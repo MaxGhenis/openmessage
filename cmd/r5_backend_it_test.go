@@ -132,7 +132,7 @@ func buildR5LegacyFixture(t *testing.T) r5LegacyFixture {
 		{
 			ConversationID: r5WhatsAppConversation,
 			Name:           "R5 WhatsApp Friend",
-			Participants:   `[{"name":"R5 WhatsApp Friend","number":"14155550200@s.whatsapp.net"},{"name":"Me","number":"14155550999@s.whatsapp.net","is_me":true}]`,
+			Participants:   `[{"name":"R5 WhatsApp Friend","number":"14155550200@s.whatsapp.net"},{"name":"Me","number":"14155550114@s.whatsapp.net","is_me":true}]`,
 			LastMessageTS:  base + 5_000,
 			SourcePlatform: "whatsapp",
 		},
