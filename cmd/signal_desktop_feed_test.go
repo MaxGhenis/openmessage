@@ -33,6 +33,20 @@ const (
 	sdfBaseMS   = int64(1_790_000_000_000)
 )
 
+// desktopFeedTestSink records history frames and fails the failAt-th append.
+type desktopFeedTestSink struct {
+	records []bridge.RawIngressRecord
+	failAt  int
+}
+
+func (s *desktopFeedTestSink) AppendHistoryIngress(_ context.Context, record bridge.RawIngressRecord) error {
+	if s.failAt > 0 && len(s.records)+1 == s.failAt {
+		return errors.New("synthetic append failure")
+	}
+	s.records = append(s.records, record)
+	return nil
+}
+
 func sdfChunk() signaldesktop.Chunk {
 	return signaldesktop.Chunk{
 		Chat:     signaldesktop.Chat{RemoteID: "signal:" + sdfPeerE164, Participants: []signaldesktop.Participant{{Address: sdfPeerE164}}},

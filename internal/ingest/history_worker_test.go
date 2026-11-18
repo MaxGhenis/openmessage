@@ -1395,17 +1395,18 @@ func TestHistoryWorkerRegistrationIsGoogleAndSignalOnly(t *testing.T) {
 			}
 		})
 	}
-	// WhatsApp history needs placement rules this worker does not have, and an
-	// unknown platform has none at all.
-	for _, platform := range []bridge.Platform{bridge.PlatformWhatsApp, "telegram"} {
-		t.Run("rejects/"+string(platform), func(t *testing.T) {
-			const codec = "test.hwt.history"
-			_, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder, History: true}))
-			want := fmt.Sprintf("history codec %q is only supported for %q and %q", codec, bridge.PlatformGoogle, bridge.PlatformSignal)
-			if err == nil || !strings.Contains(err.Error(), want) {
-				t.Fatalf("NewWorker(History on %s) error = %v, want %q", platform, err, want)
-			}
-		})
+	// WhatsApp history needs placement rules this worker does not have.
+	t.Run("rejects/"+string(bridge.PlatformWhatsApp), func(t *testing.T) {
+		const codec = "test.hwt.history"
+		_, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: bridge.PlatformWhatsApp, Decoder: decoder, History: true}))
+		want := fmt.Sprintf("history codec %q is only supported for %q and %q", codec, bridge.PlatformGoogle, bridge.PlatformSignal)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("NewWorker(History on whatsapp) error = %v, want %q", err, want)
+		}
+	})
+	// An unknown platform is refused before the history rule is reached.
+	if _, err := NewWorker(config(DecoderRegistration{Codec: "test.hwt.history", Platform: "telegram", Decoder: decoder, History: true})); err == nil {
+		t.Fatal("NewWorker(History on telegram) succeeded")
 	}
 	// Control: the same WhatsApp registration without History is valid, so the
 	// rejection is about history, not the platform or codec.

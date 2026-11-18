@@ -255,7 +255,7 @@ func TestSignalDesktopV2FeedMatchesLegacyImporter(t *testing.T) {
 	wantLegacyOnly := map[string]string{
 		incoming(peer, diffPeerE164, 7):                                                 "deleted for everyone",
 		peer + "|out:" + strconv.FormatInt(diffBaseMS+8000, 10):                         "outgoing that never sent",
-		peer + "|" + v2keys.SignalIncomingSourceID(peer, diffPeerE164, diffBaseMS+9007): "no sent time (legacy falls back to received_at)",
+		peer + "|" + v2keys.SignalReceivedSourceID(peer, diffPeerE164, diffBaseMS+9007): "no sent time (legacy keys it by received_at)",
 		incoming(group, diffSelf, 11):                                                   "authored by the account itself",
 		incoming(other, diffOtherACI, 13):                                               "a story, which live never projects",
 	}

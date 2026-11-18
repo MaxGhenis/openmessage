@@ -781,11 +781,21 @@ func TestSignalDesktopHistoryWorkerS8DedupesAgainstLiveInAnyOrderProperty(t *tes
 			t.Fatalf("case %d category %d: counts=%+v", caseIndex, category, c)
 		}
 
-		before := h.state(t)
+		// The sink re-evaluates a replayed frame, so a replayed live frame
+		// may move timestamps; rows and their content must not change.
+		content := func() map[string][]string {
+			return map[string][]string{
+				"conversations": h.rows(t, "SELECT conversation_id, remote_conversation_id FROM conversations ORDER BY 1"),
+				"identities":    h.rows(t, "SELECT identity_id, kind, canonical_value FROM identities ORDER BY 1"),
+				"participants":  h.rows(t, "SELECT conversation_id, identity_id FROM conversation_participants ORDER BY 1, 2"),
+				"messages":      h.rows(t, "SELECT message_id, conversation_id, remote_message_id, sender_identity_id, direction, body, state, occurred_at_ms FROM messages ORDER BY 1"),
+			}
+		}
+		before := content()
 		random.Shuffle(len(steps), func(i, j int) { steps[i], steps[j] = steps[j], steps[i] })
 		apply()
-		if after := h.state(t); !reflect.DeepEqual(before, after) {
-			t.Fatalf("case %d category %d: replay changed state", caseIndex, category)
+		if after := content(); !reflect.DeepEqual(before, after) {
+			t.Fatalf("case %d category %d: replay changed rows:\nbefore=%v\nafter=%v", caseIndex, category, before, after)
 		}
 		if err := h.store.Close(); err != nil {
 			t.Fatal(err)
