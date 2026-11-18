@@ -459,7 +459,7 @@ func (*SignalDesktopHistoryDecoder) Decode(ctx context.Context, record bridge.Ra
 	live := NewSignalDecoder()
 	messages := 0
 	for _, line := range envelope.Lines {
-		payload, err := marshalSignalJSONRPCFrame(envelope.Account, line.Line, line.ResolvedSource, line.ResolvedDestination)
+		payload, err := marshalSignalJSONRPCFrame(envelope.Account, line.Line, line.ResolvedSource, line.ResolvedDestination, nil)
 		if err != nil {
 			return nil, err
 		}
