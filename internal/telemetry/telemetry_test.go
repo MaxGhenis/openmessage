@@ -106,14 +106,13 @@ func TestInstallIDIsStable(t *testing.T) {
 }
 
 // TestInstallIDStableAcrossLaunches models two launches the way serve does
-// them: a new Client each time, on the same data dir. Both must send the same
-// install ID, the one saved in telemetry-id. The 24-hour limit doesn't carry
-// over between Clients, so each launch sends.
+// them, a new Client each time on the same data dir: the second launch's
+// install ID is the one the first launch sent and saved in telemetry-id.
 func TestInstallIDStableAcrossLaunches(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
-	var ids []string
+	var sent []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
 		body, _ := io.ReadAll(r.Body)
@@ -122,8 +121,48 @@ func TestInstallIDStableAcrossLaunches(t *testing.T) {
 			return
 		}
 		mu.Lock()
-		ids = append(ids, p.InstallID)
+		sent = append(sent, p.InstallID)
 		mu.Unlock()
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	first := New(dir, "test", true)
+	first.SetEndpoint(srv.URL)
+	first.MaybeSend(context.Background(), PlatformStatus{})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 1 || len(sent[0]) != 32 {
+		t.Fatalf("first launch sent %q; want one 32-character install id", sent)
+	}
+
+	second := New(dir, "test", true)
+	secondID, err := second.installID()
+	if err != nil {
+		t.Fatalf("second launch install id: %v", err)
+	}
+	if secondID != sent[0] {
+		t.Fatalf("install id changed between launches: %q vs %q", sent[0], secondID)
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, "telemetry-id"))
+	if err != nil {
+		t.Fatalf("read telemetry-id: %v", err)
+	}
+	if string(saved) != sent[0] {
+		t.Fatalf("telemetry-id holds %q; first launch sent %q", saved, sent[0])
+	}
+}
+
+// TestEachLaunchSendsAgain pins the package comment's claim that the 24-hour
+// guard doesn't survive a relaunch: two Clients on one data dir, back to back,
+// both send. If lastSent is ever persisted, update that comment with this test.
+func TestEachLaunchSendsAgain(t *testing.T) {
+	t.Parallel()
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
 	}))
 	defer srv.Close()
 
@@ -134,46 +173,63 @@ func TestInstallIDStableAcrossLaunches(t *testing.T) {
 		c.MaybeSend(context.Background(), PlatformStatus{})
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(ids) != 2 {
-		t.Fatalf("got %d heartbeats from two launches; want 2", len(ids))
-	}
-	if ids[0] != ids[1] {
-		t.Fatalf("install id changed between launches: %q vs %q", ids[0], ids[1])
-	}
-	saved, err := os.ReadFile(filepath.Join(dir, "telemetry-id"))
-	if err != nil {
-		t.Fatalf("read telemetry-id: %v", err)
-	}
-	if string(saved) != ids[0] {
-		t.Fatalf("telemetry-id holds %q; heartbeats sent %q", saved, ids[0])
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("two launches sent %d heartbeats; want 2", got)
 	}
 }
 
 // TestUnsavableInstallIDSendsNothing checks that a heartbeat never carries an
-// ID that couldn't be saved: with a data dir that can't hold telemetry-id,
-// MaybeSend sends nothing.
+// ID that couldn't be saved: when the data dir can't be created or
+// telemetry-id can't be written, MaybeSend sends nothing.
 func TestUnsavableInstallIDSendsNothing(t *testing.T) {
 	t.Parallel()
 
-	var calls int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-	}))
-	defer srv.Close()
-
-	// A regular file where the data dir should be: MkdirAll fails.
-	notADir := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name    string
+		dataDir func(t *testing.T) string
+	}{
+		{
+			// A regular file where the data dir should be: MkdirAll fails.
+			name: "data dir can't be created",
+			dataDir: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "not-a-dir")
+				if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			// A directory named telemetry-id: MkdirAll succeeds, but reading
+			// and writing the file both fail.
+			name: "telemetry-id can't be written",
+			dataDir: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.Mkdir(filepath.Join(dir, "telemetry-id"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+		},
 	}
-	c := New(notADir, "test", true)
-	c.SetEndpoint(srv.URL)
-	c.MaybeSend(context.Background(), PlatformStatus{})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := atomic.LoadInt32(&calls); got != 0 {
-		t.Fatalf("made %d HTTP calls with an unsavable install id; want 0", got)
+			var calls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+			}))
+			defer srv.Close()
+
+			c := New(tc.dataDir(t), "test", true)
+			c.SetEndpoint(srv.URL)
+			c.MaybeSend(context.Background(), PlatformStatus{})
+
+			if got := atomic.LoadInt32(&calls); got != 0 {
+				t.Fatalf("made %d HTTP calls with an unsavable install id; want 0", got)
+			}
+		})
 	}
 }
 

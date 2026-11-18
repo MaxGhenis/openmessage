@@ -824,7 +824,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	// Send anonymous heartbeat (opt-in only, off by default).
 	// Enable with `OPENMESSAGE_TELEMETRY=1`. Skipped in demo mode and in
-	// transportless processes (one heartbeat per install, not per client).
+	// transportless processes (one heartbeat per daemon launch, not per MCP
+	// client process). The stdio-only shape never gets here: with
+	// --transports it returned at ServeStdio above.
 	if !isDemo && transports && os.Getenv("OPENMESSAGE_TELEMETRY") == "1" {
 		go func() {
 			tc := telemetry.New(app.DefaultDataDir(), buildVersion, true)
