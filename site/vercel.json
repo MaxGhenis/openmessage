@@ -4,5 +4,11 @@
   "installCommand": "bun install --frozen-lockfile",
   "buildCommand": "bun run build",
   "outputDirectory": null,
-  "cleanUrls": true
+  "cleanUrls": true,
+  "crons": [
+    {
+      "path": "/api/cron/expire-heartbeats",
+      "schedule": "17 4 * * *"
+    }
+  ]
 }

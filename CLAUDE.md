@@ -250,6 +250,7 @@ The site is the Next.js app in `site/`. **Deploy from `site/` with the Vercel CL
 - The CLI uploads the working directory, not a commit. Deploy from a clean checkout of the commit you mean to ship.
 - **Scope: `max-ghenis-projects`** (personal account, NOT PolicyEngine).
 - Only production deployments store sign-ups and install reports. The waitlist and heartbeat routes touch Blob only when `VERCEL_ENV` is `production` (`canStore` in `site/lib/public-writes.mjs`), and `BLOB_READ_WRITE_TOKEN` targets Production and Development only, so a new preview gets no token. Previews built before 2026-11-18 still carry production's token and run code without that check: **never POST to `/api/waitlist` or `/api/heartbeat` on a preview.** `GET /api/heartbeat` answers `"persists"` for the deployment it reaches; check a preview with `vercel curl /api/heartbeat --deployment <preview-url>`.
+- A daily Vercel cron (`crons` in `site/vercel.json`) calls `/api/cron/expire-heartbeats`, which deletes heartbeat records once they are `RETENTION.heartbeatDays` old (`site/lib/heartbeat-retention.mjs`). `/privacy` states that period, and `site/tests/heartbeat-retention.test.js` fails if the two differ. The route needs `CRON_SECRET` on Production and refuses every request without it. Never call it by hand on production: it deletes data.
 
 ```bash
 cd site

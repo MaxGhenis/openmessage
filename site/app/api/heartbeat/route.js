@@ -9,8 +9,10 @@
 // heartbeats/<day>/<install_id>.json in Vercel Blob. The record holds the random
 // install ID, version, OS, CPU architecture, which networks are paired, and the
 // time received. It holds no IP address, no user agent and no message data.
-// Records are pseudonymous (the same install ID recurs) and nothing deletes
-// them automatically. The privacy page says the same; change both together.
+// Records are pseudonymous (the same install ID recurs). A daily cron
+// (/api/cron/expire-heartbeats, lib/heartbeat-retention.mjs) deletes each one
+// once it is RETENTION.heartbeatDays old. The privacy page states that period,
+// and tests/heartbeat-retention.test.js fails if the two differ.
 //
 // Anyone can call this route, so lib/public-writes.mjs bounds what it can
 // store: the install ID must have the app's format, each address is

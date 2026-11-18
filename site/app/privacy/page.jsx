@@ -119,8 +119,8 @@ export default function PrivacyPage() {
             one record per install per day: the install ID, version, operating system, CPU type,
             which networks you have paired, and the time it arrived. It stores no IP address and
             no message data. The app picks the install ID at random and keeps it from day to day,
-            so the records link an install&rsquo;s days together without naming anyone. Nothing
-            deletes them automatically.
+            so the records link an install&rsquo;s days together without naming anyone. A daily job
+            deletes each record once it is 90 days old.
           </p>
 
           <h2>What this site collects</h2>
