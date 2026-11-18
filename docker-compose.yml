@@ -21,8 +21,11 @@ services:
       OPENMESSAGES_DATA_DIR: /data
       OPENMESSAGES_HOST: 0.0.0.0
       OPENMESSAGES_PORT: "7007"
-      # Set to "1" to send anonymous heartbeats (off by default).
-      # OPENMESSAGE_TELEMETRY_ENABLED: "0"
+      # Uncomment, then run `docker compose up -d`, to send one anonymous
+      # heartbeat each time the container starts (off by default). Only "1"
+      # enables it; note the singular OPENMESSAGE_ prefix. The install ID lives
+      # in the /data volume, so it stays the same until the volume is removed.
+      # OPENMESSAGE_TELEMETRY: "1"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7007/api/status >/dev/null || exit 1"]
       interval: 60s

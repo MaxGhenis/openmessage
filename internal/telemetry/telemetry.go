@@ -3,10 +3,22 @@
 // and "what platforms do they have paired?".
 //
 // Design principles:
-//   - Off by default. Users explicitly opt in via the UI or a config file.
+//   - Off by default. The only switch is the OPENMESSAGE_TELEMETRY environment
+//     variable set to exactly "1" for `openmessage serve`. There is no UI
+//     toggle or config file. cmd/serve.go reads it and skips telemetry in demo
+//     mode, in processes that don't run the messaging transports
+//     (--no-transports, or the MCP-stdio client shape), and in the stdio-only
+//     shape with --transports, which returns before the heartbeat.
 //   - No message content, contact info, or anything that could identify a user.
-//   - One heartbeat per app launch, at most one per 24 hours.
-//   - Stable anonymous install ID stored locally; no IP-based identity.
+//   - serve calls MaybeSend once per launch and never again, so each launch
+//     that reaches that call tries to send one heartbeat, and a daemon that
+//     runs for days sends no more. MaybeSend's own 24-hour guard (lastSent)
+//     lives in memory, so it matters only to a caller that reuses a Client;
+//     it doesn't survive a relaunch.
+//   - Stable anonymous install ID: random, cached at $dataDir/telemetry-id and
+//     read back on every later telemetry-enabled launch that uses the same
+//     data dir (a different data dir gets a different ID). No IP-based
+//     identity.
 //   - Failure is silent — telemetry must never block app startup.
 package telemetry
 
@@ -127,8 +139,14 @@ func (c *Client) MaybeSend(ctx context.Context, status PlatformStatus) {
 	c.mu.Unlock()
 }
 
-// installID returns a stable, locally-generated random ID. Created lazily on
-// first use and cached at $dataDir/telemetry-id. Never tied to any user
+// installID returns this install's anonymous ID, which stays the same across
+// launches. The first call generates 16 random bytes, hex-encodes them and
+// writes them to $dataDir/telemetry-id; later calls, in this process or a
+// later launch, read that file back. If the file can't be read, or doesn't
+// hold 32 bytes after trimming whitespace, it generates a fresh ID and
+// overwrites the file. If it can't save the ID (create the data dir or write
+// the file) it returns an error and MaybeSend sends nothing, so no heartbeat
+// carries an ID this process couldn't save. Never tied to any user
 // identifier.
 func (c *Client) installID() (string, error) {
 	path := filepath.Join(c.dataDir, "telemetry-id")
