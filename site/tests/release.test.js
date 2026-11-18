@@ -3,11 +3,11 @@ import { describe, expect, test } from "vitest";
 import { RELEASE } from "../data/facts.js";
 import {
   FALLBACK_RELEASE,
+  compareVersions,
   formatDate,
-  commitsAheadOf,
   formatMegabytes,
   normalizeRelease,
-  parseCommitTotal
+  releaseStatus
 } from "../lib/release.js";
 
 const payload = {
@@ -78,41 +78,51 @@ describe("fallback", () => {
   });
 });
 
-describe("parseCommitTotal", () => {
-  const link = (last) =>
-    `<https://api.github.com/repositories/1/commits?sha=main&per_page=1&page=2>; rel="next", <https://api.github.com/repositories/1/commits?sha=main&per_page=1&page=${last}>; rel="last"`;
-
-  test("reads the last page number as the commit total", () => {
-    expect(parseCommitTotal(link(254))).toBe(254);
+describe("compareVersions", () => {
+  test.each([
+    ["0.2.9", "0.2.9", 0],
+    ["0.2.10", "0.2.9", 1],
+    ["0.3.0", "0.2.9", 1],
+    ["1.0.0", "0.99.99", 1],
+    ["0.2.8", "0.2.9", -1],
+    ["0.10.0", "0.9.0", 1]
+  ])("%s against %s -> %s", (a, b, expected) => {
+    expect(compareVersions(a, b)).toBe(expected);
   });
 
   test.each([
-    ["no header", null],
-    ["an empty header", ""],
-    ["a header with only prev/first", '<https://api.github.com/x?page=1>; rel="first"'],
-    ["a zero page", link(0)],
-    ["a non-numeric page", link("abc")]
-  ])("returns null for %s", (_label, input) => {
-    expect(parseCommitTotal(input)).toBeNull();
-  });
-
-  test("does not confuse per_page with page", () => {
-    expect(parseCommitTotal('<https://api.github.com/x?per_page=1>; rel="last"')).toBeNull();
-    expect(parseCommitTotal('<https://api.github.com/x?page=7&per_page=1>; rel="last"')).toBeNull();
-    expect(parseCommitTotal('<https://api.github.com/x?per_page=1&page=7>; rel="last"')).toBe(7);
+    ["v0.2.9", "0.2.9"],
+    ["0.2", "0.2.9"],
+    ["0.2.9-beta", "0.2.9"],
+    ["", "0.2.9"],
+    [null, "0.2.9"],
+    ["0.2.9", undefined]
+  ])("returns null for %s against %s", (a, b) => {
+    expect(compareVersions(a, b)).toBeNull();
   });
 });
 
-describe("commitsAheadOf", () => {
-  test.each([
-    [254, 138, 116],
-    [138, 138, 0],
-    [137, 138, null],
-    [null, 138, null],
-    [254, null, null],
-    [254.5, 138, null]
-  ])("main %s, release %s -> %s", (mainTotal, releaseTotal, expected) => {
-    expect(commitsAheadOf(mainTotal, releaseTotal)).toBe(expected);
+describe("releaseStatus", () => {
+  const live = (version) => ({ tag: `v${version}`, version, publishedAt: "2026-05-01T00:00:00.000Z", dmgBytes: null, live: true });
+
+  test("same when GitHub confirms the release the copy describes", () => {
+    expect(releaseStatus(live(RELEASE.version))).toBe("same");
+  });
+
+  test("newer only when GitHub reports a later release", () => {
+    expect(releaseStatus(live("0.2.10"), "0.2.9")).toBe("newer");
+    expect(releaseStatus(live("0.3.0"), "0.2.9")).toBe("newer");
+  });
+
+  test("unknown when GitHub did not answer, even though the fallback names the same version", () => {
+    expect(FALLBACK_RELEASE.version).toBe(RELEASE.version);
+    expect(releaseStatus(FALLBACK_RELEASE)).toBe("unknown");
+  });
+
+  test("unknown for an older or unreadable release", () => {
+    expect(releaseStatus(live("0.2.8"), "0.2.9")).toBe("unknown");
+    expect(releaseStatus({ ...live("0.2.9"), version: "zero" }, "0.2.9")).toBe("unknown");
+    expect(releaseStatus(null)).toBe("unknown");
   });
 });
 

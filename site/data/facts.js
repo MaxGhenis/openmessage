@@ -26,11 +26,7 @@ export const MAIN_CHECKED_ON = "2026-11-18";
 // Counted at MAIN_COMMIT by tests/facts.test.js.
 export const MAIN_STATS = {
   commits: 301,
-  commitsWithClaudeTrailer: 224,
-  commitsSinceRelease: 163,
-  // Commits reachable from the release tag. The live "commits ahead" number on
-  // the homepage is main's current total minus this.
-  commitsAtRelease: 138
+  commitsWithClaudeTrailer: 224
 };
 
 export const MCP = {
@@ -99,6 +95,21 @@ export const SENDING_TOOLS = [
   "react_to_message"
 ];
 
+// Tools whose handlers write the untrusted-message warning before the message
+// text they return, at the release. tests/content.test.js derives this list
+// from the code.
+export const WARNED_TOOLS = [
+  "get_conversation",
+  "get_messages",
+  "get_person_messages",
+  "get_person_messages_range",
+  "search_messages"
+];
+
+// Tools whose results quote message text (story quotes, common phrases)
+// without that warning.
+export const UNWARNED_QUOTING_TOOLS = ["generate_story", "generate_person_story", "conversation_stats", "person_stats"];
+
 export const TOOL_COUNT = TOOL_GROUPS.reduce((sum, group) => sum + group.tools.length, 0);
 
 export const RECEIPTS = {
@@ -109,21 +120,37 @@ export const RECEIPTS = {
   toolRegistry: { ref: "release", path: "internal/tools/tools.go", line: 15, expect: "func Register" },
   untrustedPreamble: {
     ref: "release",
-    path: "internal/tools/tools.go",
-    line: 63,
-    expect: "const messagePreamble"
+    path: "internal/tools/get_person_messages.go",
+    line: 74,
+    expect: "sb.WriteString(messagePreamble)"
   },
+  storyQuotes: { ref: "release", path: "internal/story/generate.go", line: 185, expect: "truncate(m.Body, 200)" },
+  statsPhrases: { ref: "release", path: "internal/tools/story.go", line: 90, expect: "p.Phrase, p.Count" },
+  personOldest: { ref: "release", path: "internal/db/messages.go", line: 365, expect: "ORDER BY timestamp_ms ASC" },
+  personStatsDirect: { ref: "release", path: "internal/tools/story.go", line: 418, expect: "if c.IsGroup {" },
   draftTool: {
     ref: "release",
-    path: "internal/tools/draft_message.go",
-    line: 17,
-    expect: "The user can review and send it from the app."
+    path: "internal/web/static/index.html",
+    line: 7205,
+    expect: "/api/drafts/send"
   },
   sendResult: {
     ref: "release",
     path: "internal/tools/send_message.go",
     line: 117,
     expect: "SendMessageResponse_SUCCESS"
+  },
+  sendUnchecked: {
+    ref: "release",
+    path: "internal/tools/send_to_conversation.go",
+    line: 85,
+    expect: "_, err = cli.GM.SendMessage(payload)"
+  },
+  groupSendUnchecked: {
+    ref: "release",
+    path: "internal/tools/send_group_message.go",
+    line: 65,
+    expect: "_, err = cli.GM.SendMessage(payload)"
   },
   personRoutes: {
     ref: "release",
@@ -154,7 +181,70 @@ export const RECEIPTS = {
     expect: "Library/Application Support/OpenMessage"
   },
   messagesDb: { ref: "release", path: "internal/app/app.go", line: 189, expect: '"messages.db"' },
+  googleSessionFile: { ref: "release", path: "internal/app/app.go", line: 252, expect: '"session.json"' },
   sessionFiles: { ref: "release", path: "internal/app/app.go", line: 253, expect: '"whatsapp-session.db"' },
+  signalConfigDir: { ref: "release", path: "internal/app/app.go", line: 254, expect: '"signal-cli"' },
+  appWebView: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/ContentView.swift",
+    line: 109,
+    expect: "WKWebView(frame: .zero, configuration: config)"
+  },
+  demoSignalId: {
+    ref: "release",
+    path: "internal/db/db.go",
+    line: 149,
+    expect: '"number":"a1a98e48-1111-4000-a000-000000000001"'
+  },
+  whatsappPresence: {
+    ref: "release",
+    path: "internal/whatsapplive/client.go",
+    line: 1070,
+    expect: "cli.SendPresence(context.Background(), watypes.PresenceAvailable)"
+  },
+  previewImage: {
+    ref: "release",
+    path: "internal/web/static/index.html",
+    line: 6345,
+    expect: "<img src=\"${escapeHtml(preview.image_url)}\""
+  },
+  storySample: { ref: "release", path: "internal/tools/story.go", line: 132, expect: "MaxSampleMessages: 200" },
+  vizTemplate: {
+    ref: "release",
+    path: "internal/viz/template.go",
+    line: 130,
+    expect: "https://cdn.jsdelivr.net/npm/chart.js"
+  },
+  appEnv: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/BackendManager.swift",
+    line: 113,
+    expect: "proc.environment = ["
+  },
+  googleSessionJson: {
+    ref: "release",
+    path: "internal/client/session.go",
+    line: 19,
+    expect: 'b, err := json.MarshalIndent(data, "", "  ")'
+  },
+  whatsappSessionStore: {
+    ref: "release",
+    path: "internal/whatsapplive/client.go",
+    line: 203,
+    expect: 'sqlstore.New(context.Background(), "sqlite", sessionStoreDSN(b.sessionPath), waLog.Noop)'
+  },
+  storyPrompt: {
+    ref: "release",
+    path: "internal/story/generate.go",
+    line: 235,
+    expect: "- Total messages: %d"
+  },
+  notificationBody: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/NotificationManager.swift",
+    line: 328,
+    expect: 'body: latest.body ?? "New message"'
+  },
   telemetryOptIn: { ref: "release", path: "cmd/serve.go", line: 404, expect: 'os.Getenv("OPENMESSAGE_TELEMETRY") == "1"' },
   telemetryEndpoint: {
     ref: "release",
@@ -175,12 +265,19 @@ export const RECEIPTS = {
     expect: "func isPrivatePreviewIP"
   },
   storyApiKey: { ref: "release", path: "internal/tools/story.go", line: 119, expect: 'strArg(args, "api_key")' },
-  demoMode: { ref: "release", path: "internal/app/app.go", line: 158, expect: "func DemoMode" },
+  demoMode: { ref: "release", path: "cmd/serve.go", line: 437, expect: "func RunDemo" },
+  sourcePlatformColumn: {
+    ref: "release",
+    path: "internal/db/db.go",
+    line: 281,
+    expect: "ALTER TABLE messages ADD COLUMN source_platform"
+  },
+  plainOpen: { ref: "release", path: "internal/db/db.go", line: 67, expect: 'sql.Open("sqlite", dsn)' },
   demoSeed: { ref: "release", path: "internal/db/db.go", line: 94, expect: "SeedDemo" },
   minMacos: { ref: "release", path: "macos/OpenMessage/Package.swift", line: 6, expect: ".macOS(.v14)" },
   sqliteDriver: { ref: "release", path: "go.mod", line: 12, expect: "modernc.org/sqlite" },
 
-  // Cited by the engineering notes under /blog.
+  // Cited by the blog posts under /blog.
   gmessagesFork: {
     ref: "release",
     path: "go.mod",
@@ -193,6 +290,12 @@ export const RECEIPTS = {
     path: "cmd/pair.go",
     line: 148,
     expect: "Paste a Google cookie JSON object or a cURL command copied from browser devtools"
+  },
+  appCookiePairing: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/PairingView.swift",
+    line: 66,
+    expect: "Paste a Google cookie JSON object or a cURL command copied from browser devtools for messages.google.com"
   },
   googleAccountTab: {
     ref: "release",
@@ -278,18 +381,8 @@ export const RECEIPTS = {
     line: 67,
     expect: "ExpectedActiveHoursLimit: 6"
   },
-  statusSilence: {
-    ref: "main",
-    path: "cmd/status.go",
-    line: 34,
-    expect: 'nothing for longer than its own baseline explains ("silent Nh"'
-  },
-  googleRefresh: {
-    ref: "main",
-    path: "internal/googlecookies/googlecookies.go",
-    line: 1,
-    expect: "Package googlecookies refreshes the Google account cookies"
-  },
+  statusSilence: { ref: "main", path: "cmd/status_silence.go", line: 235, expect: "freshness.EvaluateSilence" },
+  googleRefresh: { ref: "main", path: "cmd/serve.go", line: 1145, expect: "googlecookies.RefreshWithStats" },
   googleQrRetired: {
     ref: "main",
     path: "cmd/pair.go",

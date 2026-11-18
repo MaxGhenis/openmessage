@@ -2,13 +2,14 @@ import { Receipts } from "../../components/receipts";
 import { SiteFooter } from "../../components/site-footer";
 import { SiteHeader } from "../../components/site-header";
 import { RELEASE, REPO_URL } from "../../data/facts";
+import { pageMetadata } from "../../lib/metadata";
 
-export const metadata = {
+export const metadata = pageMetadata({
   title: "Privacy",
   description:
     "Everything the OpenMessage app and this site send anywhere, and what stays on your Mac.",
-  alternates: { canonical: "/privacy" }
-};
+  path: "/privacy"
+});
 
 const UPDATED = "November 18, 2026";
 
@@ -28,16 +29,31 @@ export default function PrivacyPage() {
         <div className="prose">
           <h2>What stays on your Mac</h2>
           <p>
-            Your messages, contacts, drafts and search index live in a SQLite database,{" "}
-            <code>messages.db</code>, in <code>~/Library/Application Support/OpenMessage</code>.
-            The login for each network you pair sits in its own file in the same folder. OpenMessage
-            does not encrypt the database; your macOS account&rsquo;s file permissions protect it.
+            OpenMessage keeps your messages, contacts, drafts and search index in a SQLite
+            database, <code>messages.db</code>, in{" "}
+            <code>~/Library/Application Support/OpenMessage</code>. It keeps each network&rsquo;s
+            login in the same folder, outside the database. OpenMessage encrypts neither the
+            database nor the logins.
           </p>
           <p>
-            To delete your messages and logins from this Mac, quit the app and remove that folder.
-            Your messages remain with Google, WhatsApp and Signal.
+            To delete your messages and logins from this Mac, quit the app, remove that folder and
+            any files your agent saved elsewhere, and clear OpenMessage&rsquo;s notifications,
+            which show message text. Removing the folder leaves your messages on your phone and
+            any other device you have linked.
           </p>
-          <Receipts ids={["dataFolder", "messagesDb", "sessionFiles"]} />
+          <Receipts
+            ids={[
+              "dataFolder",
+              "messagesDb",
+              "googleSessionFile",
+              "sessionFiles",
+              "signalConfigDir",
+              "plainOpen",
+              "googleSessionJson",
+              "whatsappSessionStore",
+              "notificationBody"
+            ]}
+          />
 
           <h2>What the app sends, and where</h2>
           <p>Version {RELEASE.version} of the app sends data to these places and no others.</p>
@@ -54,18 +70,19 @@ export default function PrivacyPage() {
                 <tr>
                   <th scope="row">Google, WhatsApp, Signal</th>
                   <td data-label="What">
-                    The messages you send, and the traffic that keeps the link up and brings in
-                    new messages
+                    The messages you send, the traffic that keeps the link up and brings in new
+                    messages, and an online status your WhatsApp contacts may see
                   </td>
                   <td data-label="When">While you have that network paired</td>
                 </tr>
                 <tr>
                   <th scope="row">Sites linked in your threads</th>
                   <td data-label="What">
-                    A request from your Mac for the page&rsquo;s title and preview image.
-                    OpenMessage refuses private and local addresses
+                    Requests from your Mac for the linked page, any page it redirects to, and the
+                    preview image it names, wherever that is. OpenMessage skips links whose own
+                    address is private or local
                   </td>
-                  <td data-label="When">When a thread shows a link preview</td>
+                  <td data-label="When">When you open a thread that contains a link</td>
                 </tr>
                 <tr>
                   <th scope="row">Google Fonts</th>
@@ -74,16 +91,22 @@ export default function PrivacyPage() {
                 </tr>
                 <tr>
                   <th scope="row">Anthropic</th>
-                  <td data-label="What">The conversation you asked a story about</td>
+                  <td data-label="What">
+                    Up to 200 messages with their times and senders, plus the message count, date
+                    range and participants. They come from the conversation you named, or from
+                    the one-to-one conversations that match the name you gave
+                  </td>
                   <td data-label="When">
-                    Only when you give a story tool an Anthropic API key
+                    When you give <code>generate_story</code>, <code>generate_person_story</code> or{" "}
+                    <code>generate_viz</code> an Anthropic API key
                   </td>
                 </tr>
                 <tr>
                   <th scope="row">jsDelivr and Google Fonts</th>
                   <td data-label="What">Requests for a chart library and fonts</td>
                   <td data-label="When">
-                    When you open a relationship page that <code>generate_viz</code> made
+                    When you open a page that <code>generate_viz</code> or <code>render_story</code>{" "}
+                    made
                   </td>
                 </tr>
                 <tr>
@@ -98,19 +121,31 @@ export default function PrivacyPage() {
                     networks you have paired. No message data
                   </td>
                   <td data-label="When">
-                    Only if you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>. The
-                    Mac app does not set it
+                    When you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>. The Mac
+                    app does not set it
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
           <Receipts
-            ids={["linkPreviewGuard", "uiFonts", "storyApiKey", "telemetryOptIn", "telemetryEndpoint"]}
+            ids={[
+              "whatsappPresence",
+              "linkPreviewGuard",
+              "previewImage",
+              "uiFonts",
+              "storyApiKey",
+              "storySample",
+              "storyPrompt",
+              "vizTemplate",
+              "telemetryOptIn",
+              "appEnv",
+              "telemetryEndpoint"
+            ]}
           />
           <p>
-            The app can show contact photos from macOS Contacts if you grant access. It reads them
-            on your Mac and sends them nowhere. It also creates notifications on your Mac.
+            If you grant access to macOS Contacts, the app shows contact photos, which it reads on
+            your Mac and sends nowhere.
           </p>
 
           <h2>What an install report keeps</h2>
@@ -143,9 +178,9 @@ export default function PrivacyPage() {
               counts downloads per release.
             </li>
             <li>
-              If you leave an email address for release news, the site encrypts it with AES-256-GCM
-              before storing it, and I use it only for OpenMessage release news. To have it
-              removed, email me at <a href="mailto:max@maxghenis.com">max@maxghenis.com</a>.
+              If you leave an email address, the site encrypts it with AES-256-GCM before storing
+              it, and I use it only for OpenMessage release news. Email me at{" "}
+              <a href="mailto:max@maxghenis.com">max@maxghenis.com</a> and I&rsquo;ll delete it.
             </li>
           </ul>
 
@@ -156,13 +191,7 @@ export default function PrivacyPage() {
           </p>
 
           <h2>Changes</h2>
-          <p>
-            I update the date whenever I change this policy, and the{" "}
-            <a href={REPO_URL} rel="noopener">
-              source code
-            </a>{" "}
-            shows what the app does in detail.
-          </p>
+          <p>I update the date whenever I change this policy.</p>
 
           <h2>Contact</h2>
           <p>

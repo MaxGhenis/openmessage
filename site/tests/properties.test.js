@@ -2,11 +2,11 @@ import fc from "fast-check";
 import { describe, expect, test } from "vitest";
 
 import {
-  commitsAheadOf,
+  compareVersions,
   formatDate,
   formatMegabytes,
   normalizeRelease,
-  parseCommitTotal
+  releaseStatus
 } from "../lib/release.js";
 import { clockTime, parseTranscript } from "../lib/transcript.js";
 
@@ -16,9 +16,11 @@ import { clockTime, parseTranscript } from "../lib/transcript.js";
 //                      back to the same messages, in order).
 //   normalizeRelease — total; returns null or a release whose version matches
 //                      its tag and whose size is a positive integer or null.
-//   parseCommitTotal — total; returns null or a positive safe integer, and
-//                      recovers the page number it was given.
-//   commitsAheadOf   — null or a non-negative integer equal to the difference.
+//   compareVersions  — total; on well-formed versions it is reflexive,
+//                      antisymmetric and agrees with numeric tuple order.
+//   releaseStatus    — total; "newer" exactly when GitHub answered with a
+//                      later version, "same" exactly when it answered with
+//                      the described one, and "unknown" otherwise.
 //   formatMegabytes  — monotonic in the byte count.
 //   clockTime        — empty or a valid 12-hour label.
 
@@ -145,33 +147,57 @@ describe("release helper properties", () => {
     );
   });
 
-  test("parseCommitTotal is total and returns null or a positive safe integer", () => {
+  const version = fc
+    .tuple(fc.nat({ max: 999 }), fc.nat({ max: 999 }), fc.nat({ max: 999 }))
+    .map((parts) => ({ parts, text: parts.join(".") }));
+  const tupleOrder = (left, right) => {
+    for (let index = 0; index < 3; index += 1) {
+      if (left[index] !== right[index]) {
+        return left[index] < right[index] ? -1 : 1;
+      }
+    }
+    return 0;
+  };
+
+  test("compareVersions agrees with numeric tuple order and is antisymmetric", () => {
     fc.assert(
-      fc.property(fc.anything(), (header) => {
-        const total = parseCommitTotal(header);
-        expect(total === null || (Number.isSafeInteger(total) && total > 0)).toBe(true);
+      fc.property(version, version, (a, b) => {
+        const order = compareVersions(a.text, b.text);
+        expect(order).toBe(tupleOrder(a.parts, b.parts));
+        expect(compareVersions(b.text, a.text)).toBe(-order || 0);
+        expect(compareVersions(a.text, a.text)).toBe(0);
       })
     );
   });
 
-  test("parseCommitTotal recovers the last page it is given", () => {
+  test("compareVersions is total and returns null for anything but x.y.z", () => {
     fc.assert(
-      fc.property(fc.integer({ min: 1, max: 10_000_000 }), (count) => {
-        const header = `<https://api.github.com/repositories/1/commits?sha=main&per_page=1&page=2>; rel="next", <https://api.github.com/repositories/1/commits?sha=main&per_page=1&page=${count}>; rel="last"`;
-        expect(parseCommitTotal(header)).toBe(count);
-      })
-    );
-  });
-
-  test("commitsAheadOf is the non-negative difference or null", () => {
-    fc.assert(
-      fc.property(fc.integer({ min: 0, max: 1_000_000 }), fc.integer({ min: 0, max: 1_000_000 }), (main, release) => {
-        const ahead = commitsAheadOf(main, release);
-        if (main >= release) {
-          expect(ahead).toBe(main - release);
-        } else {
-          expect(ahead).toBeNull();
+      fc.property(fc.anything(), fc.anything(), (a, b) => {
+        const order = compareVersions(a, b);
+        expect([null, -1, 0, 1]).toContain(order);
+        const wellFormed = (value) => typeof value === "string" && /^\d+\.\d+\.\d+$/.test(value);
+        if (!wellFormed(a) || !wellFormed(b)) {
+          expect(order).toBeNull();
         }
+      })
+    );
+  });
+
+  test("releaseStatus says newer or same only when GitHub answered", () => {
+    fc.assert(
+      fc.property(version, version, fc.boolean(), (reported, described, live) => {
+        const status = releaseStatus({ version: reported.text, live }, described.text);
+        const order = tupleOrder(reported.parts, described.parts);
+        const expected = !live ? "unknown" : order === 1 ? "newer" : order === 0 ? "same" : "unknown";
+        expect(status).toBe(expected);
+      })
+    );
+  });
+
+  test("releaseStatus is total", () => {
+    fc.assert(
+      fc.property(fc.anything(), fc.anything(), (release, described) => {
+        expect(["same", "newer", "unknown"]).toContain(releaseStatus(release, described));
       })
     );
   });

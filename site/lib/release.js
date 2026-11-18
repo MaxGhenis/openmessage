@@ -1,9 +1,11 @@
 import { RELEASE, REPO } from "../data/facts.js";
 
 // The Download button redirects to GitHub's "latest release", so the page asks
-// GitHub which release that is instead of trusting a constant. If GitHub is
-// unreachable or rate-limited the page falls back to the release these facts
-// were checked against, and says nothing it cannot back up.
+// GitHub which release that is instead of trusting a constant. The copy
+// describes RELEASE, and the tests check it there. When GitHub confirms that
+// release, the page names it as what the button serves; when GitHub reports a
+// newer one, the page says so; and when GitHub is unreachable, rate-limited or
+// reports anything else, the page names no version beside the button.
 
 const API = `https://api.github.com/repos/${REPO}`;
 const HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
@@ -39,30 +41,41 @@ export function normalizeRelease(payload) {
   return { tag, version: tag.slice(1), publishedAt, dmgBytes, live: true };
 }
 
-// Pure: reads the commit total out of the Link header GitHub sends for
-// `commits?per_page=1`, whose last page number is the number of commits.
-// Null when the header is missing or has no last page.
-export function parseCommitTotal(linkHeader) {
-  if (typeof linkHeader !== "string") {
+// Pure: compares two "x.y.z" versions numerically. Returns -1, 0 or 1, or null
+// when either is not three dot-separated whole numbers.
+export function compareVersions(a, b) {
+  const parse = (version) => {
+    if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
+      return null;
+    }
+    const parts = version.split(".").map(Number);
+    return parts.every(Number.isSafeInteger) ? parts : null;
+  };
+  const left = parse(a);
+  const right = parse(b);
+  if (!left || !right) {
     return null;
   }
-  const match = linkHeader.match(/[?&]page=(\d+)>;\s*rel="last"/);
-  if (!match) {
-    return null;
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) {
+      return left[index] < right[index] ? -1 : 1;
+    }
   }
-  const total = Number(match[1]);
-  return Number.isSafeInteger(total) && total > 0 ? total : null;
+  return 0;
 }
 
-// Pure: commits on main beyond the release, given main's total. Null if the
-// total is unknown or smaller than the release's own count (which would mean
-// the inputs disagree, so no number is better than a wrong one).
-export function commitsAheadOf(mainTotal, releaseTotal) {
-  if (!Number.isSafeInteger(mainTotal) || !Number.isSafeInteger(releaseTotal)) {
-    return null;
+// Pure: how the release GitHub reports relates to the one the copy describes.
+// "same" when GitHub answered with that release, "newer" when it answered with
+// a later one, and "unknown" otherwise: no answer, or an older or odd tag.
+export function releaseStatus(release, described = RELEASE.version) {
+  if (!release || release.live !== true) {
+    return "unknown";
   }
-  const ahead = mainTotal - releaseTotal;
-  return ahead >= 0 ? ahead : null;
+  const order = compareVersions(release.version, described);
+  if (order === 0) {
+    return "same";
+  }
+  return order === 1 ? "newer" : "unknown";
 }
 
 async function getJson(url) {
@@ -78,23 +91,6 @@ export async function getLatestRelease() {
     return normalizeRelease(await getJson(`${API}/releases/latest`)) ?? FALLBACK_RELEASE;
   } catch {
     return FALLBACK_RELEASE;
-  }
-}
-
-// How many commits main has, or null when GitHub can't say. One small request:
-// the count comes from the pagination header, so no commit data is downloaded.
-export async function getMainCommitTotal() {
-  try {
-    const response = await fetch(`${API}/commits?sha=main&per_page=1`, {
-      headers: HEADERS,
-      next: { revalidate: REVALIDATE_SECONDS }
-    });
-    if (!response.ok) {
-      return null;
-    }
-    return parseCommitTotal(response.headers.get("link"));
-  } catch {
-    return null;
   }
 }
 

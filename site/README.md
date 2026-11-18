@@ -23,6 +23,7 @@ On the page a fact shows as a read receipt: a double check mark linking to that 
 
 - a cited line no longer contains its `expect` text;
 - the tool list differs from the `mcp.NewTool(...)` names registered at the release tag;
+- the tools whose handlers write the untrusted-text warning differ from `WARNED_TOOLS`;
 - the connect command's host, port or path differs from the release's defaults;
 - a commit count or co-author count differs from git;
 - a message in the hero transcript is not in the release's demo seed data;
@@ -32,7 +33,7 @@ The hero transcript in `data/demo.js` is real output. It was captured from the r
 
 ## When a release ships
 
-The Download button follows GitHub's latest release, and the homepage asks GitHub which release that is. If it is newer than `RELEASE.tag` in `data/facts.js`, the homepage says it still describes the older version. To catch up:
+The Download button follows GitHub's latest release, and the homepage asks GitHub which release that is. When GitHub confirms `RELEASE` in `data/facts.js`, the page names it as what the button serves. When GitHub reports a newer release, the page says it still describes `RELEASE`. When GitHub is unreachable or rate-limited, the page names no version beside the button; the copy still names `RELEASE` wherever it makes a claim. To catch up with a new release:
 
 1. Set `RELEASE` to the new tag and move `MAIN_COMMIT` to current main.
 2. Run `bun run test`. Fix each receipt it flags by re-reading the code at the new ref. If the claim is no longer true, change the copy.
@@ -56,9 +57,9 @@ Previews share production's Blob store, so never submit the email form or POST a
 
 | Route | Used by | Behavior |
 |---|---|---|
-| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. `GET` returns `{"ok":true,"schema_version":1}`. |
+| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. Answers 415 unless the Content-Type is `application/json`. `GET` returns `{"ok":true,"schema_version":1}`. |
 | `GET /download` | Download buttons and shared links | 307 to the disk image on the latest GitHub release. |
-| `POST /api/waitlist` | The release-email form | Stores the address encrypted with AES-256-GCM. |
+| `POST /api/waitlist` | The release-email form | Stores the address encrypted with AES-256-GCM. Answers 415 unless the Content-Type is `application/json`. |
 
 Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes, `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist.
 

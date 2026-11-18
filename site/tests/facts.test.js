@@ -10,6 +10,8 @@ import {
   RELEASE,
   TOOL_COUNT,
   TOOL_GROUPS,
+  UNWARNED_QUOTING_TOOLS,
+  WARNED_TOOLS,
   receiptLabel,
   receiptUrl
 } from "../data/facts.js";
@@ -54,6 +56,68 @@ describe("MCP tools", () => {
     expect([...siteTools].sort()).toEqual(registeredTools(RELEASE.tag));
   });
 
+  // The release's internal/tools package as top-level function bodies keyed by
+  // name. gofmt puts each top-level func's closing brace alone at column 0.
+  function packageFunctions(ref) {
+    const bodies = new Map();
+    for (const file of listAt(ref, "internal/tools")) {
+      if (!file.endsWith(".go") || file.endsWith("_test.go")) {
+        continue;
+      }
+      for (const chunk of fileAt(ref, file).split(/^(?=func )/m)) {
+        const name = chunk.match(/^func (?:\([^)]*\)\s*)?(\w+)/);
+        if (name) {
+          const end = chunk.search(/^}$/m);
+          bodies.set(name[1], end === -1 ? chunk : chunk.slice(0, end + 1));
+        }
+      }
+    }
+    return bodies;
+  }
+
+  // True if the function, or any package function it calls, mentions needle.
+  function reaches(bodies, start, needle) {
+    const seen = new Set();
+    const stack = [start];
+    while (stack.length > 0) {
+      const fn = stack.pop();
+      if (seen.has(fn) || !bodies.has(fn)) {
+        continue;
+      }
+      seen.add(fn);
+      const body = bodies.get(fn);
+      if (body.includes(needle)) {
+        return true;
+      }
+      for (const [, called] of body.matchAll(/\b(\w+)\(/g)) {
+        stack.push(called);
+      }
+    }
+    return false;
+  }
+
+  test("the tools the site says warn about message text are exactly the ones that do", () => {
+    const bodies = packageFunctions(RELEASE.tag);
+    expect(fileAt(RELEASE.tag, "internal/tools/tools.go")).toContain("const messagePreamble");
+    const handlers = new Map();
+    for (const body of bodies.values()) {
+      for (const [, toolFn, handlerFn] of body.matchAll(/s\.AddTool\((\w+)\(\),\s*(\w+)\(a\)\)/g)) {
+        const name = bodies.get(toolFn).match(/mcp\.NewTool\(\s*"([a-z_]+)"/)[1];
+        handlers.set(name, handlerFn);
+      }
+    }
+    expect([...handlers.keys()].sort()).toEqual([...siteTools].sort());
+
+    const warned = [...handlers]
+      .filter(([, handlerFn]) => reaches(bodies, handlerFn, "messagePreamble"))
+      .map(([name]) => name);
+    expect(warned.sort()).toEqual([...WARNED_TOOLS].sort());
+    for (const name of UNWARNED_QUOTING_TOOLS) {
+      expect(handlers.has(name), `${name} is not a tool in the release`).toBe(true);
+      expect(warned).not.toContain(name);
+    }
+  });
+
   test("no tool is listed twice and the count matches", () => {
     expect(new Set(siteTools).size).toBe(siteTools.length);
     expect(TOOL_COUNT).toBe(siteTools.length);
@@ -90,17 +154,12 @@ describe("release facts", () => {
 });
 
 describe("numbers quoted about main", () => {
-  test("commit counts", () => {
+  test("commit count", () => {
     expect(Number(git(["rev-list", "--count", MAIN_COMMIT]).trim())).toBe(MAIN_STATS.commits);
-    expect(Number(git(["rev-list", "--count", `${RELEASE.tag}..${MAIN_COMMIT}`]).trim())).toBe(
-      MAIN_STATS.commitsSinceRelease
-    );
-    expect(Number(git(["rev-list", "--count", RELEASE.tag]).trim())).toBe(MAIN_STATS.commitsAtRelease);
   });
 
-  test("the release is an ancestor of main, so the counts add up", () => {
+  test("the release is an ancestor of main, so main-only changes landed after it", () => {
     expect(git(["rev-list", "--count", `${MAIN_COMMIT}..${RELEASE.tag}`]).trim()).toBe("0");
-    expect(MAIN_STATS.commitsAtRelease + MAIN_STATS.commitsSinceRelease).toBe(MAIN_STATS.commits);
   });
 
   test("commits carrying a Claude co-author trailer", () => {

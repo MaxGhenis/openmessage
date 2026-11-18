@@ -70,7 +70,7 @@ describe("tool names in copy", () => {
 });
 
 describe("pages", () => {
-  test("each engineering note has a page at its slug", () => {
+  test("each blog post has a page at its slug", () => {
     for (const post of BLOG_POSTS) {
       expect(pages.map((page) => page.file)).toContain(path.join("app", "blog", post.slug, "page.jsx"));
       expect(Date.parse(post.revised)).toBeGreaterThanOrEqual(Date.parse(post.published));

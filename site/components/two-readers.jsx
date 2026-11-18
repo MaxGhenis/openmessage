@@ -43,10 +43,10 @@ export function TwoReaders({ person, call, routes, lines, initialRoute }) {
 
   return (
     <div className="readers__frame">
-      <section className="readers__pane" aria-label="The thread as you see it in the app">
+      <section className="readers__pane" aria-label="The direct messages as a thread">
         <div className="readers__head">
-          <span className="readers__who">You, in the app</span>
-          <div className="routes" role="tablist" aria-label={`Routes to ${person}`} onKeyDown={onKeyDown}>
+          <span className="readers__who">As a thread</span>
+          <div className="routes" role="tablist" aria-label={`Networks for ${person}`} onKeyDown={onKeyDown}>
             {routes.map((route) => (
               <button
                 key={route.platform}
@@ -67,7 +67,13 @@ export function TwoReaders({ person, call, routes, lines, initialRoute }) {
             ))}
           </div>
         </div>
-        <div className="thread" role="tabpanel" id="route-panel" aria-labelledby={`route-tab-${active.platform}`}>
+        <div
+          className="thread"
+          role="tabpanel"
+          id="route-panel"
+          tabIndex={0}
+          aria-labelledby={`route-tab-${active.platform}`}
+        >
           <p className="thread__person">{person}</p>
           {active.messages.map((message, index) => (
             <p key={index} className={message.mine ? "bubble bubble--mine" : "bubble"}>
@@ -79,12 +85,12 @@ export function TwoReaders({ person, call, routes, lines, initialRoute }) {
         </div>
       </section>
 
-      <section className="readers__pane" aria-label="The same messages as an MCP tool returns them">
+      <section className="readers__pane" aria-label="The messages as an MCP tool returns them">
         <div className="readers__head">
           <span className="readers__who">Your agent, over MCP</span>
           <code className="readers__call">{call}</code>
         </div>
-        <pre className="result" ref={resultRef} tabIndex={0} aria-label="Tool result">
+        <pre className="result" ref={resultRef} tabIndex={0} role="region" aria-label="Tool result text">
           {lines.map((line, index) => {
             const inRoute = line.conversationId === active.conversationId;
             const names = ["result__line"];
