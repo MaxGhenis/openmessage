@@ -42,6 +42,8 @@ const PAUSED = "The site has stopped taking sign-ups for today. Email max@maxghe
 // into production's store. Vercel sets VERCEL_ENV to "production" only on
 // production deployments (this project exposes system env vars), and to
 // "preview" or "development" elsewhere; a development pull leaves it unset.
+// A production pull writes VERCEL_ENV="production" too, which is why the
+// README sends that pull to .env.waitlist.local, a file `next dev` ignores.
 // GET /api/heartbeat reports the result, so a deploy that loses it shows
 // "persists": false.
 export function canStore(env) {
