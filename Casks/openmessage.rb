@@ -18,13 +18,15 @@ cask "openmessage" do
   url "https://github.com/MaxGhenis/openmessage/releases/download/v#{version}/OpenMessage.dmg"
   name "OpenMessage"
   desc "Local-first desktop for SMS, RCS, WhatsApp, and Signal with built-in MCP"
-  homepage "https://openmessage.ai"
+  homepage "https://openmessage.ai/"
+
+  depends_on macos: :sonoma
 
   app "OpenMessage.app"
 
   zap trash: [
     "~/Library/Application Support/OpenMessage",
-    "~/Library/Preferences/com.openmessage.OpenMessage.plist",
     "~/Library/Caches/com.openmessage.OpenMessage",
+    "~/Library/Preferences/com.openmessage.OpenMessage.plist",
   ]
 end
