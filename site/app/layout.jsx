@@ -22,7 +22,7 @@ const mono = Atkinson_Hyperlegible_Mono({
 
 const title = "OpenMessage: a message database for your agent";
 const description =
-  "OpenMessage keeps your SMS, RCS, WhatsApp and Signal messages in one SQLite database on your Mac, with a desktop app and a local MCP server on the same file.";
+  "OpenMessage keeps your SMS, RCS, WhatsApp and Signal messages in one SQLite database on your Mac. A Mac app and a local MCP server read the same file.";
 
 export const metadata = {
   metadataBase: new URL(SITE_URL),
@@ -33,17 +33,20 @@ export const metadata = {
   description,
   alternates: { canonical: "/" },
   openGraph: {
-    title,
+    title: {
+      default: title,
+      template: "%s | OpenMessage"
+    },
     description,
     url: SITE_URL,
     siteName: "OpenMessage",
     locale: "en_US",
     type: "website"
   },
+  // Next.js fills the Twitter title, description and image from each page's
+  // openGraph when Twitter sets none, so pages below this layout stay in step.
   twitter: {
-    card: "summary_large_image",
-    title,
-    description
+    card: "summary_large_image"
   }
 };
 

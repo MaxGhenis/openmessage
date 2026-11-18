@@ -24,9 +24,9 @@ export default function WhatsAppPost() {
       <h2>What it syncs</h2>
       <p>
         New messages arrive as events, and OpenMessage writes them to the same{" "}
-        <code>messages</code> table as SMS and Signal. The session also handles delivery receipts, typing notices from the other
-        person, and the history WhatsApp sends a newly linked device. You can send text, replies,
-        attachments and reactions.
+        <code>messages</code> table as SMS and Signal. OpenMessage also handles delivery receipts and
+        typing notices from the other person, and imports each batch of history WhatsApp sends. You
+        can send text, replies, attachments and reactions.
       </p>
       <Receipts ids={["whatsappReceipts", "whatsappTyping", "whatsappHistory"]} />
 
@@ -44,8 +44,8 @@ export default function WhatsAppPost() {
           WhatsApp&rsquo;s terms
         </a>{" "}
         forbid reverse engineering its service and let it suspend an account at any time. A
-        linked-device client on whatsmeow falls on the wrong side of that. Pair an account
-        you could stand to lose.
+        linked-device client built on whatsmeow breaks those terms, so pair an account you could
+        stand to lose.
       </p>
     </Post>
   );

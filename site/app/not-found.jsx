@@ -13,8 +13,8 @@ export default function NotFound() {
         <header className="page-head">
           <h1>There is no page at this address</h1>
           <p>
-            Go to the <Link href="/">homepage</Link>, the <Link href="/blog">engineering notes</Link>{" "}
-            or the <Link href="/privacy">privacy page</Link>.
+            Go to the <Link href="/">homepage</Link>, the <Link href="/blog">blog</Link> or the{" "}
+            <Link href="/privacy">privacy page</Link>.
           </p>
         </header>
       </main>
