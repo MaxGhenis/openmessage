@@ -249,7 +249,7 @@ The site is the Next.js app in `site/`. **Deploy from `site/` with the Vercel CL
 - `site/vercel.json` carries the build settings (`framework: nextjs`, bun install, bun build). The root `vercel.json` exists only to make a root deploy fail loudly; a root deploy cannot build the site.
 - The CLI uploads the working directory, not a commit. Deploy from a clean checkout of the commit you mean to ship.
 - **Scope: `max-ghenis-projects`** (personal account, NOT PolicyEngine).
-- Preview deployments share production's Blob store. **Never POST to `/api/waitlist` or `/api/heartbeat` on a preview.**
+- Only production deployments store sign-ups and install reports. The waitlist and heartbeat routes refuse to write when `VERCEL_ENV` names another environment (`canStore` in `site/lib/public-writes.mjs`), and `BLOB_READ_WRITE_TOKEN` targets Production and Development only, so a new preview gets no token. Previews built before 2026-11-18 still carry production's token and run code without that check: **never POST to `/api/waitlist` or `/api/heartbeat` on a preview.** `GET /api/heartbeat` answers `"persists"` for the deployment it reaches; check a preview with `vercel curl /api/heartbeat --deployment <preview-url>`.
 
 ```bash
 cd site
@@ -262,7 +262,7 @@ vercel deploy --prod --scope max-ghenis-projects                      # producti
 **Verify after a production deploy:**
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" https://openmessage.ai
-curl -s https://openmessage.ai/api/heartbeat          # {"ok":true,"schema_version":1}
+curl -s https://openmessage.ai/api/heartbeat          # {"ok":true,"schema_version":1,"persists":true}
 curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" https://openmessage.ai/download
 ```
 

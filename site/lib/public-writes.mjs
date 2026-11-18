@@ -3,7 +3,8 @@
 // each request could store a new object (the waitlist kept a fresh UUID path
 // per submission, and the heartbeat took any caller-chosen install id).
 //
-// Three layers:
+// Four layers:
+//  - deployment: only a production deployment stores anything (canStore);
 //  - request shape: a small body cap and strict field formats;
 //  - a per-instance rate limit by client address, which throttles a burst on
 //    the warm serverless instances it lands on;
@@ -33,6 +34,18 @@ export const HEARTBEAT = {
 const allowedInterests = new Set(["", "mac-app", "whatsapp", "signal", "mcp", "general"]);
 const UNCONFIGURED = "The site can't take sign-ups right now. Email max@maxghenis.com instead.";
 const PAUSED = "The site has stopped taking sign-ups for today. Email max@maxghenis.com instead.";
+
+// True when this deployment may write to Blob. Only production stores
+// anything: a preview, or `vercel dev`, can carry production's
+// BLOB_READ_WRITE_TOKEN, and a POST there would otherwise write into
+// production's store. Vercel sets VERCEL_ENV to "production", "preview" or
+// "development"; when it names anything but production, the routes store
+// nothing, whatever token the deployment carries. Outside Vercel (tests, a
+// plain `next dev`) VERCEL_ENV is unset and the token alone decides.
+export function canStore(env) {
+  if (!env.BLOB_READ_WRITE_TOKEN) return false;
+  return !env.VERCEL_ENV || env.VERCEL_ENV === "production";
+}
 
 export function isValidEmail(value) {
   return value.length <= WAITLIST.maxEmailLength && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
@@ -152,8 +165,8 @@ export async function handleWaitlist(request, { put, list, env, allow, now = Dat
   }
 
   const key = Buffer.from(env.WAITLIST_ENCRYPTION_KEY || "", "hex");
-  if (!env.BLOB_READ_WRITE_TOKEN || key.length !== 32) {
-    log("Waitlist storage is not configured.");
+  if (!canStore(env) || key.length !== 32) {
+    log("Waitlist storage is not configured on this deployment.");
     return { status: 503, body: { error: UNCONFIGURED } };
   }
 
@@ -193,8 +206,8 @@ export async function handleHeartbeat(request, { put, list, env, allow, now = Da
   if (!allow(clientAddress(request))) {
     return { status: 429, body: { ok: false } };
   }
-  if (!env.BLOB_READ_WRITE_TOKEN) {
-    // No-op if not configured; respond OK so the app doesn't retry.
+  if (!canStore(env)) {
+    // Not configured, or not production: answer OK so the app doesn't retry.
     return { status: 200, body: { ok: true, persisted: false } };
   }
 

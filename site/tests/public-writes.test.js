@@ -9,6 +9,7 @@ import { test } from "vitest";
 import {
   HEARTBEAT,
   WAITLIST,
+  canStore,
   createRateLimiter,
   handleHeartbeat,
   handleWaitlist,
@@ -184,6 +185,75 @@ test("heartbeat: at the daily budget the app is told OK and nothing is written",
   const beat = { schema_version: 1, install_id: INSTALL };
   assert.deepEqual(await handleHeartbeat(post(beat), deps(blob)), { status: 200, body: { ok: true, persisted: false } });
   assert.equal(blob.count("heartbeats/2026-10-23/"), HEARTBEAT.dailyCap);
+});
+
+// A Blob stand-in that fails the test if a route reads or writes it at all.
+function forbiddenBlob() {
+  const calls = [];
+  const record = (name) => async (...args) => {
+    calls.push([name, ...args]);
+    throw new Error(`${name} called on a deployment that must not store`);
+  };
+  return { calls, put: record("put"), list: record("list") };
+}
+
+test("canStore: only production, or no VERCEL_ENV at all, with a token", () => {
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t" }), true, "outside Vercel the token decides");
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: "" }), true);
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: "production" }), true);
+  for (const vercelEnv of ["preview", "development", "Production", "staging"]) {
+    assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: vercelEnv }), false, vercelEnv);
+  }
+  assert.equal(canStore({ VERCEL_ENV: "production" }), false, "no token, no storage");
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "", VERCEL_ENV: "production" }), false);
+});
+
+test("a preview or development deployment never reads or writes Blob, even with production's token", async () => {
+  const beat = { schema_version: 1, install_id: INSTALL };
+  for (const VERCEL_ENV of ["preview", "development"]) {
+    const blob = forbiddenBlob();
+    const env = { ...ENV, VERCEL_ENV };
+    assert.deepEqual(await handleHeartbeat(post(beat), deps(blob, { env })), { status: 200, body: { ok: true, persisted: false } });
+    const signup = await handleWaitlist(post({ email: "a@b.co" }), deps(blob, { env }));
+    assert.equal(signup.status, 503);
+    assert.match(signup.body.error, /can't take sign-ups/);
+    assert.deepEqual(blob.calls, [], VERCEL_ENV);
+  }
+  const production = fakeBlob();
+  const env = { ...ENV, VERCEL_ENV: "production" };
+  assert.deepEqual(await handleHeartbeat(post(beat), deps(production, { env })), { status: 200, body: { ok: true } });
+  assert.equal((await handleWaitlist(post({ email: "a@b.co" }), deps(production, { env }))).status, 200);
+  assert.equal(production.objects.size, 2);
+});
+
+// Invariant: on any deployment other than production, no request of any
+// shape reaches Blob, and every heartbeat that would have been stored gets
+// the same "don't retry" answer the app gets when storage is off.
+test("no request reaches Blob outside production (property)", async () => {
+  const vercelEnv = fc.string({ minLength: 1, maxLength: 12 }).filter((value) => value !== "production");
+  const heartbeat = fc.record({
+    schema_version: fc.constantFrom(1, 2),
+    install_id: fc.oneof(fc.stringMatching(/^[0-9a-f]{32}$/), fc.string({ maxLength: 40 })),
+    version: fc.string({ maxLength: 40 }),
+  });
+  const signup = fc.record({
+    email: fc.oneof(fc.emailAddress(), fc.string({ maxLength: 40 })),
+    interest: fc.constantFrom("", "general", "mcp", "other"),
+  });
+  await fc.assert(
+    fc.asyncProperty(vercelEnv, fc.array(fc.oneof(heartbeat.map((h) => ["heartbeat", h]), signup.map((s) => ["waitlist", s])), { maxLength: 12 }), async (VERCEL_ENV, requests) => {
+      const blob = forbiddenBlob();
+      const env = { ...ENV, VERCEL_ENV };
+      for (const [route, body] of requests) {
+        const result = route === "heartbeat" ? await handleHeartbeat(post(body), deps(blob, { env })) : await handleWaitlist(post(body), deps(blob, { env }));
+        assert.notEqual(result.status, 502, "a 502 means a storage call was made");
+        if (route === "heartbeat" && result.status === 200) assert.equal(result.body.persisted, false);
+        if (route === "waitlist" && result.status === 200) assert.equal(result.body.message, "Thanks.", "only the honeypot answers 200");
+      }
+      assert.deepEqual(blob.calls, []);
+    }),
+    { numRuns: 200 }
+  );
 });
 
 // Invariant: whatever sequence of requests arrives, a day's folder never

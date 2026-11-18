@@ -50,17 +50,17 @@ vercel deploy --scope max-ghenis-projects                             # preview
 vercel deploy --prod --scope max-ghenis-projects                      # production
 ```
 
-Previews share production's Blob store, so never submit the email form or POST a heartbeat on a preview.
+Only production deployments store anything: the API routes check `VERCEL_ENV` before they touch Blob, and previews get no Blob token. Previews built before 2026-11-18 still carry production's token and run older code, so never submit the email form or POST a heartbeat on a preview.
 
 ## Server routes
 
 | Route | Used by | Behavior |
 |---|---|---|
-| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. `GET` returns `{"ok":true,"schema_version":1}`. |
+| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. `GET` returns `{"ok":true,"schema_version":1,"persists":true}`, with `persists` false on any deployment that would store nothing. |
 | `GET /download` | Download buttons and shared links | 307 to the disk image on the latest GitHub release. |
 | `POST /api/waitlist` | The release-email form | Stores the address encrypted with AES-256-GCM. |
 
-Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes, `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist.
+Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes (Production and Development only), `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist.
 
 To read the release-email list:
 
