@@ -9,8 +9,8 @@ downloaded copy until they override it.
 
 ## What a signed build does
 
-With `DEVELOPER_ID` set to a Developer ID Application identity in the
-keychain, `RELEASE=1 ./macos/build.sh`:
+If `DEVELOPER_ID` names a Developer ID Application identity in the keychain,
+`RELEASE=1 ./macos/build.sh`:
 
 1. signs the Go helper (`Contents/Resources/openmessage`) with the hardened
    runtime and [`OpenMessageHelper.entitlements`](OpenMessageHelper.entitlements),
@@ -21,15 +21,17 @@ keychain, `RELEASE=1 ./macos/build.sh`:
    `com.apple.security.cs.disable-library-validation` and
    `com.apple.security.cs.allow-dyld-environment-variables`;
 3. builds `macos/build/OpenMessage.dmg` and signs the DMG itself, because
-   Gatekeeper checks the disk image's own signature before it mounts it;
+   Gatekeeper checks a disk image's signature before mounting it;
 4. submits the DMG to Apple's notary service, waits for the verdict, and
    staples the ticket to the DMG.
 
 For step 4 the script uses `AC_USERNAME`, `AC_PASSWORD` and `AC_TEAM_ID` when
-it has all three. Otherwise it looks for the `notarytool` keychain profile
-that `NOTARY_KEYCHAIN_PROFILE` names (default `OpenMessage`). With
-neither, it signs the DMG, skips notarization and prints "Signed but NOT
-notarized" without failing.
+it has all three. Otherwise it tries the `notarytool` keychain profile that
+`NOTARY_KEYCHAIN_PROFILE` names (default `OpenMessage`), and first checks it
+with `notarytool history`, which asks Apple's notary service. If that check
+fails for any reason, such as a missing profile, a revoked app-specific
+password or no network, the script skips notarization and prints "Signed but
+NOT notarized" without failing; the DMG keeps its step 3 signature.
 
 Leave out `RELEASE=1` and the script builds a dev bundle
 (`com.openmessage.app.dev`, in `OpenMessage-dev.dmg`) that can't
@@ -38,25 +40,33 @@ shadow the installed app; see "Building the macOS app" in
 
 ## How the release workflow signs
 
-Pushing a `v*` tag runs the release workflow. Its macOS job:
+Work through [the release checklist](../docs/release-checklist.md), then push
+a `v*` tag to run the release workflow. Its macOS job:
 
 1. imports the certificate from `MACOS_CERT_P12_BASE64` into a temporary
-   keychain under `$RUNNER_TEMP`, then deletes the decoded `.p12` (the step
-   skips when the repo has no such secret);
+   keychain under `$RUNNER_TEMP`, then deletes the decoded `.p12` (the
+   workflow skips this step when the repo has no `MACOS_CERT_P12_BASE64`
+   secret);
 2. runs `macos/build.sh` with `RELEASE=1`, `DEVELOPER_ID` and the three `AC_*`
    secrets;
-3. fails the job if the bundle carries any id other than
-   `com.openmessage.app` or any name other than `OpenMessage`, or if
-   `OpenMessage.dmg` doesn't exist;
+3. fails the job unless the bundle id reads `com.openmessage.app`, the bundle
+   name reads `OpenMessage` and `OpenMessage.dmg` exists;
 4. runs `spctl --assess --type install` on the DMG and, if Gatekeeper rejects
-   it, prints a warning without failing the job.
+   it, prints a warning without failing the job (like step 1, the workflow
+   skips this step without `MACOS_CERT_P12_BASE64`).
 
-Because of step 4, and because `build.sh` skips notarization without failing
-when a notary secret goes missing, a green run doesn't prove the DMG passes
-Gatekeeper. Check the published DMG yourself (see "Verifying"). The publish job
-then attaches the DMG, the four CLI tarballs and `SHA256SUMS` to the GitHub
-release. Work through [the release checklist](../docs/release-checklist.md)
-before you push the tag.
+The publish job then attaches the DMG, the four CLI tarballs and `SHA256SUMS`
+to the GitHub release.
+
+A green run can publish a DMG that Gatekeeper rejects: step 4 warns instead of
+failing, and `build.sh` skips notarization without failing when the job lacks
+an `AC_*` secret. With neither `MACOS_CERT_P12_BASE64` nor `DEVELOPER_ID`, the
+job ships an ad-hoc-signed DMG and skips the Gatekeeper check. Check the
+published DMG yourself (see "Verifying"). If it fails, fix the secret and
+re-run the tag's release run (`gh run rerun <run-id> --repo
+MaxGhenis/openmessage`): the publish job uploads every file again with
+`--clobber` and regenerates `SHA256SUMS`. Don't replace the DMG by hand,
+because `SHA256SUMS` would no longer match it.
 
 ## Secrets
 
@@ -71,19 +81,22 @@ The workflow reads six repository secrets:
 | `AC_PASSWORD` | An app-specific password for that Apple ID |
 | `AC_TEAM_ID` | The 10-character Apple Developer Team ID (developer.apple.com/account) |
 
-Update the matching secret whenever you replace the certificate or the
-app-specific password.
+When you replace the certificate, update `MACOS_CERT_P12_BASE64`, plus
+`MACOS_CERT_PASSWORD` if you set a new export password and `DEVELOPER_ID` if
+the identity name changes. When you replace the app-specific password, update
+`AC_PASSWORD` and run `xcrun notarytool store-credentials` again for any local
+profile.
 
 ## Setting up credentials
 
-You need an Apple Developer Program membership: Developer ID certificates and
-notarization both require one.
+You need an [Apple Developer Program](https://developer.apple.com/programs/enroll)
+membership: Developer ID certificates and notarization both require one.
 
 ### 1. Developer ID Application certificate
 
-In Xcode → Settings → Accounts → Manage Certificates → `+` → "Developer ID
-Application". Xcode installs the certificate in your login keychain. Find its
-identity name with:
+In Xcode, open Settings → Accounts → Manage Certificates, click `+` and choose
+"Developer ID Application". Xcode installs the certificate in your login
+keychain. Find its identity name with:
 
 ```bash
 security find-identity -v -p codesigning
@@ -91,8 +104,9 @@ security find-identity -v -p codesigning
 
 ### 2. App-specific password
 
-Apple ID → [appleid.apple.com](https://appleid.apple.com) → Sign-In and
-Security → App-Specific Passwords → Generate. Label it "OpenMessage notary".
+Sign in at [appleid.apple.com](https://appleid.apple.com), open Sign-In and
+Security → App-Specific Passwords and click Generate. Label the password
+"OpenMessage notary".
 
 ### 3. Repository secrets
 
@@ -109,7 +123,7 @@ gh secret set AC_PASSWORD --repo MaxGhenis/openmessage
 gh secret set AC_TEAM_ID --repo MaxGhenis/openmessage
 ```
 
-Delete the exported `.p12` once the secret holds it.
+Delete the exported `.p12` once you've set `MACOS_CERT_P12_BASE64`.
 
 ## Local signed builds
 
@@ -126,8 +140,10 @@ Then build with your identity:
 DEVELOPER_ID="Developer ID Application: Your Name (TEAMID)" RELEASE=1 ./macos/build.sh
 ```
 
-`build.sh` finds the `OpenMessage` profile by itself; set
-`NOTARY_KEYCHAIN_PROFILE` if you saved it under another name.
+`build.sh` uses the `OpenMessage` profile by default; set
+`NOTARY_KEYCHAIN_PROFILE` if you saved it under another name. Check that the
+build prints "Notarized and stapled!" and not "Signed but NOT notarized", or
+run the commands under "Verifying".
 
 ## Verifying
 
