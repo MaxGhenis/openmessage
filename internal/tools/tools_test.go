@@ -1182,7 +1182,7 @@ func TestGetMessagesMediaIndicator(t *testing.T) {
 		MessageID:      "vm-1",
 		ConversationID: "c1",
 		SenderName:     "Jenn",
-		SenderNumber:   "+14699991654",
+		SenderNumber:   "+14695550142",
 		Body:           "",
 		TimestampMS:    now,
 		IsFromMe:       false,

@@ -1125,7 +1125,7 @@ func TestDownloadStoredMediaReadsLocalWhatsAppDesktopFile(t *testing.T) {
 	bridge := &Bridge{}
 	data, mimeType, err := bridge.DownloadStoredMedia(&db.Message{
 		MessageID:      "whatsapp:m1",
-		ConversationID: "whatsapp:14699991654@s.whatsapp.net",
+		ConversationID: "whatsapp:14695550142@s.whatsapp.net",
 		MediaID:        whatsappmedia.EncodeLocalMediaRef("Media/jenn/voice.opus"),
 		SourcePlatform: "whatsapp",
 	})
@@ -2177,7 +2177,7 @@ func TestHandleMessageCanonicalizesLIDToPhoneNumberThread(t *testing.T) {
 	defer store.Close()
 
 	lid := watypes.NewJID("134149377675278", watypes.HiddenUserServer)
-	pn := watypes.NewJID("14699991654", watypes.DefaultUserServer)
+	pn := watypes.NewJID("14695550142", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		store: store,
 		client: &whatsmeow.Client{
@@ -2228,24 +2228,24 @@ func TestHandleMessageCanonicalizesLIDToPhoneNumberThread(t *testing.T) {
 		},
 	})
 
-	msgs, err := store.GetMessagesByConversation("whatsapp:14699991654@s.whatsapp.net", 10)
+	msgs, err := store.GetMessagesByConversation("whatsapp:14695550142@s.whatsapp.net", 10)
 	if err != nil {
 		t.Fatalf("GetMessagesByConversation(): %v", err)
 	}
 	if len(msgs) != 2 {
 		t.Fatalf("got %d messages, want 2", len(msgs))
 	}
-	if msgs[0].SenderNumber != "+14699991654" {
-		t.Fatalf("sender number = %q, want +14699991654", msgs[0].SenderNumber)
+	if msgs[0].SenderNumber != "+14695550142" {
+		t.Fatalf("sender number = %q, want +14695550142", msgs[0].SenderNumber)
 	}
-	convo, err := store.GetConversation("whatsapp:14699991654@s.whatsapp.net")
+	convo, err := store.GetConversation("whatsapp:14695550142@s.whatsapp.net")
 	if err != nil {
 		t.Fatalf("GetConversation(): %v", err)
 	}
 	if convo == nil {
 		t.Fatal("expected canonical WhatsApp conversation to be stored")
 	}
-	if convo.Participants == "" || !strings.Contains(convo.Participants, "+14699991654") {
+	if convo.Participants == "" || !strings.Contains(convo.Participants, "+14695550142") {
 		t.Fatalf("participants = %q, want canonical phone number", convo.Participants)
 	}
 	if _, err := store.GetConversation("whatsapp:134149377675278@lid"); err == nil {
@@ -2743,7 +2743,7 @@ func TestCanonicalJIDFallsBackToSessionStore(t *testing.T) {
 	}
 
 	lid := watypes.NewJID("134149377675278", watypes.HiddenUserServer)
-	pn := watypes.NewJID("14699991654", watypes.DefaultUserServer)
+	pn := watypes.NewJID("14695550142", watypes.DefaultUserServer)
 	sessionDB, err := sql.Open("sqlite", sessionStoreDSN(sessionPath))
 	if err != nil {
 		t.Fatalf("sql.Open(session store): %v", err)

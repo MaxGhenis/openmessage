@@ -44,7 +44,7 @@ func TestRepairLegacyMediaPlaceholders(t *testing.T) {
 	}
 	defer store.Close()
 	if err := store.UpsertConversation(&db.Conversation{
-		ConversationID: "whatsapp:14699991654@s.whatsapp.net",
+		ConversationID: "whatsapp:14695550142@s.whatsapp.net",
 		Name:           "Jenn",
 		SourcePlatform: "whatsapp",
 	}); err != nil {
@@ -52,7 +52,7 @@ func TestRepairLegacyMediaPlaceholders(t *testing.T) {
 	}
 	if err := store.UpsertMessage(&db.Message{
 		MessageID:      "whatsapp:abc123",
-		ConversationID: "whatsapp:14699991654@s.whatsapp.net",
+		ConversationID: "whatsapp:14695550142@s.whatsapp.net",
 		Body:           "[Photo]",
 		TimestampMS:    1,
 		SourcePlatform: "whatsapp",

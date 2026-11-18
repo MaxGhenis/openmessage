@@ -112,7 +112,7 @@ func TestJordanFixtureHasOneSMSAndOneWhatsAppRoute(t *testing.T) {
 	}
 	routes := map[string]int{}
 	for _, conversation := range conversations {
-		if conversation.Name == "Jordan Rivera" && strings.Contains(conversation.Participants, "+14699991654") {
+		if conversation.Name == "Jordan Rivera" && strings.Contains(conversation.Participants, "+14695550142") {
 			routes[conversation.SourcePlatform]++
 		}
 	}
