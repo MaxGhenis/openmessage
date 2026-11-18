@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -112,15 +113,25 @@ func (v signalCLIVersion) String() string {
 }
 
 // receiveOutputHasEnvelopes reports whether a receive call's output holds any
-// line processReceiveLine would treat as an envelope (it skips everything that
-// does not start with '{', such as signal-cli's log lines).
+// line processReceiveLine would treat as an envelope: a JSON object. It skips
+// signal-cli's log lines and the fragments receiveLineUnparseable describes,
+// so a call that printed only "{" did not deliver anything.
 func receiveOutputHasEnvelopes(output []byte) bool {
 	for _, line := range bytes.Split(output, []byte("\n")) {
-		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' {
+		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' && !receiveLineUnparseable(line) {
 			return true
 		}
 	}
 	return false
+}
+
+// receiveLineUnparseable reports whether a receive line that starts like a
+// JSON object is not JSON at all: a fragment of multi-line output, such as
+// the bare "{" that opens a pretty-printed object, or a line cut off while
+// it was written. Its bytes can never parse, so no replay can recover it, and
+// it must not wait in the recovery queue as pending.
+func receiveLineUnparseable(line []byte) bool {
+	return !json.Valid(line)
 }
 
 func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
@@ -423,6 +434,12 @@ type ReceiveRecoveryStatus struct {
 	PendingCount    int    `json:"pending_count"`
 	LastIssueAt     int64  `json:"last_issue_at,omitempty"`
 	LastIssueReason string `json:"last_issue_reason,omitempty"`
+	// UnparseableCount counts receive lines that started like JSON but were
+	// not JSON (see receiveLineUnparseable), since this process started plus
+	// any still in the queue file from earlier versions. They are not pending:
+	// no replay can recover them.
+	UnparseableCount  int   `json:"unparseable_count,omitempty"`
+	LastUnparseableAt int64 `json:"last_unparseable_at,omitempty"`
 }
 
 type QRSnapshot struct {
@@ -497,6 +514,12 @@ type Bridge struct {
 	}
 	lastReceiveRecoveryAt int64
 	lastTmpSweep          time.Time
+
+	// unparseableReceiveLines and lastUnparseableReceiveAt count the lines
+	// receiveLineUnparseable rejects. They are atomics because replay counts
+	// them while it holds recoveryMu.
+	unparseableReceiveLines  atomic.Int64
+	lastUnparseableReceiveAt atomic.Int64
 
 	// wg tracks background goroutines (link, receive loop, metadata refresh,
 	// sweeps, sync requests) so Close can wait for them to finish. Without
@@ -2388,6 +2411,18 @@ func (b *Bridge) processReceiveLineWithFailures(
 	}
 	payloadAccount, env, err := ParseReceiveEnvelope(account, line)
 	if err != nil {
+		if receiveLineUnparseable(line) {
+			// Queued, it would stay pending forever and hold the recovery
+			// alert up; count it instead, and still ask for the recovery
+			// sync a malformed line has always triggered. Only its length is
+			// logged.
+			b.noteUnparseableReceiveLines(1, now().UnixMilli())
+			b.logger.Warn().Int("bytes", len(line)).Msg("Skipped a Signal receive line that is not JSON")
+			if allowRecovery {
+				b.triggerReceiveRecoverySync(account, "unparseable")
+			}
+			return true, nil
+		}
 		if allowRecovery {
 			b.recordReceiveRecoveryIssue(account, line, "unmarshal_failed", err)
 		}
@@ -2473,10 +2508,37 @@ func ParseReceiveEnvelope(fallbackAccount string, line []byte) (string, Envelope
 	return payloadAccount, env, nil
 }
 
+func (b *Bridge) noteUnparseableReceiveLines(count int, atMS int64) {
+	if count <= 0 {
+		return
+	}
+	b.unparseableReceiveLines.Add(int64(count))
+	for {
+		last := b.lastUnparseableReceiveAt.Load()
+		if atMS <= last || b.lastUnparseableReceiveAt.CompareAndSwap(last, atMS) {
+			return
+		}
+	}
+}
+
+// recoveryRecordUnparseable reports whether a queued record holds a line
+// receiveLineUnparseable rejects. Versions before it queued such lines as
+// unmarshal_failed.
+func recoveryRecordUnparseable(record signalReceiveRecoveryRecord) bool {
+	line := bytes.TrimSpace([]byte(record.Raw))
+	return len(line) > 0 && line[0] == '{' && receiveLineUnparseable(line)
+}
+
 func (b *Bridge) recordReceiveRecoveryIssue(account string, rawLine []byte, reason string, err error) {
 	if err := b.appendReceiveRecoveryRecord(account, rawLine, reason, err); err != nil {
 		b.logger.Warn().Err(err).Str("reason", reason).Msg("Failed to quarantine Signal receive payload")
 	}
+	b.triggerReceiveRecoverySync(account, reason)
+}
+
+// triggerReceiveRecoverySync asks the primary device for a sync, at most once
+// per receiveRecoveryWindow.
+func (b *Bridge) triggerReceiveRecoverySync(account, reason string) {
 	if !b.shouldTriggerReceiveRecovery() {
 		return
 	}
@@ -2544,6 +2606,8 @@ func (b *Bridge) replayReceiveRecoveryQueue(account string) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	remaining := make([][]byte, 0)
 	recovered := 0
+	dropped := 0
+	var lastDroppedAt int64
 	for scanner.Scan() {
 		recordLine := bytes.TrimSpace(scanner.Bytes())
 		if len(recordLine) == 0 {
@@ -2552,6 +2616,12 @@ func (b *Bridge) replayReceiveRecoveryQueue(account string) {
 		var record signalReceiveRecoveryRecord
 		if err := json.Unmarshal(recordLine, &record); err != nil {
 			remaining = append(remaining, append([]byte(nil), recordLine...))
+			continue
+		}
+		if recoveryRecordUnparseable(record) {
+			// It can never replay; keep it only as a count.
+			dropped++
+			lastDroppedAt = max(lastDroppedAt, record.TimestampMS)
 			continue
 		}
 		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
@@ -2572,6 +2642,10 @@ func (b *Bridge) replayReceiveRecoveryQueue(account string) {
 	if err := rewriteRecoveryQueue(path, remaining); err != nil {
 		b.logger.Warn().Err(err).Msg("Failed to rewrite Signal receive recovery queue")
 		return
+	}
+	if dropped > 0 {
+		b.noteUnparseableReceiveLines(dropped, lastDroppedAt)
+		b.logger.Info().Int("dropped", dropped).Msg("Dropped Signal recovery records that are not JSON")
 	}
 	if recovered > 0 {
 		b.logger.Debug().Int("recovered", recovered).Msg("Replayed Signal recovery payloads")
@@ -2619,32 +2693,39 @@ func (b *Bridge) receiveRecoveryStatus() *ReceiveRecoveryStatus {
 	}
 	b.recoveryMu.Lock()
 	defer b.recoveryMu.Unlock()
-	raw, err := os.ReadFile(b.receiveRecoveryPath())
-	if err != nil {
-		return nil
+	status := &ReceiveRecoveryStatus{
+		UnparseableCount:  int(b.unparseableReceiveLines.Load()),
+		LastUnparseableAt: b.lastUnparseableReceiveAt.Load(),
 	}
-	scanner := bufio.NewScanner(bytes.NewReader(raw))
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	status := &ReceiveRecoveryStatus{}
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		status.PendingCount++
-		var record signalReceiveRecoveryRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			if status.LastIssueAt == 0 && status.LastIssueReason == "" {
-				status.LastIssueReason = "invalid_record"
+	if raw, err := os.ReadFile(b.receiveRecoveryPath()); err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(raw))
+		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+		for scanner.Scan() {
+			line := bytes.TrimSpace(scanner.Bytes())
+			if len(line) == 0 {
+				continue
 			}
-			continue
-		}
-		if record.TimestampMS >= status.LastIssueAt {
-			status.LastIssueAt = record.TimestampMS
-			status.LastIssueReason = strings.TrimSpace(record.Reason)
+			var record signalReceiveRecoveryRecord
+			if err := json.Unmarshal(line, &record); err != nil {
+				status.PendingCount++
+				if status.LastIssueAt == 0 && status.LastIssueReason == "" {
+					status.LastIssueReason = "invalid_record"
+				}
+				continue
+			}
+			if recoveryRecordUnparseable(record) {
+				status.UnparseableCount++
+				status.LastUnparseableAt = max(status.LastUnparseableAt, record.TimestampMS)
+				continue
+			}
+			status.PendingCount++
+			if record.TimestampMS >= status.LastIssueAt {
+				status.LastIssueAt = record.TimestampMS
+				status.LastIssueReason = strings.TrimSpace(record.Reason)
+			}
 		}
 	}
-	if status.PendingCount == 0 {
+	if status.PendingCount == 0 && status.UnparseableCount == 0 {
 		return nil
 	}
 	return status

@@ -1356,7 +1356,10 @@ func TestHandleReceiveOutputStoresIncomingSignalMessageFromSourceServiceID(t *te
 	}
 }
 
-func TestHandleReceiveOutputQuarantinesMalformedSignalPayloadAndRequestsRecoverySync(t *testing.T) {
+// A line that is not JSON can never replay, so it is counted instead of
+// queued (it would stay pending forever and hold the recovery alert up), and
+// it still requests the recovery sync a malformed line always has.
+func TestHandleReceiveOutputCountsUnparseableSignalLineAndRequestsRecoverySync(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := db.New(filepath.Join(dataDir, "messages.db"))
 	if err != nil {
@@ -1392,29 +1395,12 @@ func TestHandleReceiveOutputQuarantinesMalformedSignalPayloadAndRequestsRecovery
 		return syncCalls.Load() == 1
 	})
 
-	recoveryLog, err := os.ReadFile(filepath.Join(bridge.configDir, "signal-receive-recovery.ndjson"))
-	if err != nil {
-		t.Fatalf("ReadFile(recovery): %v", err)
+	if _, err := os.Stat(filepath.Join(bridge.configDir, "signal-receive-recovery.ndjson")); !os.IsNotExist(err) {
+		t.Fatalf("an unparseable line was queued for recovery (stat err %v)", err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(recoveryLog)), "\n")
-	if len(lines) != 1 {
-		t.Fatalf("got %d recovery records, want 1", len(lines))
-	}
-	var record signalReceiveRecoveryRecord
-	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
-		t.Fatalf("json.Unmarshal(recovery): %v", err)
-	}
-	if record.Reason != "unmarshal_failed" {
-		t.Fatalf("reason = %q, want unmarshal_failed", record.Reason)
-	}
-	if record.Account != "+15551230000" {
-		t.Fatalf("account = %q, want +15551230000", record.Account)
-	}
-	if strings.TrimSpace(record.Raw) != "{not json}" {
-		t.Fatalf("raw = %q, want original line", record.Raw)
-	}
-	if record.Error == "" {
-		t.Fatal("expected recovery record to include unmarshal error")
+	status := bridge.receiveRecoveryStatus()
+	if status == nil || status.PendingCount != 0 || status.UnparseableCount != 1 || status.LastUnparseableAt != 1700000000123 {
+		t.Fatalf("receive recovery status = %+v, want 0 pending and 1 unparseable", status)
 	}
 	if snap := bridge.Status(); snap.HistorySync == nil || !snap.HistorySync.Running {
 		t.Fatalf("expected running history sync after recovery request, got %+v", snap.HistorySync)
