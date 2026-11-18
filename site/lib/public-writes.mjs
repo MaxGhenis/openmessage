@@ -31,8 +31,8 @@ export const HEARTBEAT = {
 };
 
 const allowedInterests = new Set(["", "mac-app", "whatsapp", "signal", "mcp", "general"]);
-const UNCONFIGURED = "Updates are not configured right now. Email max@maxghenis.com instead.";
-const PAUSED = "Sign-ups are paused for today. Email max@maxghenis.com instead.";
+const UNCONFIGURED = "The site can't take sign-ups right now. Email max@maxghenis.com instead.";
+const PAUSED = "The site has stopped taking sign-ups for today. Email max@maxghenis.com instead.";
 
 export function isValidEmail(value) {
   return value.length <= WAITLIST.maxEmailLength && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);

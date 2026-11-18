@@ -1,7 +1,10 @@
-// Run from site/: node --test lib/public-writes.test.mjs
+// Bounds on the two public routes that write to Vercel Blob (lib/public-writes.mjs).
+// Run from site/: bun run test
 import assert from "node:assert/strict";
 import { createDecipheriv, createHash } from "node:crypto";
-import { test } from "node:test";
+
+import fc from "fast-check";
+import { test } from "vitest";
 
 import {
   HEARTBEAT,
@@ -13,7 +16,7 @@ import {
   isValidEmail,
   readJSONBody,
   underDailyBudget,
-} from "./public-writes.mjs";
+} from "../lib/public-writes.mjs";
 
 const KEY_HEX = "11".repeat(32);
 const ENV = { BLOB_READ_WRITE_TOKEN: "test-token", WAITLIST_ENCRYPTION_KEY: KEY_HEX };
@@ -152,7 +155,7 @@ test("waitlist: writes stop at the daily budget", async () => {
   for (let i = 0; i < WAITLIST.dailyCap; i++) await blob.put(`waitlist/2026-10-23/${i}`, "", {});
   const paused = await handleWaitlist(post({ email: "a@b.co" }), deps(blob));
   assert.equal(paused.status, 503);
-  assert.match(paused.body.error, /paused/);
+  assert.match(paused.body.error, /stopped taking sign-ups/);
   assert.equal(blob.count("waitlist/2026-10-23/"), WAITLIST.dailyCap);
 });
 
@@ -186,33 +189,78 @@ test("heartbeat: at the daily budget the app is told OK and nothing is written",
 // Invariant: whatever sequence of requests arrives, a day's folder never
 // holds more than the cap, it holds exactly one object per distinct address
 // accepted that day, and a refusal at the cap writes nothing.
-test("waitlist storage never exceeds the cap or the distinct sign-ups (randomized)", async () => {
-  let seed = 7;
-  const random = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+const signupSequence = fc.array(
+  fc.record({ day: fc.integer({ min: 0, max: 2 }), user: fc.integer({ min: 0, max: 8 }) }),
+  { maxLength: 40 }
+);
+const dayOf = (index) => `2026-10-2${3 + index}`;
+
+test("waitlist storage never exceeds the cap or the distinct sign-ups (property)", async () => {
   let pausedSeen = 0;
-  for (let round = 0; round < 60; round++) {
-    const blob = fakeBlob();
-    const dailyCap = 1 + Math.floor(random() * 6);
-    const accepted = new Map();
-    for (let i = 0; i < 40; i++) {
-      const date = `2026-10-2${3 + Math.floor(random() * 3)}`;
-      const email = `u${Math.floor(random() * 9)}@b.co`;
-      const before = blob.objects.size;
-      const result = await handleWaitlist(post({ email }), deps(blob, { now: () => Date.parse(`${date}T12:00:00Z`), dailyCap }));
-      if (result.status === 200) {
-        if (!accepted.has(date)) accepted.set(date, new Set());
-        accepted.get(date).add(email);
-      } else {
-        assert.equal(result.status, 503);
-        assert.equal(blob.objects.size, before, "a refused sign-up writes nothing");
-        pausedSeen++;
+  await fc.assert(
+    fc.asyncProperty(fc.integer({ min: 1, max: 6 }), signupSequence, async (dailyCap, requests) => {
+      const blob = fakeBlob();
+      const accepted = new Map();
+      for (const { day, user } of requests) {
+        const date = dayOf(day);
+        const email = `u${user}@b.co`;
+        const before = blob.objects.size;
+        const result = await handleWaitlist(
+          post({ email }),
+          deps(blob, { now: () => Date.parse(`${date}T12:00:00Z`), dailyCap })
+        );
+        if (result.status === 200) {
+          if (!accepted.has(date)) accepted.set(date, new Set());
+          accepted.get(date).add(email);
+        } else {
+          assert.equal(result.status, 503);
+          assert.equal(blob.objects.size, before, "a refused sign-up writes nothing");
+          pausedSeen++;
+        }
+        for (const [d, emails] of accepted) {
+          const stored = blob.count(`waitlist/${d}/`);
+          assert.ok(stored <= dailyCap, `${d}: ${stored} objects over a cap of ${dailyCap}`);
+          assert.equal(stored, emails.size, `${d}: one object per distinct accepted address`);
+        }
       }
-      for (const [d, emails] of accepted) {
-        const stored = blob.count(`waitlist/${d}/`);
-        assert.ok(stored <= dailyCap, `${d}: ${stored} objects over a cap of ${dailyCap}`);
-        assert.equal(stored, emails.size, `${d}: one object per distinct accepted address`);
-      }
-    }
-  }
+    }),
+    { numRuns: 120 }
+  );
   assert.ok(pausedSeen > 0, "the generated sequences reached the cap");
+});
+
+// The same invariant for heartbeats: at most the cap per day, one object per
+// install that was stored, and a heartbeat at the cap writes nothing.
+test("heartbeat storage never exceeds the cap or the distinct installs (property)", async () => {
+  let cappedSeen = 0;
+  await fc.assert(
+    fc.asyncProperty(fc.integer({ min: 1, max: 6 }), signupSequence, async (dailyCap, requests) => {
+      const blob = fakeBlob();
+      const persisted = new Map();
+      for (const { day, user } of requests) {
+        const date = dayOf(day);
+        const installId = user.toString(16).padStart(32, "0");
+        const before = blob.objects.size;
+        const result = await handleHeartbeat(
+          post({ schema_version: 1, install_id: installId }),
+          deps(blob, { now: () => Date.parse(`${date}T12:00:00Z`), dailyCap })
+        );
+        assert.equal(result.status, 200);
+        if (result.body.persisted === false) {
+          assert.equal(blob.objects.size, before, "a capped heartbeat writes nothing");
+          cappedSeen++;
+        } else {
+          if (!persisted.has(date)) persisted.set(date, new Set());
+          persisted.get(date).add(installId);
+        }
+        for (const [d, installs] of persisted) {
+          const stored = blob.count(`heartbeats/${d}/`);
+          assert.ok(stored <= dailyCap, `${d}: ${stored} objects over a cap of ${dailyCap}`);
+          assert.equal(stored, installs.size, `${d}: one object per stored install`);
+        }
+      }
+    }),
+    { numRuns: 120 }
+  );
+  assert.ok(cappedSeen > 0, "the generated sequences reached the cap");
 });

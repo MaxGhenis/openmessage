@@ -1,7 +1,8 @@
-// Prints the release-email list: one line per signup, oldest first.
+// Prints the release-email list: one line per address, oldest first.
 //
 // The site stores each signup as an AES-256-GCM record in Vercel Blob
-// (app/api/waitlist/route.js). This reads them back with the same key.
+// (lib/public-writes.mjs), one per address per UTC day. This reads them back
+// with the same key and keeps each address's latest record.
 //
 //   vercel env pull .env.local --environment production --scope max-ghenis-projects
 //   bun --env-file=.env.local scripts/read-waitlist.mjs
@@ -27,6 +28,19 @@ export function decryptRecord(record, keyHex) {
     decipher.final()
   ]);
   return JSON.parse(plaintext.toString("utf8"));
+}
+
+// One record per address: the latest, so a later sign-up's interest wins.
+// Sorted by that record's time, oldest first.
+export function latestPerAddress(signups) {
+  const latest = new Map();
+  for (const signup of signups) {
+    const kept = latest.get(signup.email);
+    if (!kept || Date.parse(signup.submittedAt) > Date.parse(kept.submittedAt)) {
+      latest.set(signup.email, signup);
+    }
+  }
+  return [...latest.values()].sort((a, b) => Date.parse(a.submittedAt) - Date.parse(b.submittedAt));
 }
 
 async function main() {
@@ -56,11 +70,11 @@ async function main() {
     cursor = page.hasMore ? page.cursor : undefined;
   } while (cursor);
 
-  signups.sort((a, b) => `${a.submittedAt}`.localeCompare(`${b.submittedAt}`));
-  for (const signup of signups) {
+  const addresses = latestPerAddress(signups);
+  for (const signup of addresses) {
     console.log(`${signup.submittedAt}\t${signup.email}\t${signup.interest}`);
   }
-  console.error(`${signups.length} signup(s).`);
+  console.error(`${addresses.length} address(es) from ${signups.length} record(s).`);
 }
 
 if (import.meta.main) {
