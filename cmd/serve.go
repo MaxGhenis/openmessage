@@ -219,6 +219,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	baseURL := "http://" + net.JoinHostPort(publicHost(host), port)
 
 	events := web.NewEventBroker()
+	signalDesktopGate := &signalDesktopGate{}
 	isConnected := func() bool {
 		if isDemo {
 			return true
@@ -236,6 +237,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		publishOverallStatus()
 	}
 	a.OnSignalStatusChange = func() {
+		// Off the callback's goroutine: the bridge can emit while the app
+		// still holds the lock SignalStatus takes.
+		go func() { signalDesktopGate.observe(a.SignalStatus(), time.Now()) }()
 		publishOverallStatus()
 	}
 	identityName := app.LocalIdentityName()
@@ -511,6 +515,21 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			Bool("ingest", v2Ingest).
 			Msg("V2 stack enabled")
 	}
+	var signalDesktopSilence freshness.ActivitySource
+	if !isDemo {
+		signalDesktopSilence = freshnessActivitySource(stack, a.Store, v2Primary)
+	}
+	signalDesktopFeed := newSignalDesktopFeed(signalDesktopFeedDeps{
+		stack:      stack,
+		transports: transports,
+		demo:       isDemo,
+		gate:       signalDesktopGate,
+		live:       a.SignalStatus,
+		liveSilent: signalLiveSilenceProbe(signalDesktopSilence),
+		logger:     logger,
+	})
+	stopSignalDesktopFeed := signalDesktopFeed.Start(context.Background())
+	defer stopSignalDesktopFeed()
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
 	lastImportErr := map[string]string{}
@@ -752,6 +771,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				ReconnectGoogle:       reconnectGoogle,
 				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
+				SignalDesktopStatus:   func() any { return signalDesktopFeed.Snapshot() },
 				ConnectWhatsApp:       connectWhatsApp,
 				PairWhatsAppPhone:     pairWhatsAppPhone,
 				UnpairWhatsApp:        unpairWhatsApp,
