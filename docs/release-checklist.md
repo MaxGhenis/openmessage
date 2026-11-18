@@ -44,3 +44,13 @@ Use this before shipping a TestFlight/App Store build, public website update, or
 - No failing required CI checks.
 - Release artifacts are generated from the intended commit.
 - Rollback path is known before promoting a website deployment or public build.
+
+## 7. Homebrew Cask
+
+Do this after the release workflow has published the tag; the DMG's hash does not exist before then.
+
+- Download the release's checksums into an empty folder: `gh release download vX.Y.Z --repo MaxGhenis/openmessage --pattern SHA256SUMS --dir <empty dir>`.
+- Confirm its `OpenMessage.dmg` line matches the digest GitHub reports for the asset: `gh release view vX.Y.Z --repo MaxGhenis/openmessage --json assets --jq '.assets[] | select(.name == "OpenMessage.dmg") | .digest'`.
+- In `Casks/openmessage.rb`, set `version` to the tag without its `v` and `sha256` to that hash, then open a PR. Until it merges, the cask keeps installing the previous release.
+- Bump it again if the tag's assets are replaced. A re-run of the release workflow uploads a rebuilt DMG and a new SHA256SUMS with `--clobber`; a manual `gh release upload ... --clobber` of the DMG changes its hash without touching SHA256SUMS, so take the hash from the asset digest instead (dropping its `sha256:` prefix).
+- The cask lives only in this repo, which serves as its own tap. `MaxGhenis/homebrew-tap` and `homebrew/cask` don't carry it; if either ever does, bump that copy too.
