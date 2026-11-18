@@ -10,7 +10,7 @@ export const metadata = {
   alternates: { canonical: "/privacy" }
 };
 
-const UPDATED = "October 8, 2026";
+const UPDATED = "November 7, 2026";
 
 export default function PrivacyPage() {
   return (
@@ -20,8 +20,8 @@ export default function PrivacyPage() {
         <header className="page-head">
           <h1>What OpenMessage does with your data</h1>
           <p>
-            OpenMessage has no accounts and no server in the path of your messages. This page lists
-            everything the app and this site send anywhere, as of version {RELEASE.version}.
+            OpenMessage has no accounts and no server in the path of your messages. Version{" "}
+            {RELEASE.version} of the app, and this site, send data only to the places listed below.
           </p>
           <p className="dateline">Updated {UPDATED}</p>
         </header>
@@ -31,8 +31,8 @@ export default function PrivacyPage() {
           <p>
             Your messages, contacts, drafts and search index live in a SQLite database,{" "}
             <code>messages.db</code>, in <code>~/Library/Application Support/OpenMessage</code>.
-            The login for each network you pair sits in its own file in the same folder. The
-            database is not encrypted; it is protected by your macOS account.
+            The login for each network you pair sits in its own file in the same folder. OpenMessage
+            does not encrypt the database; your macOS account&rsquo;s file permissions protect it.
           </p>
           <p>
             To delete your messages and logins from this Mac, quit the app and remove that folder.
@@ -56,13 +56,13 @@ export default function PrivacyPage() {
                   <td data-label="What">
                     The messages you send, and the traffic needed to stay linked and receive
                   </td>
-                  <td data-label="When">While that network is paired</td>
+                  <td data-label="When">While you have that network paired</td>
                 </tr>
                 <tr>
                   <th scope="row">Sites linked in your threads</th>
                   <td data-label="What">
-                    A request from your Mac for the page&rsquo;s title and preview image. Private
-                    and local addresses are refused
+                    A request from your Mac for the page&rsquo;s title and preview image.
+                    OpenMessage refuses private and local addresses
                   </td>
                   <td data-label="When">When a thread shows a link preview</td>
                 </tr>
@@ -94,10 +94,10 @@ export default function PrivacyPage() {
                   <th scope="row">openmessage.ai</th>
                   <td data-label="What">
                     A random install ID, the version, operating system, CPU type and which
-                    networks are paired. No message data
+                    networks you have paired. No message data
                   </td>
                   <td data-label="When">
-                    Only if OpenMessage is started with <code>OPENMESSAGE_TELEMETRY=1</code>. The
+                    Only if you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>. The
                     Mac app does not set it
                   </td>
                 </tr>
@@ -108,37 +108,42 @@ export default function PrivacyPage() {
             ids={["linkPreviewGuard", "uiFonts", "storyApiKey", "telemetryOptIn", "telemetryEndpoint"]}
           />
           <p>
-            The app can show contact photos from macOS Contacts if you grant access. They are read
-            on your Mac and sent nowhere. Notifications are generated on your Mac.
+            The app can show contact photos from macOS Contacts if you grant access. It reads them
+            on your Mac and sends them nowhere. It also creates notifications on your Mac.
           </p>
 
           <h2>What an install report keeps</h2>
           <p>
             If you turn on the report above, this site stores one record per install per day: the
-            install ID, version, operating system, CPU type, which networks are paired, and the
-            time received. It stores no IP address and no message data. The install ID is random
-            but stays the same from day to day, so the records are pseudonymous. Nothing deletes
-            them automatically.
+            install ID, version, operating system, CPU type, which networks you have paired, and
+            the time it arrived. It stores no IP address and no message data. The install ID is
+            random and stays the same from day to day, so the records link an install&rsquo;s days
+            together without naming anyone. Nothing deletes them automatically.
           </p>
 
           <h2>What this site collects</h2>
           <ul>
             <li>
-              No cookies and no analytics scripts. Your light or dark theme choice is saved in your
-              own browser.
+              The site sets no cookies and runs no analytics scripts. Your browser saves your light
+              or dark theme choice.
             </li>
             <li>
-              The site is hosted on Vercel, which handles each request, including your IP address,
-              in order to serve it.
+              Vercel hosts the site and handles each request, including your IP address, to serve
+              it.
+            </li>
+            <li>
+              To limit abuse, the server counts sign-ups and install reports per IP address in
+              memory. It never writes the counts to storage, and they disappear when the server
+              instance restarts.
             </li>
             <li>
               The download button redirects to GitHub. The site records nothing about it; GitHub
               counts downloads per release.
             </li>
             <li>
-              If you leave an email address for release news, it is encrypted with AES-256-GCM
-              before it is stored, and it is used only for OpenMessage release news. To have it
-              removed, write to the address below.
+              If you leave an email address for release news, the site encrypts it with AES-256-GCM
+              before storing it, and I use it only for OpenMessage release news. To have it
+              removed, write to me at the address below.
             </li>
           </ul>
 
@@ -150,11 +155,11 @@ export default function PrivacyPage() {
 
           <h2>Changes</h2>
           <p>
-            When this page changes, the date at the top changes with it. The{" "}
+            I change the date at the top whenever I change this page, and the{" "}
             <a href={REPO_URL} rel="noopener">
               source code
             </a>{" "}
-            is the reference for what the app does.
+            shows what the app does in detail.
           </p>
 
           <h2>Contact</h2>

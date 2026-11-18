@@ -232,18 +232,18 @@ signal|11`}</code>
                 <div className="fact">
                   <h3>Search works offline</h3>
                   <p>
-                    Message text is indexed with SQLite&rsquo;s FTS5, so search runs on your Mac
-                    with no network.
+                    OpenMessage indexes message text with SQLite&rsquo;s FTS5, so search runs on
+                    your Mac with no network.
                   </p>
                   <Receipts ids={["searchIndex"]} />
                 </div>
                 <div className="fact">
-                  <h3>Older history can be imported</h3>
+                  <h3>Import older history</h3>
                   <p>
                     The command line and the <code>import_messages</code> tool load iMessage history
                     from <code>chat.db</code> on your Mac, a Google Chat Takeout and a WhatsApp
-                    export. Imported iMessage and Google Chat threads are read-only: OpenMessage
-                    has no live connection to either.
+                    export. You can read imported iMessage and Google Chat threads but not reply
+                    to them, because OpenMessage has no live connection to either.
                   </p>
                   <Receipts ids={["imessageImport", "importCommands"]} />
                 </div>
@@ -279,7 +279,7 @@ signal|11`}</code>
               <Image
                 className="shot__img"
                 src={appScreenshot}
-                alt="OpenMessage window. Jordan Rivera is selected in the sidebar of conversations. The thread shows four SMS messages, with tabs for SMS, WhatsApp and Signal above them."
+                alt="OpenMessage window with Jordan Rivera selected in the sidebar of conversations. The thread shows four SMS messages, with tabs for SMS, WhatsApp and Signal above them."
                 sizes="(max-width: 72rem) 100vw, 67rem"
                 placeholder="empty"
               />
@@ -325,17 +325,17 @@ signal|11`}</code>
                 <div className="fact">
                   <h3>What your agent reads leaves your Mac</h3>
                   <p>
-                    Text that a tool returns goes to the model running your agent. Incoming messages
-                    are also untrusted input: anyone can text you instructions aimed at that model.
-                    The warning on each result lowers that risk and does not remove it.
+                    Text that a tool returns goes to the model running your agent, and anyone can
+                    text you instructions aimed at that model. The warning OpenMessage puts on each
+                    result lowers that risk and does not remove it.
                   </p>
                 </div>
                 <div className="fact">
                   <h3>Anything running as you can reach it</h3>
                   <p>
-                    The local server listens on <code>{MCP.host}</code> with no password, and the
-                    database is unencrypted SQLite. Other software running under your macOS account
-                    can call the server and read the file.
+                    The local server listens on <code>{MCP.host}</code> with no password, and
+                    OpenMessage does not encrypt the database. Other software running under your
+                    macOS account can call the server and read the file.
                   </p>
                   <Receipts ids={["mcpHost", "sqliteDriver"]} />
                 </div>
@@ -370,12 +370,13 @@ signal|11`}</code>
               </p>
               {!describesLatest && (
                 <p>
-                  This page was checked against version {RELEASE.version}. Version {release.version}{" "}
-                  is newer, so details here, including the agent setup command, can differ. The{" "}
+                  The details on this page come from version {RELEASE.version}. Version{" "}
+                  {release.version} is newer, so some of them, including the agent setup command,
+                  may have changed. Its{" "}
                   <a href={RELEASES_URL} rel="noopener">
                     release notes
                   </a>{" "}
-                  are current.
+                  list what changed.
                 </p>
               )}
               {describesLatest && (
@@ -385,11 +386,19 @@ signal|11`}</code>
                     <div className="fact">
                       <h3>Connections that reconnect themselves</h3>
                       <p>
-                        A supervisor per network retries a dropped connection with jittered backoff,
-                        from 5 seconds up to 5 minutes, and can refresh an expired Google session
-                        from your local Chrome profile.
+                        A supervisor for each network retries a dropped connection after a random
+                        wait, under a ceiling that doubles from 5 seconds to 5 minutes. It can also
+                        refresh an expired Google session from your local Chrome profile.
                       </p>
-                      <Receipts ids={["supervisorStart", "supervisorBackoff", "googleRefresh"]} />
+                      <Receipts
+                        ids={[
+                          "supervisorBackoff",
+                          "whatsappBackoff",
+                          "signalBackoff",
+                          "supervisorJitter",
+                          "googleRefresh"
+                        ]}
+                      />
                     </div>
                     <div className="fact">
                       <h3>Stall detection</h3>
@@ -397,16 +406,16 @@ signal|11`}</code>
                         The app compares each network&rsquo;s silence with its own recent traffic
                         and flags one that has gone quiet for longer than that history explains.{" "}
                         <code>openmessage status</code> shows how fresh each network&rsquo;s data
-                        is.
+                        is and marks a silent one.
                       </p>
-                      <Receipts ids={["silenceDefaults", "statusBehind"]} />
+                      <Receipts ids={["silenceDefaults", "statusSilence"]} />
                     </div>
                     <div className="fact">
                       <h3>A send outbox, behind a flag</h3>
                       <p>
-                        With the flag on, a send is saved locally before it is attempted. A send
-                        whose outcome is unknown is parked as <code>uncertain</code> and is never
-                        retried automatically.
+                        With the flag on, OpenMessage saves each send locally before it tries it.
+                        It parks a send whose outcome is unknown as <code>uncertain</code> and never
+                        retries it automatically.
                       </p>
                       <Receipts ids={["outboxFlag", "outboxUncertain", "outboxLease"]} />
                     </div>
@@ -484,17 +493,33 @@ signal|11`}</code>
                   <div>
                     <h3>Pair a network</h3>
                     <p>
-                      The app shows a QR code for each network. Scan it from Google Messages on
-                      your Android phone, from WhatsApp, or from Signal, the way you would link a
-                      desktop client. If Google refuses the QR code, pair through your Google
-                      account instead; in version {RELEASE.version} that means pasting a request
-                      copied from your browser&rsquo;s developer tools.
+                      For WhatsApp and Signal, the app shows a QR code. Scan it from the app on
+                      your phone, the way you would link a desktop client. Signal needs{" "}
+                      <code>signal-cli</code> installed first: <code>brew install signal-cli</code>.
                     </p>
                     <p>
-                      Signal needs <code>signal-cli</code> installed first:{" "}
-                      <code>brew install signal-cli</code>.
+                      For Google Messages, use the Google Account tab.{" "}
+                      <a
+                        href="https://support.google.com/messages/answer/9077245?co=GENIE.Platform%3DDesktop&hl=en"
+                        rel="noopener"
+                      >
+                        Google no longer offers QR pairing
+                      </a>{" "}
+                      in the US. In version {RELEASE.version}, you paste a cookie object or a cURL
+                      request for <code>messages.google.com</code>, copied from your browser&rsquo;s
+                      developer tools. Then tap the matching emoji in Google Messages on your
+                      Android phone.
                     </p>
-                    <Receipts ids={["signalCli"]} />
+                    <Receipts
+                      ids={[
+                        "whatsappQrPairing",
+                        "signalQrPairing",
+                        "signalCli",
+                        "googleAccountTab",
+                        "googleCookiePairing",
+                        "googleEmojiConfirm"
+                      ]}
+                    />
                   </div>
                 </li>
                 <li>
@@ -531,7 +556,8 @@ signal|11`}</code>
               </p>
               <UpdatesForm />
               <p className="muted">
-                Addresses are stored encrypted and used only for OpenMessage release news. See the{" "}
+                The site encrypts your address before storing it, and I use it only for
+                OpenMessage release news. See the{" "}
                 <a href="/privacy">privacy page</a>.
               </p>
             </div>

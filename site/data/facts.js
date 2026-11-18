@@ -20,14 +20,14 @@ export const RELEASE = {
   dmgName: "OpenMessage.dmg"
 };
 
-export const MAIN_COMMIT = "4208e081922b452c49cfba899c56a3ef072a8167";
-export const MAIN_CHECKED_ON = "2026-10-08";
+export const MAIN_COMMIT = "d863ba66c021a0ba9f7da37be8bc5b65df5f524f";
+export const MAIN_CHECKED_ON = "2026-11-18";
 
 // Counted at MAIN_COMMIT by tests/facts.test.js.
 export const MAIN_STATS = {
-  commits: 254,
-  commitsWithClaudeTrailer: 178,
-  commitsSinceRelease: 116,
+  commits: 301,
+  commitsWithClaudeTrailer: 224,
+  commitsSinceRelease: 163,
   // Commits reachable from the release tag. The live "commits ahead" number on
   // the homepage is main's current total minus this.
   commitsAtRelease: 138
@@ -194,6 +194,18 @@ export const RECEIPTS = {
     line: 148,
     expect: "Paste a Google cookie JSON object or a cURL command copied from browser devtools"
   },
+  googleAccountTab: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/PairingView.swift",
+    line: 6,
+    expect: 'case google = "Google Account"'
+  },
+  googleEmojiConfirm: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/PairingView.swift",
+    line: 76,
+    expect: "Tap this emoji in Google Messages on your phone."
+  },
   googleHandleMessage: {
     ref: "release",
     path: "internal/client/events.go",
@@ -217,6 +229,12 @@ export const RECEIPTS = {
     path: "internal/whatsapplive/client.go",
     line: 306,
     expect: "cli.GetQRChannel"
+  },
+  signalQrPairing: {
+    ref: "release",
+    path: "internal/web/api.go",
+    line: 1458,
+    expect: 'mux.HandleFunc("/api/signal/qr"'
   },
   whatsappSessionStore: {
     ref: "release",
@@ -250,15 +268,22 @@ export const RECEIPTS = {
   },
 
   // --- main (merged, not yet in a release) ---
-  supervisorStart: { ref: "main", path: "cmd/serve.go", line: 245, expect: "if !isDemo && transports" },
   supervisorBackoff: { ref: "main", path: "cmd/google_supervisor.go", line: 36, expect: "MinBackoff:         5 * time.Second" },
+  whatsappBackoff: { ref: "main", path: "cmd/whatsapp_supervisor.go", line: 27, expect: "MinBackoff:         5 * time.Second" },
+  signalBackoff: { ref: "main", path: "cmd/signal_supervisor.go", line: 45, expect: "MinBackoff:         5 * time.Second" },
+  supervisorJitter: { ref: "main", path: "internal/bridge/supervisor.go", line: 1303, expect: "l.drawJitter(cap)" },
   silenceDefaults: {
     ref: "main",
     path: "internal/freshness/silence.go",
     line: 67,
     expect: "ExpectedActiveHoursLimit: 6"
   },
-  statusBehind: { ref: "main", path: "cmd/status.go", line: 64, expect: "behind >= 3" },
+  statusSilence: {
+    ref: "main",
+    path: "cmd/status.go",
+    line: 34,
+    expect: 'nothing for longer than its own baseline explains ("silent Nh"'
+  },
   googleStall: {
     ref: "main",
     path: "internal/freshness/silence.go",
@@ -271,17 +296,23 @@ export const RECEIPTS = {
     line: 1,
     expect: "Package googlecookies refreshes the Google account cookies"
   },
+  googleQrRetired: {
+    ref: "main",
+    path: "cmd/pair.go",
+    line: 325,
+    expect: "OpenMessage no longer supports Google Messages QR pairing"
+  },
   outboxFlag: { ref: "main", path: "cmd/v2stack.go", line: 56, expect: "OPENMESSAGES_V2_SEND" },
   outboxUncertain: {
     ref: "main",
     path: "internal/storage/sqlite/outbox.go",
-    line: 31,
+    line: 33,
     expect: 'OutboxUncertain     OutboxState = "uncertain"'
   },
   outboxLease: {
     ref: "main",
     path: "internal/storage/sqlite/outbox.go",
-    line: 1172,
+    line: 1451,
     expect: "state IN ('queued', 'not_dispatched')"
   }
 };
