@@ -4,7 +4,10 @@
 // per submission, and the heartbeat took any caller-chosen install id).
 //
 // Three layers:
-//  - request shape: a small body cap and strict field formats;
+//  - request shape: a JSON Content-Type, a small body cap and strict field
+//    formats. A browser preflights a cross-site application/json request,
+//    and the routes answer no CORS headers, so another site can't use its
+//    visitors' browsers to write here;
 //  - a per-instance rate limit by client address, which throttles a burst on
 //    the warm serverless instances it lands on;
 //  - a daily object budget per route, read from Blob itself, which bounds
@@ -33,9 +36,24 @@ export const HEARTBEAT = {
 const allowedInterests = new Set(["", "mac-app", "whatsapp", "signal", "mcp", "general"]);
 const UNCONFIGURED = "The site can't take sign-ups right now. Email max@maxghenis.com instead.";
 const PAUSED = "The site has stopped taking sign-ups for today. Email max@maxghenis.com instead.";
+// components/updates-form.jsx shows this, and falls back to the same text.
+export const WAITLIST_THANKS = "Thanks. I'll email you when a release ships.";
 
+// Control and format characters (ESC, NUL, bidi overrides, zero-width
+// spaces) have no place in an address, and scripts/read-waitlist.mjs prints
+// addresses to a terminal.
 export function isValidEmail(value) {
-  return value.length <= WAITLIST.maxEmailLength && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  return (
+    value.length <= WAITLIST.maxEmailLength &&
+    !/[\p{Cc}\p{Cf}]/u.test(value) &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+  );
+}
+
+// Every app release that sends heartbeats (v0.2.0 on) and the site's own form
+// set Content-Type: application/json, optionally with parameters.
+export function isJSONContentType(request) {
+  return (request.headers.get("content-type") || "").toLowerCase().startsWith("application/json");
 }
 
 // The app's install id: 16 random bytes, hex (internal/telemetry installID).
@@ -43,8 +61,11 @@ export function isInstallID(value) {
   return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 }
 
-// Reads a JSON body of at most maxBytes. Returns { value } or { status }.
+// Reads a JSON body of at most maxBytes. Returns { value } or { status }:
+// 415 for any other Content-Type, 413 for a body over the cap, 400 for one
+// that doesn't parse.
 export async function readJSONBody(request, maxBytes) {
+  if (!isJSONContentType(request)) return { status: 415 };
   const declared = Number(request.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) return { status: 413 };
   let text;
@@ -130,6 +151,7 @@ function encryptWaitlistRecord(record, key) {
 
 export async function handleWaitlist(request, { put, list, env, allow, now = Date.now, log = console.error, dailyCap = WAITLIST.dailyCap }) {
   const body = await readJSONBody(request, WAITLIST.maxBodyBytes);
+  if (body.status === 415) return { status: 415, body: { error: "Set the Content-Type header to application/json." } };
   if (body.status === 413) return { status: 413, body: { error: "Request is too large." } };
   if (body.status) return { status: 400, body: { error: "Invalid request body." } };
   const payload = body.value;
@@ -142,13 +164,14 @@ export async function handleWaitlist(request, { put, list, env, allow, now = Dat
     return { status: 200, body: { ok: true, message: "Thanks." } };
   }
   if (!isValidEmail(email)) {
-    return { status: 400, body: { error: "Enter a valid email address." } };
+    // `field` lets the form mark the email input invalid for this error alone.
+    return { status: 400, body: { error: "Enter a valid email address.", field: "email" } };
   }
   if (!allowedInterests.has(interest)) {
     return { status: 400, body: { error: "Invalid interest selection." } };
   }
   if (!allow(clientAddress(request))) {
-    return { status: 429, body: { error: "Too many sign-ups from this address. Try again later." } };
+    return { status: 429, body: { error: "Your IP address has reached the sign-up limit. Try again later." } };
   }
 
   const key = Buffer.from(env.WAITLIST_ENCRYPTION_KEY || "", "hex");
@@ -173,10 +196,10 @@ export async function handleWaitlist(request, { put, list, env, allow, now = Dat
     });
   } catch (error) {
     log("Waitlist submit failed:", error);
-    return { status: 502, body: { error: "Could not save your email right now. Try again shortly." } };
+    return { status: 502, body: { error: "The site couldn't save your email right now. Try again shortly." } };
   }
 
-  return { status: 200, body: { ok: true, message: "Thanks. I’ll send product updates when there’s something real to share." } };
+  return { status: 200, body: { ok: true, message: WAITLIST_THANKS } };
 }
 
 function safeString(value, max) {

@@ -1,22 +1,42 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 // Posts to /api/waitlist, which stores the address encrypted (AES-256-GCM).
-// The route's response keys (`error`, `message`) are part of its contract.
+// The route's response keys are part of its contract: `message` on success,
+// `error` on failure, and `field: "email"` when it rejects the address itself.
+// THANKS matches WAITLIST_THANKS in lib/public-writes.mjs; tests/routes.test.js
+// checks that.
+const THANKS = "Thanks. I'll email you when a release ships.";
+const FAILED = "The site couldn't save your email. Try again shortly.";
+
 export function UpdatesForm() {
   const [email, setEmail] = useState("");
   const [website, setWebsite] = useState("");
   const [state, setState] = useState("idle");
   const [message, setMessage] = useState("");
+  const [invalid, setInvalid] = useState(false);
+  const field = useRef(null);
+  const sending = state === "submitting";
+
+  // When the route rejects the address, focus returns to the field, which
+  // then reports itself invalid and reads the error through aria-describedby.
+  useEffect(() => {
+    if (invalid) {
+      field.current?.focus();
+    }
+  }, [invalid]);
 
   async function submit(event) {
     event.preventDefault();
-    if (state === "submitting") {
+    // The button keeps focus while sending (aria-disabled, not disabled), so
+    // a repeat press lands here and does nothing.
+    if (sending) {
       return;
     }
     setState("submitting");
     setMessage("");
+    setInvalid(false);
 
     try {
       const response = await fetch("/api/waitlist", {
@@ -26,15 +46,18 @@ export function UpdatesForm() {
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(payload?.error || "Could not save your email. Try again shortly.");
+        setState("error");
+        setMessage(payload?.error || FAILED);
+        setInvalid(response.status === 400 && payload?.field === "email");
+        return;
       }
       setState("success");
-      setMessage("Saved. You'll get an email when a release ships.");
+      setMessage(payload?.message || THANKS);
       setEmail("");
       setWebsite("");
-    } catch (error) {
+    } catch {
       setState("error");
-      setMessage(error.message || "Could not save your email. Try again shortly.");
+      setMessage(FAILED);
     }
   }
 
@@ -45,6 +68,7 @@ export function UpdatesForm() {
           Email address
         </label>
         <input
+          ref={field}
           id="updates-email"
           className="field"
           type="email"
@@ -52,6 +76,8 @@ export function UpdatesForm() {
           autoComplete="email"
           placeholder="you@example.com"
           required
+          aria-invalid={invalid ? "true" : undefined}
+          aria-describedby={invalid ? "updates-status" : undefined}
           value={email}
           onChange={(event) => setEmail(event.target.value)}
         />
@@ -68,11 +94,11 @@ export function UpdatesForm() {
             onChange={(event) => setWebsite(event.target.value)}
           />
         </div>
-        <button type="submit" className="btn btn--quiet" disabled={state === "submitting"}>
-          {state === "submitting" ? "Saving" : "Email me releases"}
+        <button type="submit" className="btn btn--quiet" aria-disabled={sending ? "true" : undefined}>
+          {sending ? "Saving" : "Email me releases"}
         </button>
       </div>
-      <p className="updates__status" data-state={state} role="status" aria-live="polite">
+      <p id="updates-status" className="updates__status" data-state={state} role="status" aria-live="polite">
         {message}
       </p>
     </form>

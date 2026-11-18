@@ -1,7 +1,10 @@
 // Usage heartbeat receiver.
 //
-// An OpenMessage process started with OPENMESSAGE_TELEMETRY=1 sends a POST with:
+// An OpenMessage process started with OPENMESSAGE_TELEMETRY=1 sends a POST
+// with Content-Type: application/json (internal/telemetry/telemetry.go, every
+// release from v0.2.0) and this body:
 //   { install_id, version, os, arch, platforms, sent_at, schema_version }
+// Any other Content-Type gets a 415.
 // No shipped build sets that variable for the user, so most installs send
 // nothing.
 //
