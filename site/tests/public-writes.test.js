@@ -3,6 +3,10 @@
 import assert from "node:assert/strict";
 import { createDecipheriv, createHash } from "node:crypto";
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import fc from "fast-check";
 import { test } from "vitest";
 
@@ -332,4 +336,18 @@ test("heartbeat storage never exceeds the cap or the distinct installs (property
     { numRuns: 120 }
   );
   assert.ok(cappedSeen > 0, "the generated sequences reached the cap");
+});
+
+test("no doc tells anyone to pull production env into a file next dev loads", () => {
+  // next dev loads .env.local (and .env, .env.development[.local]); a
+  // production pull writes VERCEL_ENV="production" and the Blob token there.
+  const site = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const files = ["README.md", "../CLAUDE.md", "scripts/read-waitlist.mjs"];
+  for (const file of files) {
+    for (const line of readFileSync(path.join(site, file), "utf8").split("\n")) {
+      if (!/vercel env pull/.test(line) || !/--environment[= ]production/.test(line)) continue;
+      const target = line.match(/vercel env pull\s+(\S+)/)?.[1] || ".env.local";
+      assert.ok(!/^\.env(\.local|\.development(\.local)?)?$/.test(target), `${file}: ${line.trim()}`);
+    }
+  }
 });

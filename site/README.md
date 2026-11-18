@@ -50,7 +50,7 @@ vercel deploy --scope max-ghenis-projects                             # preview
 vercel deploy --prod --scope max-ghenis-projects                      # production
 ```
 
-Only production deployments store anything: the API routes touch Blob only when `VERCEL_ENV` is `production`, and previews get no Blob token. A local `next dev` stores nothing either, since a default `vercel env pull` sets no `VERCEL_ENV`. Previews built before 2026-11-18 still carry production's token and run older code, so never submit the email form or POST a heartbeat on a preview.
+Only production deployments store anything: the API routes touch Blob only when `VERCEL_ENV` is `production`, and previews built since 2026-11-18 18:45 UTC get no Blob token. A local `next dev` whose `.env.local` came from a default `vercel env pull` stores nothing, since that pull sets no `VERCEL_ENV`. A production pull does set it, so never pull production into `.env.local`, and delete one made that way: `next dev` loads it, and a later default pull keeps its keys. Three previews built on 2026-11-18 before 18:45 UTC still carry production's token and run code without this check, so never submit the email form or POST a heartbeat on any preview.
 
 ## Server routes
 
