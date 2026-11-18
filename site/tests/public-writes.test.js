@@ -338,16 +338,51 @@ test("heartbeat storage never exceeds the cap or the distinct installs (property
   assert.ok(cappedSeen > 0, "the generated sequences reached the cap");
 });
 
+// The file a `vercel env pull` command in `text` writes when it pulls
+// production, or null. Vercel CLI 56.2.1 writes .env.local unless given a
+// file, takes -e/--environment, and defaults to development.
+const VALUE_FLAGS = new Set(["-e", "--environment", "-S", "--scope", "--cwd", "-t", "--token", "--git-branch", "-A", "--local-config", "-Q", "--global-config"]);
+function productionPullTarget(text) {
+  const words = text.split(/\s+/).map((w) => w.replace(/^[`'"(]+|[`'",;)]+$/g, "")).filter(Boolean);
+  const at = words.findIndex((w, i) => w === "pull" && words[i - 1] === "env" && words[i - 2] === "vercel");
+  if (at < 0) return null;
+  let environment = "development";
+  let file = null;
+  for (let i = at + 1; i < words.length; i++) {
+    const w = words[i];
+    if (["&&", "||", "|", "#", "//"].includes(w)) break;
+    if (w.startsWith("--environment=")) environment = w.slice("--environment=".length);
+    else if (w === "-e" || w === "--environment") environment = words[++i];
+    else if (VALUE_FLAGS.has(w)) i += 1;
+    else if (!w.startsWith("-") && file === null) file = w;
+  }
+  return environment === "production" ? file || ".env.local" : null;
+}
+const NEXT_DEV_LOADS = /^\.env(\.local|\.development(\.local)?)?$/;
+
+test("productionPullTarget reads the file a production pull writes", () => {
+  const cases = {
+    "vercel env pull .env.waitlist.local --environment production --scope s": ".env.waitlist.local",
+    "vercel env pull --environment production --scope s": ".env.local",
+    "vercel env pull --environment=production .env.local": ".env.local",
+    "vercel env pull -e production ./.env.development.local": "./.env.development.local",
+    "`vercel env pull site/.env --yes --environment production`": "site/.env",
+    "vercel env pull .env.local": null,
+    "vercel env pull --environment preview": null,
+    "vercel env ls production": null,
+  };
+  for (const [command, file] of Object.entries(cases)) assert.equal(productionPullTarget(command), file, command);
+});
+
 test("no doc tells anyone to pull production env into a file next dev loads", () => {
-  // next dev loads .env.local (and .env, .env.development[.local]); a
-  // production pull writes VERCEL_ENV="production" and the Blob token there.
+  // next dev loads .env, .env.local, .env.development and .env.development.local;
+  // a production pull writes VERCEL_ENV="production" and the Blob token there.
   const site = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const files = ["README.md", "../CLAUDE.md", "scripts/read-waitlist.mjs"];
-  for (const file of files) {
-    for (const line of readFileSync(path.join(site, file), "utf8").split("\n")) {
-      if (!/vercel env pull/.test(line) || !/--environment[= ]production/.test(line)) continue;
-      const target = line.match(/vercel env pull\s+(\S+)/)?.[1] || ".env.local";
-      assert.ok(!/^\.env(\.local|\.development(\.local)?)?$/.test(target), `${file}: ${line.trim()}`);
+  for (const file of ["README.md", "../CLAUDE.md", "scripts/read-waitlist.mjs"]) {
+    const text = readFileSync(path.join(site, file), "utf8").replace(/\\\n/g, " ");
+    for (const line of text.split("\n")) {
+      const target = productionPullTarget(line);
+      if (target !== null) assert.ok(!NEXT_DEV_LOADS.test(path.posix.basename(target)), `${file}: ${line.trim()}`);
     }
   }
 });

@@ -158,7 +158,7 @@ describe("POST /api/waitlist", () => {
     });
   });
 
-  test("outside production (a preview, vercel dev, a plain next dev) refuses sign-ups and never touches Blob", async () => {
+  test("outside production (a preview, vercel dev, a next dev on a default pull) refuses sign-ups and never touches Blob", async () => {
     for (const vercelEnv of ["preview", "development", null]) {
       if (vercelEnv) process.env.VERCEL_ENV = vercelEnv;
       else delete process.env.VERCEL_ENV;
@@ -338,7 +338,7 @@ describe("/api/heartbeat", () => {
     expect(await response.json()).toEqual({ ok: true, persisted: false });
     expect(put).not.toHaveBeenCalled();
   });
-  test("outside production (a preview, vercel dev, a plain next dev) stores nothing even with production's token", async () => {
+  test("outside production (a preview, vercel dev, a next dev on a default pull) stores nothing even with production's token", async () => {
     for (const vercelEnv of ["preview", "development", null]) {
       if (vercelEnv) process.env.VERCEL_ENV = vercelEnv;
       else delete process.env.VERCEL_ENV;
