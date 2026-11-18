@@ -284,12 +284,6 @@ export const RECEIPTS = {
     line: 34,
     expect: 'nothing for longer than its own baseline explains ("silent Nh"'
   },
-  googleStall: {
-    ref: "main",
-    path: "internal/freshness/silence.go",
-    line: 8,
-    expect: "silent at 01:11 for 38 hours"
-  },
   googleRefresh: {
     ref: "main",
     path: "internal/googlecookies/googlecookies.go",

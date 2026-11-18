@@ -136,9 +136,8 @@ export default async function HomePage() {
               />
               <p className="readers__caption">
                 Demo conversations that ship with the app; none of these people exist. The right
-                pane is the unedited result of <code>{DEMO_TOOL}</code> in version{" "}
-                {RELEASE.version}. The left pane lays out the same messages as a thread, one tab
-                per network.
+                pane shows the text <code>{DEMO_TOOL}</code> returned in version {RELEASE.version},
+                and the left pane lays out the same messages as a thread, one tab per network.
               </p>
               <Receipts ids={["demoSeed", "untrustedPreamble"]} />
             </div>
@@ -179,7 +178,7 @@ export default async function HomePage() {
                   <h3>One call covers a person on every network</h3>
                   <p>
                     <code>get_person_messages</code> takes a name and returns that person&rsquo;s
-                    SMS, WhatsApp and Signal messages in one result, as above.{" "}
+                    SMS, WhatsApp and Signal messages in one result.{" "}
                     <code>person_stats</code> summarizes the same history.
                   </p>
                 </div>
@@ -192,7 +191,7 @@ export default async function HomePage() {
                   <Receipts ids={["draftTool"]} />
                 </div>
                 <div className="fact">
-                  <h3>Message text arrives marked as untrusted</h3>
+                  <h3>Results flag message text as untrusted</h3>
                   <p>
                     Results that contain message text open with a warning that tells the model to
                     ignore instructions inside message bodies.
@@ -223,7 +222,7 @@ whatsapp|12
 signal|11`}</code>
                 </pre>
                 <figcaption className="readers__caption">
-                  Run against the demo data in version {RELEASE.version}.
+                  I ran this on the demo data in version {RELEASE.version}.
                 </figcaption>
               </figure>
               <Receipts ids={["dataFolder", "messagesDb", "sqliteDriver"]} />
@@ -283,7 +282,7 @@ signal|11`}</code>
                 sizes="(max-width: 72rem) 100vw, 67rem"
                 placeholder="empty"
               />
-              <figcaption>The app running on its built-in demo data.</figcaption>
+              <figcaption>The app shows its built-in demo data.</figcaption>
             </figure>
           </div>
         </section>
@@ -296,7 +295,7 @@ signal|11`}</code>
             <div className="section__body">
               <div className="facts">
                 <div className="fact">
-                  <h3>These are unofficial clients</h3>
+                  <h3>Unofficial clients</h3>
                   <p>
                     OpenMessage reaches the three networks through open-source libraries that Google,
                     WhatsApp and Signal do not support: mautrix-gmessages, whatsmeow and signal-cli.{" "}
@@ -317,8 +316,8 @@ signal|11`}</code>
                     <code>draft_message</code>.
                   </p>
                   <p>
-                    &ldquo;Message sent&rdquo; in a result means the network accepted the message.
-                    Delivery and reading are later events that the result does not report.
+                    A send tool reports &ldquo;Message sent&rdquo; when the network accepts the
+                    message, and its result says nothing about delivery or reading.
                   </p>
                   <Receipts ids={["sendResult"]} />
                 </div>
@@ -360,19 +359,18 @@ signal|11`}</code>
             </div>
             <div className="section__body">
               <p className="lead">
-                The download is version {release.version}, released {releaseDate}.
+                The download button serves version {release.version}, released {releaseDate}.
                 {commitsAhead !== null && commitsAhead > 0 && (
                   <>
                     {" "}
-                    The <code>main</code> branch is {commitsAhead} commits ahead of it.
+                    Since then, {commitsAhead} commits have landed on <code>main</code>.
                   </>
                 )}
               </p>
               {!describesLatest && (
                 <p>
-                  The details on this page come from version {RELEASE.version}. Version{" "}
-                  {release.version} is newer, so some of them, including the agent setup command,
-                  may have changed. Its{" "}
+                  Version {release.version} shipped after version {RELEASE.version}, so some details
+                  here may have changed, including the agent setup command. Its{" "}
                   <a href={RELEASES_URL} rel="noopener">
                     release notes
                   </a>{" "}
@@ -381,7 +379,7 @@ signal|11`}</code>
               )}
               {describesLatest && (
                 <>
-                  <p>Merged since version {RELEASE.version} and waiting for the next release:</p>
+                  <p>These changes sit on <code>main</code>, waiting for the next release:</p>
                   <div className="facts">
                     <div className="fact">
                       <h3>Connections that reconnect themselves</h3>
@@ -413,7 +411,8 @@ signal|11`}</code>
                     <div className="fact">
                       <h3>A send outbox, behind a flag</h3>
                       <p>
-                        With the flag on, OpenMessage saves each send locally before it tries it.
+                        With <code>OPENMESSAGES_V2_SEND=1</code>, OpenMessage saves each send
+                        locally before it tries it.
                         It parks a send whose outcome is unknown as <code>uncertain</code> and never
                         retries it automatically.
                       </p>
@@ -462,9 +461,8 @@ signal|11`}</code>
               <Receipts ids={["minMacos", "imessageImport"]} />
 
               <p>
-                Most commits are co-written with AI: {MAIN_STATS.commitsWithClaudeTrailer} of the{" "}
-                {MAIN_STATS.commits} on <code>main</code> carry a Claude co-author line, as of{" "}
-                {formatDate(`${MAIN_CHECKED_ON}T00:00:00Z`)}.
+                Claude co-wrote {MAIN_STATS.commitsWithClaudeTrailer} of the {MAIN_STATS.commits}{" "}
+                commits on <code>main</code>, as of {formatDate(`${MAIN_CHECKED_ON}T00:00:00Z`)}.
               </p>
             </div>
           </div>
@@ -494,21 +492,21 @@ signal|11`}</code>
                     <h3>Pair a network</h3>
                     <p>
                       For WhatsApp and Signal, the app shows a QR code. Scan it from the app on
-                      your phone, the way you would link a desktop client. Signal needs{" "}
-                      <code>signal-cli</code> installed first: <code>brew install signal-cli</code>.
+                      your phone, the way you would link a desktop client. For Signal, install{" "}
+                      <code>signal-cli</code> first: <code>brew install signal-cli</code>.
                     </p>
                     <p>
-                      For Google Messages, use the Google Account tab.{" "}
+                      For Google Messages, use the Google Account tab, since{" "}
                       <a
                         href="https://support.google.com/messages/answer/9077245?co=GENIE.Platform%3DDesktop&hl=en"
                         rel="noopener"
                       >
                         Google no longer offers QR pairing
                       </a>{" "}
-                      in the US. In version {RELEASE.version}, you paste a cookie object or a cURL
-                      request for <code>messages.google.com</code>, copied from your browser&rsquo;s
-                      developer tools. Then tap the matching emoji in Google Messages on your
-                      Android phone.
+                      in the US. Copy a cookie object or a cURL request for{" "}
+                      <code>messages.google.com</code> from your browser&rsquo;s developer tools and
+                      paste it there. Then tap the matching emoji in Google Messages on your Android
+                      phone.
                     </p>
                     <Receipts
                       ids={[
@@ -547,7 +545,7 @@ signal|11`}</code>
             </div>
             <div className="section__body">
               <p>
-                The app does not update itself. Leave an address to get an email when a release
+                The app does not update itself, so leave an address to get an email when a release
                 ships, or watch{" "}
                 <a href={RELEASES_URL} rel="noopener">
                   releases on GitHub

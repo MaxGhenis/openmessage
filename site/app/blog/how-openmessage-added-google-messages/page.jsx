@@ -13,7 +13,7 @@ export default function GoogleMessagesPost() {
       lead="OpenMessage connected to Google Messages first. Google Messages carries SMS and RCS from an Android phone, and the way OpenMessage handles it set the pattern for WhatsApp and Signal."
     >
       <p>
-        In April we wrote that the Google connection recovered cleanly when something went wrong.
+        In April I wrote that the Google connection recovered cleanly when something went wrong.
         Version {RELEASE.version} cannot renew an expired Google session, so you pair again when
         one lapses.
       </p>
@@ -21,10 +21,10 @@ export default function GoogleMessagesPost() {
       <h2>Pairing</h2>
       <p>
         OpenMessage links to your phone the way Google Messages for web does. It uses a fork of
-        the open-source mautrix-gmessages library, which Google does not support. Version{" "}
-        {RELEASE.version} offers two ways to pair: scanning a QR code with the Google Messages
-        app, or giving OpenMessage the cookies your browser holds for{" "}
-        <code>messages.google.com</code> and then tapping a matching emoji on your phone.
+        the open-source mautrix-gmessages library, which Google does not support. You can pair
+        by scanning a QR code with the Google Messages app. You can also give OpenMessage the
+        cookies your browser holds for <code>messages.google.com</code>, then tap a matching emoji
+        on your phone.
       </p>
       <Receipts
         ids={["gmessagesFork", "googleQrPairing", "googleCookiePairing", "googleEmojiConfirm"]}
@@ -36,14 +36,14 @@ export default function GoogleMessagesPost() {
         >
           Google no longer offers QR pairing
         </a>{" "}
-        in the US, so pair there with cookies. Code on <code>main</code> drops QR setup and
-        points new installs to account pairing.
+        in the US, so there you pair with cookies. Code on <code>main</code> drops QR setup and
+        sets up Google Messages through your Google account instead.
       </p>
       <Receipts ids={["googleQrRetired"]} />
 
       <h2>The live event path</h2>
       <p>
-        Once paired, the backend holds a session with Google and receives events as they happen.
+        After you pair, the backend holds a session with Google and receives events as they happen.
         It writes each incoming message to the local database and tells the app which
         conversation changed, so the thread redraws.
       </p>
@@ -51,8 +51,8 @@ export default function GoogleMessagesPost() {
 
       <h2>One table for every network</h2>
       <p>
-        Google Messages rows go into the same <code>messages</code> table that WhatsApp and Signal
-        use, tagged with the network they came from. Search, the sidebar and the MCP tools read
+        OpenMessage writes Google Messages rows to the same <code>messages</code> table that
+        WhatsApp and Signal use, and tags each row with its network. Search, the sidebar and the MCP tools read
         that table, so one query or one tool call covers all three.
       </p>
       <Receipts ids={["messagesDb", "searchIndex", "toolRegistry"]} />
@@ -66,12 +66,10 @@ export default function GoogleMessagesPost() {
       </p>
       <Receipts ids={["googleRefresh", "supervisorBackoff"]} />
       <p>
-        On October 6, 2026, Google ingest on one install went silent for 38 hours while the
-        status endpoint reported the connection as healthy. On <code>main</code>, OpenMessage now
-        compares each network&rsquo;s silence with its own recent traffic and flags a gap like
-        that one.
+        On <code>main</code>, OpenMessage compares each network&rsquo;s silence with its own recent
+        traffic and flags a network that has gone quiet for longer than that history explains.
       </p>
-      <Receipts ids={["googleStall", "silenceDefaults"]} />
+      <Receipts ids={["silenceDefaults"]} />
     </Post>
   );
 }

@@ -44,7 +44,7 @@ export default function WhatsAppPost() {
           WhatsApp&rsquo;s terms
         </a>{" "}
         forbid reverse engineering its service and let it suspend an account at any time. A
-        linked-device client built on whatsmeow falls on the wrong side of that. Pair an account
+        linked-device client on whatsmeow falls on the wrong side of that. Pair an account
         you could stand to lose.
       </p>
     </Post>

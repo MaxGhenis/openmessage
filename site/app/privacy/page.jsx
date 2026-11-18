@@ -10,7 +10,7 @@ export const metadata = {
   alternates: { canonical: "/privacy" }
 };
 
-const UPDATED = "November 7, 2026";
+const UPDATED = "November 18, 2026";
 
 export default function PrivacyPage() {
   return (
@@ -20,8 +20,7 @@ export default function PrivacyPage() {
         <header className="page-head">
           <h1>What OpenMessage does with your data</h1>
           <p>
-            OpenMessage has no accounts and no server in the path of your messages. Version{" "}
-            {RELEASE.version} of the app, and this site, send data only to the places listed below.
+            OpenMessage has no accounts and no server in the path of your messages.
           </p>
           <p className="dateline">Updated {UPDATED}</p>
         </header>
@@ -41,6 +40,7 @@ export default function PrivacyPage() {
           <Receipts ids={["dataFolder", "messagesDb", "sessionFiles"]} />
 
           <h2>What the app sends, and where</h2>
+          <p>Version {RELEASE.version} of the app sends data to these places and no others.</p>
           <div className="table-scroll">
             <table className="ledger">
               <thead>
@@ -54,7 +54,8 @@ export default function PrivacyPage() {
                 <tr>
                   <th scope="row">Google, WhatsApp, Signal</th>
                   <td data-label="What">
-                    The messages you send, and the traffic needed to stay linked and receive
+                    The messages you send, and the traffic that keeps the link up and brings in
+                    new messages
                   </td>
                   <td data-label="When">While you have that network paired</td>
                 </tr>
@@ -82,7 +83,7 @@ export default function PrivacyPage() {
                   <th scope="row">jsDelivr and Google Fonts</th>
                   <td data-label="What">Requests for a chart library and fonts</td>
                   <td data-label="When">
-                    When you open a relationship page made by <code>generate_viz</code>
+                    When you open a relationship page that <code>generate_viz</code> made
                   </td>
                 </tr>
                 <tr>
@@ -114,11 +115,12 @@ export default function PrivacyPage() {
 
           <h2>What an install report keeps</h2>
           <p>
-            If you turn on the report above, this site stores one record per install per day: the
-            install ID, version, operating system, CPU type, which networks you have paired, and
-            the time it arrived. It stores no IP address and no message data. The install ID is
-            random and stays the same from day to day, so the records link an install&rsquo;s days
-            together without naming anyone. Nothing deletes them automatically.
+            If you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>, this site stores
+            one record per install per day: the install ID, version, operating system, CPU type,
+            which networks you have paired, and the time it arrived. It stores no IP address and
+            no message data. The app picks the install ID at random and keeps it from day to day,
+            so the records link an install&rsquo;s days together without naming anyone. Nothing
+            deletes them automatically.
           </p>
 
           <h2>What this site collects</h2>
@@ -143,19 +145,19 @@ export default function PrivacyPage() {
             <li>
               If you leave an email address for release news, the site encrypts it with AES-256-GCM
               before storing it, and I use it only for OpenMessage release news. To have it
-              removed, write to me at the address below.
+              removed, email me at <a href="mailto:max@maxghenis.com">max@maxghenis.com</a>.
             </li>
           </ul>
 
           <h2>The networks&rsquo; own policies</h2>
           <p>
-            OpenMessage connects to accounts you already have with Google, WhatsApp and Signal.
-            Their privacy policies govern what those services do with your messages.
+            OpenMessage connects to accounts you already have with Google, WhatsApp and Signal,
+            and each of them handles your messages under its own privacy policy.
           </p>
 
           <h2>Changes</h2>
           <p>
-            I change the date at the top whenever I change this page, and the{" "}
+            I update the date whenever I change this policy, and the{" "}
             <a href={REPO_URL} rel="noopener">
               source code
             </a>{" "}
