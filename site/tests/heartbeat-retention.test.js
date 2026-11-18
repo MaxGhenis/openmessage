@@ -182,12 +182,24 @@ test("a rate-limited delete waits as asked and retries; other errors stop the ru
   assert.equal(blob.objects.size, 0);
   assert.deepEqual(sleeps, [2000, 2000]);
 
+  // A Retry-After the SDK can't parse arrives as NaN: wait a second, not zero.
+  failures = 1;
+  sleeps.length = 0;
+  blob.add(`heartbeats/${day(-100)}/nan.json`);
+  const nan = async (urls) => {
+    if (failures-- > 0) throw Object.assign(new Error("rate limited"), { retryAfter: NaN });
+    return blob.del(urls);
+  };
+  await expireHeartbeats({ list: blob.list, del: nan, sleep: async (ms) => sleeps.push(ms), now: () => NOW });
+  assert.deepEqual(sleeps, [1000]);
+
   blob.add(`heartbeats/${day(-100)}/x.json`);
   let calls = 0;
   const limited = async () => {
     calls += 1;
     throw Object.assign(new Error("rate limited"), { retryAfter: 60 });
   };
+
   sleeps.length = 0;
   await assert.rejects(expireHeartbeats({ list: blob.list, del: limited, sleep: async (ms) => sleeps.push(ms), now: () => NOW }), /rate limited/);
   assert.equal(calls, RETENTION.rateLimitRetries + 1);
@@ -234,7 +246,7 @@ test("cleanup keeps exactly what retention allows (property)", async () => {
     area: fc.constantFrom("heartbeats", "heartbeats", "heartbeats", "waitlist", "other"),
     offset: fc.integer({ min: -400, max: 2 }),
     id: fc.integer({ min: 0, max: 30 }),
-    shape: fc.constantFrom("dated", "dated", "dated", "undated", "loose"),
+    shape: fc.constantFrom("dated", "dated", "dated", "nested", "undated", "baddate", "loose"),
   });
   await fc.assert(
     fc.asyncProperty(fc.array(entry, { maxLength: 60 }), fc.integer({ min: 1, max: 365 }), fc.integer({ min: 1, max: 5 }), async (entries, days, pageSize) => {
@@ -242,13 +254,18 @@ test("cleanup keeps exactly what retention allows (property)", async () => {
       for (const { area, offset, id, shape } of entries) {
         if (shape === "loose") blob.add(`${area}/${id}.json`);
         else if (shape === "undated") blob.add(`${area}/not-a-day-${id % 3}/${id}.json`);
+        else if (shape === "baddate") blob.add(`${area}/2026-02-${30 + (id % 2)}/${id}.json`);
+        else if (shape === "nested") blob.add(`${area}/${day(offset)}/sub/${id}.json`);
         else blob.add(`${area}/${day(offset)}/${id}.json`);
       }
       const before = [...blob.objects.keys()];
       const cutoff = cutoffDay(NOW, days);
       const expected = before.filter((p) => {
-        const m = /^heartbeats\/(\d{4}-\d{2}-\d{2})\/[^/]+$/.exec(p);
-        return !(m && m[1] <= cutoff);
+        // Everything under an expired calendar-date folder goes, nested or not.
+        const m = /^heartbeats\/(\d{4}-\d{2}-\d{2})\//.exec(p);
+        const t = m ? Date.parse(`${m[1]}T00:00:00Z`) : NaN;
+        const real = Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === m[1];
+        return !(real && m[1] <= cutoff);
       });
       const result = await expireHeartbeats({ list: blob.list, del: blob.del, sleep: noSleep, now: () => NOW, days, batch: 4 });
       assert.equal(result.complete, true);

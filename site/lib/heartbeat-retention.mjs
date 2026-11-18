@@ -7,8 +7,8 @@
 // folder dated T - heartbeatDays or earlier, oldest first, up to
 // maxDeletesPerRun records; the next run picks up anything left. It touches
 // nothing outside heartbeats/, and it skips any folder whose name is not a
-// calendar date. Deleting an expired folder twice changes nothing, so a
-// repeated or missed run is harmless.
+// calendar date. A repeated run finds nothing more to delete, and a missed or
+// cut-short run leaves its records for the next one, a day late.
 //
 // Like the write handlers in public-writes.mjs, these functions take their
 // storage calls as arguments so they can be tested without Next.js or Vercel.
@@ -37,9 +37,15 @@ export const RETENTION = {
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // BlobServiceRateLimited is the one @vercel/blob error with a numeric
-// retryAfter (seconds; 0 when Blob sent no Retry-After header).
+// retryAfter: seconds, 0 when Blob sent no Retry-After header, NaN when the
+// header isn't an integer.
 function isRateLimited(error) {
   return typeof error?.retryAfter === "number";
+}
+
+function retryWaitMs(retryAfter) {
+  const seconds = Number.isFinite(retryAfter) && retryAfter >= 1 ? retryAfter : 1;
+  return Math.min(seconds * 1000, RETENTION.maxRetryWaitMs);
 }
 
 async function deleteChunk(del, chunk, { sleep, retries }) {
@@ -48,7 +54,7 @@ async function deleteChunk(del, chunk, { sleep, retries }) {
       return await del(chunk);
     } catch (error) {
       if (!isRateLimited(error) || attempt >= retries) throw error;
-      await sleep(Math.min(Math.max(error.retryAfter, 1) * 1000, RETENTION.maxRetryWaitMs));
+      await sleep(retryWaitMs(error.retryAfter));
     }
   }
 }

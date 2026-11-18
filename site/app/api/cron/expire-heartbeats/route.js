@@ -12,7 +12,8 @@ import { NextResponse } from "next/server";
 
 import { handleExpireHeartbeats } from "../../../../lib/heartbeat-retention.mjs";
 
-// The run paces its deletes and takes about 100 s at most; allow 300 s.
+// A full run of 5,000 deletes spends about 100 s in pauses, plus more if Blob
+// rate-limits it. A run cut off at 300 s leaves the rest for the next day.
 export const maxDuration = 300;
 
 export async function GET(request) {

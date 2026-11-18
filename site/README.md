@@ -61,7 +61,7 @@ Only production deployments store anything: the API routes touch Blob only when 
 | `POST /api/waitlist` | The release-email form | Stores the address encrypted with AES-256-GCM. |
 | `GET /api/cron/expire-heartbeats` | Vercel Cron, daily at 04:17 UTC (`crons` in `vercel.json`) | Deletes heartbeat records once they are `RETENTION.heartbeatDays` (90) days old. Answers 401 unless the request carries `Authorization: Bearer <CRON_SECRET>`, and deletes nothing outside production. |
 
-Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes (Production and Development only), `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist, `CRON_SECRET` (Production only, a random string) for the cleanup cron. Without `CRON_SECRET` the cron route refuses every request and deletes nothing.
+Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for the API routes and the cron (Production and Development only), `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist, `CRON_SECRET` (Production only, a random string) for the cleanup cron. Without `CRON_SECRET` the cron route refuses every request and deletes nothing, so a production build stops if `vercel.json` schedules a cron and `CRON_SECRET` is unset (`lib/deploy-checks.mjs`).
 
 To read the release-email list (the production pull goes to a file `next dev` doesn't load, and `.gitignore` covers it):
 
