@@ -26,12 +26,13 @@ If `DEVELOPER_ID` names a Developer ID Application identity in the keychain,
    staples the ticket to the DMG.
 
 For step 4 the script uses `AC_USERNAME`, `AC_PASSWORD` and `AC_TEAM_ID` when
-it has all three. Otherwise it tries the `notarytool` keychain profile that
-`NOTARY_KEYCHAIN_PROFILE` names (default `OpenMessage`), and first checks it
-with `notarytool history`, which asks Apple's notary service. If that check
-fails for any reason, such as a missing profile, a revoked app-specific
-password or no network, the script skips notarization and prints "Signed but
-NOT notarized" without failing; the DMG keeps its step 3 signature.
+it has all three. Otherwise it checks the `notarytool` keychain profile that
+`NOTARY_KEYCHAIN_PROFILE` names (default `OpenMessage`) with
+`notarytool history`, which asks Apple's notary service. If the check passes,
+the script notarizes with that profile. If it fails for any reason, such as a
+missing profile, a revoked app-specific password or no network, the script
+skips notarization and prints "Signed but NOT notarized" without failing. The
+DMG keeps its step 3 signature.
 
 Leave out `RELEASE=1` and the script builds a dev bundle
 (`com.openmessage.app.dev`, in `OpenMessage-dev.dmg`) that can't
@@ -49,11 +50,11 @@ a `v*` tag to run the release workflow. Its macOS job:
    secret);
 2. runs `macos/build.sh` with `RELEASE=1`, `DEVELOPER_ID` and the three `AC_*`
    secrets;
-3. fails the job unless the bundle id reads `com.openmessage.app`, the bundle
-   name reads `OpenMessage` and `OpenMessage.dmg` exists;
+3. fails unless the bundle id reads `com.openmessage.app`, the bundle name
+   reads `OpenMessage` and `OpenMessage.dmg` exists;
 4. runs `spctl --assess --type install` on the DMG and, if Gatekeeper rejects
-   it, prints a warning without failing the job (like step 1, the workflow
-   skips this step without `MACOS_CERT_P12_BASE64`).
+   it, prints a warning without failing (like step 1, the workflow skips this
+   step without `MACOS_CERT_P12_BASE64`).
 
 The publish job then attaches the DMG, the four CLI tarballs and `SHA256SUMS`
 to the GitHub release.
@@ -61,13 +62,24 @@ to the GitHub release.
 A green run can publish a DMG that Gatekeeper rejects: step 4 warns instead of
 failing, and `build.sh` skips notarization without failing when the job lacks
 an `AC_*` secret. With neither `MACOS_CERT_P12_BASE64` nor `DEVELOPER_ID`, the
-job ships an ad-hoc-signed DMG and skips the Gatekeeper check. Check the
-published DMG yourself (see "Verifying"). If it fails, fix the secret, then
-either cut a new tag or re-run the original run within 30 days
+job ships an unsigned DMG holding an ad-hoc-signed app and skips the
+Gatekeeper check. Check the published DMG yourself (see "Verifying").
+
+If the published DMG fails, set the secret the run lacked, then either cut a
+new tag or re-run the tag's release run within 30 days
 (`gh run rerun <run-id> --repo MaxGhenis/openmessage`). A re-run builds the
 same commit and tag, and its publish job uploads every file again with
-`--clobber`, regenerates `SHA256SUMS` and rewrites the release notes. Check
-the DMG again afterwards. Don't replace the DMG by hand, because
+`--clobber`, regenerates `SHA256SUMS` and rewrites the release notes. The
+notes step lists the commits since the highest other tag, so if you've pushed
+a newer tag since, the re-run can leave the notes empty. Save them before you
+re-run and restore them afterwards:
+
+```bash
+gh release view <tag> --repo MaxGhenis/openmessage --json body --jq .body > notes.md
+gh release edit <tag> --repo MaxGhenis/openmessage --notes-file notes.md
+```
+
+Check the DMG again afterwards, and don't replace it by hand, because
 `SHA256SUMS` would no longer match it.
 
 ## Secrets
