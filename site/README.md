@@ -50,13 +50,13 @@ vercel deploy --scope max-ghenis-projects                             # preview
 vercel deploy --prod --scope max-ghenis-projects                      # production
 ```
 
-Only production deployments store anything: the API routes touch Blob only when `VERCEL_ENV` is `production`, and previews built since 2026-11-18 18:45 UTC get no Blob token. A local `next dev` whose `.env.local` came from a default `vercel env pull` stores nothing, since that pull sets no `VERCEL_ENV`. A production pull does set it, so never pull production into `.env.local`, and delete one made that way: `next dev` loads it, and a later default pull keeps its keys. Three previews built on 2026-11-18 before 18:45 UTC still carry production's token and run code without this check, so never submit the email form or POST a heartbeat on any preview.
+Only production deployments store anything: the API routes touch Blob only when `VERCEL_ENV` is `production`, and previews built since 2026-11-18 18:45 UTC get no Blob token. A local `next dev` whose `.env.local` came from a default `vercel env pull` stores nothing, since that pull sets no `VERCEL_ENV`. A production pull does set it, so never pull production into a file `next dev` loads (`.env`, `.env.local`, `.env.development` or `.env.development.local`), and delete any such file that contains `VERCEL_ENV="production"`: a later default pull keeps its keys. Three previews built on 2026-11-18 before 18:45 UTC still carry production's token and run code without this check, so never submit the email form or POST a heartbeat on any preview.
 
 ## Server routes
 
 | Route | Used by | Behavior |
 |---|---|---|
-| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. `GET` returns `{"ok":true,"schema_version":1,"persists":true}`, with `persists` false on any deployment that would store nothing. |
+| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. `GET` returns `{"ok":true,"schema_version":1,"persists":true}`, with `persists` false on any deployment that would store nothing; an answer with no `persists` key comes from code without that check. |
 | `GET /download` | Download buttons and shared links | 307 to the disk image on the latest GitHub release. |
 | `POST /api/waitlist` | The release-email form | Stores the address encrypted with AES-256-GCM. |
 

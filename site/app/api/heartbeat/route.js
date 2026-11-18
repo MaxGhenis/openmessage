@@ -20,7 +20,8 @@
 // Only a production deployment stores records (canStore in
 // lib/public-writes.mjs). GET reports whether this deployment would, so a
 // deploy can be checked without posting: production answers "persists": true,
-// a preview false.
+// any other deployment false, and code from before this check sends no
+// "persists" key at all.
 //
 // Required env vars:
 //   BLOB_READ_WRITE_TOKEN   — Vercel Blob token (shared with the waitlist)
