@@ -12,6 +12,9 @@ import { NextResponse } from "next/server";
 
 import { handleExpireHeartbeats } from "../../../../lib/heartbeat-retention.mjs";
 
+// The run paces its deletes and takes about 100 s at most; allow 300 s.
+export const maxDuration = 300;
+
 export async function GET(request) {
   const { status, body } = await handleExpireHeartbeats(request, { list, del, env: process.env });
   return NextResponse.json(body, { status, headers: { "Cache-Control": "no-store" } });

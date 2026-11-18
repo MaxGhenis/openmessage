@@ -7,7 +7,8 @@
 // folder dated T - heartbeatDays or earlier, oldest first, up to
 // maxDeletesPerRun records; the next run picks up anything left. It touches
 // nothing outside heartbeats/, and it skips any folder whose name is not a
-// calendar date.
+// calendar date. Deleting an expired folder twice changes nothing, so a
+// repeated or missed run is harmless.
 //
 // Like the write handlers in public-writes.mjs, these functions take their
 // storage calls as arguments so they can be tested without Next.js or Vercel.
@@ -18,10 +19,39 @@ import { canStore } from "./public-writes.mjs";
 
 export const RETENTION = {
   heartbeatDays: 90,
-  // Vercel's own CLI deletes up to 1,000 blobs per del() call (blob empty-store).
-  deleteBatch: 1000,
-  maxDeletesPerRun: 20000,
+  // Blob counts each deleted blob as one operation toward the Pro limit of 75
+  // advanced operations a second, which the site's own writes share, and
+  // @vercel/blob doesn't retry a rate-limited call. Deleting 50 per call with
+  // a second between calls keeps the cleanup near 50 a second.
+  deleteBatch: 50,
+  pauseMs: 1000,
+  // A rate-limited call waits as long as Blob asks (at most 10 s) and tries
+  // again, up to 3 times.
+  rateLimitRetries: 3,
+  maxRetryWaitMs: 10_000,
+  // About 100 s of deleting. The heartbeat route stores at most 1,000 records
+  // a day, so a run clears a day's folder with room to spare.
+  maxDeletesPerRun: 5000,
 };
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// BlobServiceRateLimited is the one @vercel/blob error with a numeric
+// retryAfter (seconds; 0 when Blob sent no Retry-After header).
+function isRateLimited(error) {
+  return typeof error?.retryAfter === "number";
+}
+
+async function deleteChunk(del, chunk, { sleep, retries }) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await del(chunk);
+    } catch (error) {
+      if (!isRateLimited(error) || attempt >= retries) throw error;
+      await sleep(Math.min(Math.max(error.retryAfter, 1) * 1000, RETENTION.maxRetryWaitMs));
+    }
+  }
+}
 
 const PREFIX = "heartbeats/";
 const DAY_FOLDER = /^heartbeats\/(\d{4}-\d{2}-\d{2})\/$/;
@@ -60,10 +90,14 @@ export async function expireHeartbeats({
   days = RETENTION.heartbeatDays,
   batch = RETENTION.deleteBatch,
   maxDeletes = RETENTION.maxDeletesPerRun,
+  pauseMs = RETENTION.pauseMs,
+  retries = RETENTION.rateLimitRetries,
+  sleep = wait,
 }) {
   const cutoff = cutoffDay(now(), days);
   const folders = await expiredHeartbeatFolders(list, cutoff);
   let deleted = 0;
+  let calls = 0;
   for (const [index, folder] of folders.entries()) {
     // List the folder before deleting from it, so a delete can't shift a
     // cursor; stop listing once the run's budget is covered.
@@ -79,8 +113,10 @@ export async function expireHeartbeats({
     } while (cursor && urls.length < room);
     const take = urls.slice(0, room);
     for (let i = 0; i < take.length; i += batch) {
+      if (calls > 0) await sleep(pauseMs);
       const chunk = take.slice(i, i + batch);
-      await del(chunk);
+      await deleteChunk(del, chunk, { sleep, retries });
+      calls += 1;
       deleted += chunk.length;
     }
     const folderDone = !cursor && take.length === urls.length;
@@ -105,7 +141,7 @@ export function isCronRequest(request, env) {
   return timingSafeEqual(digest(header), digest(`Bearer ${secret}`));
 }
 
-export async function handleExpireHeartbeats(request, { list, del, env, now = Date.now, log = console.error }) {
+export async function handleExpireHeartbeats(request, { list, del, env, now = Date.now, log = console.error, sleep = wait }) {
   if (!isCronRequest(request, env)) {
     if (!env.CRON_SECRET) log("expire-heartbeats: CRON_SECRET is not set; refusing.");
     return { status: 401, body: { ok: false } };
@@ -114,7 +150,7 @@ export async function handleExpireHeartbeats(request, { list, del, env, now = Da
     return { status: 200, body: { ok: true, deleted: 0, storage: false } };
   }
   try {
-    const result = await expireHeartbeats({ list, del, now });
+    const result = await expireHeartbeats({ list, del, now, sleep });
     return { status: 200, body: { ok: true, ...result } };
   } catch (error) {
     log("expire-heartbeats failed:", error);
