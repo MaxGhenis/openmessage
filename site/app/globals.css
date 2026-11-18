@@ -230,8 +230,9 @@ pre,
   top: 0;
   z-index: 10;
   background: color-mix(in srgb, var(--paper) 88%, transparent);
-  backdrop-filter: saturate(1.4) blur(12px);
+  /* Prefixed first: the minifier keeps the last of the pair it sees. */
   -webkit-backdrop-filter: saturate(1.4) blur(12px);
+  backdrop-filter: saturate(1.4) blur(12px);
   border-bottom: 1px solid var(--line);
 }
 
@@ -884,52 +885,6 @@ pre,
 
 .steps p {
   max-width: 37rem;
-}
-
-/* ---------- FAQ ---------- */
-
-.faq {
-  border-top: 1px solid var(--line);
-  max-width: 46rem;
-}
-
-.faq details {
-  border-bottom: 1px solid var(--line);
-}
-
-.faq summary {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 1rem;
-  padding: 1rem 0;
-  font-weight: 650;
-  cursor: pointer;
-  list-style: none;
-}
-
-.faq summary::-webkit-details-marker {
-  display: none;
-}
-
-.faq summary::after {
-  content: "+";
-  font-family: var(--font-mono);
-  color: var(--muted);
-}
-
-.faq details[open] summary::after {
-  content: "−";
-}
-
-.faq details > div {
-  padding-bottom: 1.25rem;
-  max-width: var(--measure);
-  color: var(--muted);
-}
-
-.faq details > div > * + * {
-  margin-top: 0.75rem;
 }
 
 /* ---------- Updates form ---------- */

@@ -323,14 +323,14 @@ export const BLOG_POSTS = [
     title: "How OpenMessage added Google Messages",
     description: "Pairing, the live event path and the shared message table behind SMS and RCS in OpenMessage.",
     published: "2026-04-05",
-    revised: "2026-10-08"
+    revised: "2026-11-18"
   },
   {
     slug: "how-openmessage-added-whatsapp",
     title: "How OpenMessage added live WhatsApp support",
     description: "The linked-device session, what it syncs, and what it leaves out.",
     published: "2026-04-05",
-    revised: "2026-10-08"
+    revised: "2026-11-18"
   }
 ];
 
