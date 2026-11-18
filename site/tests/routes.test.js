@@ -92,7 +92,8 @@ describe("POST /api/waitlist", () => {
         expect(response.status).toBe(200);
         const [pathname, stored] = put.mock.calls[0];
         expect(stored).not.toContain(email);
-        expect(pathname).not.toContain(name);
+        // The name is 32 hex characters, so it cannot spell the address (no "@").
+        expect(pathname).toMatch(/^waitlist\/\d{4}-\d{2}-\d{2}\/[0-9a-f]{32}\.json$/);
         expect(decryptRecord(JSON.parse(stored), KEY).email).toBe(email);
       }),
       { numRuns: 40 }
