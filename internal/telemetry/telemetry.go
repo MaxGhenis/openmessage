@@ -3,10 +3,17 @@
 // and "what platforms do they have paired?".
 //
 // Design principles:
-//   - Off by default. Users explicitly opt in via the UI or a config file.
+//   - Off by default. The only switch is the OPENMESSAGE_TELEMETRY environment
+//     variable set to exactly "1" for `openmessage serve` (cmd/serve.go), which
+//     also skips telemetry in demo mode and in transportless processes. There
+//     is no UI toggle or config file.
 //   - No message content, contact info, or anything that could identify a user.
-//   - One heartbeat per app launch, at most one per 24 hours.
-//   - Stable anonymous install ID stored locally; no IP-based identity.
+//   - At most one heartbeat per Client every 24 hours. That limit lives in
+//     memory and serve builds a new Client on each launch, so each launch
+//     tries to send one heartbeat, however recently the last launch sent one.
+//   - Stable anonymous install ID: random, cached at $dataDir/telemetry-id and
+//     read back on every later launch that uses the same data dir. No
+//     IP-based identity.
 //   - Failure is silent — telemetry must never block app startup.
 package telemetry
 
@@ -127,9 +134,14 @@ func (c *Client) MaybeSend(ctx context.Context, status PlatformStatus) {
 	c.mu.Unlock()
 }
 
-// installID returns a stable, locally-generated random ID. Created lazily on
-// first use and cached at $dataDir/telemetry-id. Never tied to any user
-// identifier.
+// installID returns this install's anonymous ID, which stays the same across
+// launches. The first call generates 16 random bytes, hex-encodes them and
+// writes them to $dataDir/telemetry-id; later calls, in this process or a
+// later launch, read that file back. If the file can't be read, or doesn't
+// hold 32 characters after trimming whitespace, it generates a fresh ID and
+// overwrites the file. If the write fails it returns an error and MaybeSend
+// sends nothing, so no heartbeat carries an ID that isn't saved. Never tied
+// to any user identifier.
 func (c *Client) installID() (string, error) {
 	path := filepath.Join(c.dataDir, "telemetry-id")
 	if data, err := os.ReadFile(path); err == nil {

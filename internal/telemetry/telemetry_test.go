@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,6 +102,78 @@ func TestInstallIDIsStable(t *testing.T) {
 	}
 	if len(id1) != 32 {
 		t.Fatalf("install id length = %d; want 32", len(id1))
+	}
+}
+
+// TestInstallIDStableAcrossLaunches models two launches the way serve does
+// them: a new Client each time, on the same data dir. Both must send the same
+// install ID, the one saved in telemetry-id. The 24-hour limit doesn't carry
+// over between Clients, so each launch sends.
+func TestInstallIDStableAcrossLaunches(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var ids []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p payload
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &p); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+			return
+		}
+		mu.Lock()
+		ids = append(ids, p.InstallID)
+		mu.Unlock()
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	for launch := 0; launch < 2; launch++ {
+		c := New(dir, "test", true)
+		c.SetEndpoint(srv.URL)
+		c.MaybeSend(context.Background(), PlatformStatus{})
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ids) != 2 {
+		t.Fatalf("got %d heartbeats from two launches; want 2", len(ids))
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("install id changed between launches: %q vs %q", ids[0], ids[1])
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, "telemetry-id"))
+	if err != nil {
+		t.Fatalf("read telemetry-id: %v", err)
+	}
+	if string(saved) != ids[0] {
+		t.Fatalf("telemetry-id holds %q; heartbeats sent %q", saved, ids[0])
+	}
+}
+
+// TestUnsavableInstallIDSendsNothing checks that a heartbeat never carries an
+// ID that couldn't be saved: with a data dir that can't hold telemetry-id,
+// MaybeSend sends nothing.
+func TestUnsavableInstallIDSendsNothing(t *testing.T) {
+	t.Parallel()
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+	}))
+	defer srv.Close()
+
+	// A regular file where the data dir should be: MkdirAll fails.
+	notADir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := New(notADir, "test", true)
+	c.SetEndpoint(srv.URL)
+	c.MaybeSend(context.Background(), PlatformStatus{})
+
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("made %d HTTP calls with an unsavable install id; want 0", got)
 	}
 }
 
