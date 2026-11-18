@@ -591,3 +591,209 @@ func TestSignalDesktopHistoryWorkerS3OrderIndependenceProperty(t *testing.T) {
 		}
 	}
 }
+
+// S8 dedupe against signal-cli. The feed keys a contact by the form the live
+// bridge used whenever v2 holds evidence of it (Facts.ChooseAddress, tested in
+// internal/signaldesktop). Given that, any interleaving of signal-cli frames,
+// Desktop history frames and migrated local-alias rows leaves exactly one row
+// per message and one thread. A message live delivered ends with the live
+// body; history never rewrites a row it did not insert. Replaying every frame
+// changes nothing.
+func TestSignalDesktopHistoryWorkerS8DedupesAgainstLiveInAnyOrderProperty(t *testing.T) {
+	random := rand.New(rand.NewSource(20261118))
+	categories := make([]int, 8)
+	const messageCount = 6
+	for caseIndex := 0; caseIndex < 32; caseIndex++ {
+		category := int((random.Uint64() >> 33) % 8)
+		categories[category]++
+		group := category&1 != 0
+		peer := sdhPeerE164
+		if category&2 != 0 {
+			peer = sdhPeerACI
+		}
+		withAlias := category&4 != 0
+
+		base := sdhDirect(peer)
+		if group {
+			base = SignalDesktopHistorySnapshot{
+				RemoteConversationID: "signal-group:" + sdhGroupID,
+				Title:                "Synthetic Group",
+				Participants:         []SignalDesktopHistoryParticipant{{Address: peer}, {Address: sdhOtherACI}},
+			}
+		}
+		conversationID := base.RemoteConversationID
+
+		h := newSDHHarness(t)
+		expectedRows := 0
+		if withAlias {
+			// A migrated thread: live delivered an older message, and the
+			// legacy store's outgoing rows came over under the local alias.
+			h.live(t, conversationID, SignalDesktopHistoryMessage{AuthorAddress: peer, SentAtMS: sdhBaseMS, Body: "synthetic seed"})
+			expectedRows++
+		}
+
+		type planned struct {
+			message  SignalDesktopHistoryMessage
+			remoteID string
+			live     bool
+			history  bool
+			alias    bool
+		}
+		var plan []planned
+		for index := 0; index < messageCount; index++ {
+			message := SignalDesktopHistoryMessage{SentAtMS: sdhBaseMS + int64(1000*(index+1))}
+			if index%2 == 1 {
+				message.Outgoing = true
+			} else {
+				message.AuthorAddress = peer
+				if group && index == 2 {
+					message.AuthorAddress = sdhOtherACI
+				}
+			}
+			item := planned{message: message}
+			// The first incoming and first outgoing message are held by both
+			// sources in every case; the rest are live-only, history-only or both.
+			switch delivery := (random.Uint64() >> 33) % 3; {
+			case index < 2 || delivery == 2:
+				item.live, item.history = true, true
+			case delivery == 0:
+				item.live = true
+			default:
+				item.history = true
+			}
+			if message.Outgoing {
+				item.remoteID = strconv.FormatInt(message.SentAtMS, 10)
+				if withAlias && (index == 1 || (random.Uint64()>>33)%2 == 0) {
+					item.alias = true
+					item.remoteID = v2keys.SignalLocalAlias(conversationID, message.SentAtMS)
+				}
+			} else {
+				item.remoteID = v2keys.SignalIncomingSourceID(conversationID, message.AuthorAddress, message.SentAtMS)
+			}
+			plan = append(plan, item)
+			expectedRows++
+		}
+
+		if withAlias {
+			conversation := h.conversation(t, conversationID)
+			for index, item := range plan {
+				if !item.alias {
+					continue
+				}
+				if err := h.messages.ImportMessage(context.Background(), sqlite.MessageProjection{Message: sqlite.Message{
+					MessageID:       v2keys.DeriveID("message", sdhAccountID, conversationID+"\x1f"+item.remoteID),
+					ConversationID:  conversation.ConversationID,
+					AccountID:       sdhAccountID,
+					RemoteMessageID: item.remoteID,
+					Direction:       sqlite.MessageDirectionOutgoing,
+					Body:            fmt.Sprintf("synthetic migrated %d", index),
+					State:           sqlite.MessageStateActive,
+					OccurredAtMS:    item.message.SentAtMS,
+				}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+
+		// Live frames are one per message; Desktop history arrives in
+		// chunks of one to three messages, as the reader emits them.
+		type step struct {
+			history bool
+			record  bridge.RawIngressRecord
+			live    SignalDesktopHistoryMessage
+		}
+		var steps []step
+		var chunk []SignalDesktopHistoryMessage
+		flush := func() {
+			if len(chunk) == 0 {
+				return
+			}
+			frame := base
+			frame.Messages = chunk
+			steps = append(steps, step{history: true, record: sdhRecord(t, frame)})
+			chunk = nil
+		}
+		for index, item := range plan {
+			if item.live {
+				live := item.message
+				live.Body = fmt.Sprintf("synthetic live %d", index)
+				steps = append(steps, step{live: live})
+			}
+			if item.history {
+				desktop := item.message
+				desktop.Body = fmt.Sprintf("synthetic desktop %d", index)
+				chunk = append(chunk, desktop)
+				if len(chunk) == 3 || (random.Uint64()>>33)%2 == 0 {
+					flush()
+				}
+			}
+		}
+		flush()
+		random.Shuffle(len(steps), func(i, j int) { steps[i], steps[j] = steps[j], steps[i] })
+		apply := func() {
+			for _, s := range steps {
+				h.now = h.now.Add(time.Minute)
+				if s.history {
+					h.append(t, s.record, true)
+				} else {
+					h.live(t, conversationID, s.live)
+				}
+			}
+		}
+		apply()
+
+		if rows := h.rows(t, "SELECT * FROM conversations"); len(rows) != 1 {
+			t.Fatalf("case %d category %d: conversations = %d, want 1", caseIndex, category, len(rows))
+		}
+		if rows := h.rows(t, "SELECT * FROM messages"); len(rows) != expectedRows {
+			t.Fatalf("case %d category %d: messages = %d, want %d", caseIndex, category, len(rows), expectedRows)
+		}
+		for index, item := range plan {
+			message := h.message(t, conversationID, item.remoteID)
+			liveBody := fmt.Sprintf("synthetic live %d", index)
+			desktopBody := fmt.Sprintf("synthetic desktop %d", index)
+			switch {
+			case item.alias:
+				if message.Body == desktopBody {
+					t.Fatalf("case %d category %d: history rewrote migrated row %d", caseIndex, category, index)
+				}
+			case item.live:
+				if message.Body != liveBody {
+					t.Fatalf("case %d category %d: message %d body = %q, want the live body", caseIndex, category, index, message.Body)
+				}
+			default:
+				if message.Body != desktopBody {
+					t.Fatalf("case %d category %d: message %d body = %q, want the Desktop body", caseIndex, category, index, message.Body)
+				}
+			}
+		}
+		if !group {
+			conversation := h.conversation(t, conversationID)
+			peers, err := h.store.ListConversationPeerIdentities(sdhAccountID, conversation.ConversationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(peers) != 1 || peers[0].CanonicalValue != peer {
+				t.Fatalf("case %d category %d: peers = %+v, want only %s", caseIndex, category, peers, peer)
+			}
+		}
+		if c := h.counts(); c.HistorySkipped != 0 {
+			t.Fatalf("case %d category %d: counts=%+v", caseIndex, category, c)
+		}
+
+		before := h.state(t)
+		random.Shuffle(len(steps), func(i, j int) { steps[i], steps[j] = steps[j], steps[i] })
+		apply()
+		if after := h.state(t); !reflect.DeepEqual(before, after) {
+			t.Fatalf("case %d category %d: replay changed state", caseIndex, category)
+		}
+		if err := h.store.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for category, count := range categories {
+		if count == 0 {
+			t.Fatalf("category %d never exercised", category)
+		}
+	}
+}

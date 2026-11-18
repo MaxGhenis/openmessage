@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -354,5 +355,46 @@ func TestSignalDesktopNumericSourceBreaksLegacyButNotV2(t *testing.T) {
 	}
 	if len(chunks) != 1 || chunks[0].Messages[0].AuthorAddress != diffPeerE164 {
 		t.Fatalf("chunks = %+v, want the message by %s", chunks, diffPeerE164)
+	}
+}
+
+// The legacy store dedupes a Desktop row against signal-cli's by message ID
+// first and by (conversation, sender, timestamp) second (db.dedupeSignalMessages,
+// whose agreement with SignalDuplicateWouldBeDropped is tested in internal/db).
+// For the first to hold, the importer's IDs must be the live ones for any
+// address form and padding: v2keys pins them to signallive
+// (TestSignalIncomingSourceIDSignallivePin), so this pins the importer to v2keys.
+func TestSignalDesktopLegacyIDsAreTheLiveIDsProperty(t *testing.T) {
+	random := rand.New(rand.NewSource(20261118))
+	pad := func(value string) string {
+		return strings.Repeat(" ", random.Intn(2)) + value + strings.Repeat("\t", random.Intn(2))
+	}
+	for caseIndex := 0; caseIndex < 500; caseIndex++ {
+		var conversation, sender string
+		switch random.Intn(3) {
+		case 0:
+			sender = fmt.Sprintf("+1555%07d", random.Intn(10_000_000))
+			conversation = "signal:" + sender
+		case 1:
+			sender = fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x", random.Uint32(), random.Intn(1<<16), random.Intn(1<<12), random.Intn(1<<12), random.Int63n(1<<48))
+			conversation = "signal:" + sender
+		default:
+			sender = diffOtherACI
+			conversation = "signal-group:" + diffGroupID
+		}
+		timestamp := diffBaseMS + random.Int63n(1_000_000_000)
+		body := fmt.Sprintf("synthetic %d", caseIndex)
+
+		messageID, sourceID := signalDesktopMessageIDs(pad(conversation), pad(sender), timestamp, body, false)
+		if want := v2keys.SignalIncomingSourceID(conversation, sender, timestamp); sourceID != want || messageID != "signal:"+want {
+			t.Fatalf("case %d incoming: importer ids (%q, %q), want source id %q", caseIndex, messageID, sourceID, want)
+		}
+		if other, _ := signalDesktopMessageIDs(conversation, sender, timestamp, body+" edited", false); other != messageID {
+			t.Fatalf("case %d: the body changed the message id", caseIndex)
+		}
+		messageID, sourceID = signalDesktopMessageIDs(pad(conversation), "", timestamp, body, true)
+		if want := v2keys.SignalLocalAlias(conversation, timestamp); sourceID != want || messageID != "signal:"+want {
+			t.Fatalf("case %d outgoing: importer ids (%q, %q), want alias %q", caseIndex, messageID, sourceID, want)
+		}
 	}
 }
