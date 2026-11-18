@@ -1,8 +1,10 @@
 // Checks that stop a production build which would deploy a broken promise.
 //
 // next.config.mjs runs productionBuildProblem during `next build`. Vercel sets
-// VERCEL_ENV at build time as well as at runtime, so the check fires only for
-// a production deployment; CI, local builds and previews skip it.
+// VERCEL_ENV at build time as well as at runtime, so the check fires for a
+// production deployment and for a local `vercel build --prod`; CI, a plain
+// `next build` and previews skip it. A local `vercel build --prod` checks
+// whatever CRON_SECRET its pulled production env holds.
 
 // An error message, or null when the build may go ahead.
 export function productionBuildProblem(env, vercelConfig) {

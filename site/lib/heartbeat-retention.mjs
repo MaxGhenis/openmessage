@@ -7,8 +7,10 @@
 // folder dated T - heartbeatDays or earlier, oldest first, up to
 // maxDeletesPerRun records; the next run picks up anything left. It touches
 // nothing outside heartbeats/, and it skips any folder whose name is not a
-// calendar date. A repeated run finds nothing more to delete, and a missed or
-// cut-short run leaves its records for the next one, a day late.
+// calendar date. A missed or cut-short run leaves its records for the next
+// one, a day late. Two runs at once (Vercel can deliver a cron twice) delete
+// each record once, but both count it, and together they delete at twice the
+// paced rate; the rate-limit backoff absorbs that.
 //
 // Like the write handlers in public-writes.mjs, these functions take their
 // storage calls as arguments so they can be tested without Next.js or Vercel.
@@ -37,8 +39,8 @@ export const RETENTION = {
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // BlobServiceRateLimited is the one @vercel/blob error with a numeric
-// retryAfter: seconds, 0 when Blob sent no Retry-After header, NaN when the
-// header isn't an integer.
+// retryAfter: the header parsed with parseInt, so 0 when Blob sent none and
+// NaN when it doesn't start with a digit.
 function isRateLimited(error) {
   return typeof error?.retryAfter === "number";
 }
@@ -123,7 +125,7 @@ export async function expireHeartbeats({
       const chunk = take.slice(i, i + batch);
       await deleteChunk(del, chunk, { sleep, retries });
       calls += 1;
-      deleted += chunk.length;
+      deleted += chunk.length; // records sent to del(), found or not
     }
     const folderDone = !cursor && take.length === urls.length;
     const moreFolders = index < folders.length - 1;
