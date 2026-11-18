@@ -1010,7 +1010,7 @@ func seedFixture(store *db.Store) error {
 	if err := seedSyntheticConversation(store, &db.Conversation{
 		ConversationID: "conv11",
 		Name:           "Jordan Rivera",
-		Participants:   `[{"name":"Jordan Rivera","number":"+14155550999"}]`,
+		Participants:   `[{"name":"Jordan Rivera","number":"+14155550114"}]`,
 		LastMessageTS:  1738959000000,
 		SourcePlatform: "sms",
 	}, []*db.Message{
@@ -1018,7 +1018,7 @@ func seedFixture(store *db.Store) error {
 			MessageID:      "m11a",
 			ConversationID: "conv11",
 			SenderName:     "Jordan Rivera",
-			SenderNumber:   "+14155550999",
+			SenderNumber:   "+14155550114",
 			Body:           "Wrong Jordan, different line.",
 			TimestampMS:    1738959000000,
 			Status:         "delivered",
@@ -1028,18 +1028,18 @@ func seedFixture(store *db.Store) error {
 		return err
 	}
 	if err := seedSyntheticConversation(store, &db.Conversation{
-		ConversationID: "signal:+14155550333",
+		ConversationID: "signal:+14155550115",
 		Name:           "Taylor Price",
-		Participants:   `[{"name":"Taylor Price","number":"+14155550333"}]`,
+		Participants:   `[{"name":"Taylor Price","number":"+14155550115"}]`,
 		LastMessageTS:  1738959605000,
 		UnreadCount:    0,
 		SourcePlatform: "signal",
 	}, []*db.Message{
 		{
 			MessageID:      "signal:seed-1",
-			ConversationID: "signal:+14155550333",
+			ConversationID: "signal:+14155550115",
 			SenderName:     "Taylor Price",
-			SenderNumber:   "+14155550333",
+			SenderNumber:   "+14155550115",
 			Body:           "Signal is easier for me if you want to reply here.",
 			TimestampMS:    1738959605000,
 			Status:         "received",

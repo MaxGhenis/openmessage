@@ -2434,7 +2434,7 @@ func TestWhatsAppPairCodeRoute(t *testing.T) {
 		},
 	})
 
-	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505551234"}`))
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505550116"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2443,8 +2443,8 @@ func TestWhatsAppPairCodeRoute(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("got status %d, want 200", resp.StatusCode)
 	}
-	if gotPhone != "+16505551234" {
-		t.Fatalf("handler got phone %q, want %q", gotPhone, "+16505551234")
+	if gotPhone != "+16505550116" {
+		t.Fatalf("handler got phone %q, want %q", gotPhone, "+16505550116")
 	}
 	var payload map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -2491,7 +2491,7 @@ func TestWhatsAppPairCodeRouteRejectsBadRequests(t *testing.T) {
 
 func TestWhatsAppPairCodeRouteUnavailableWithoutBridge(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{})
-	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505551234"}`))
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505550116"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

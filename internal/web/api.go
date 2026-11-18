@@ -3718,7 +3718,7 @@ func readFormFile(w http.ResponseWriter, r *http.Request, field string) (data []
 func normalizeInternationalNumber(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if !strings.HasPrefix(trimmed, "+") {
-		return "", errors.New("include the country code, e.g. +14155551234")
+		return "", errors.New("include the country code, e.g. +14155550105")
 	}
 	var digits strings.Builder
 	for _, r := range trimmed[1:] {
@@ -3732,7 +3732,7 @@ func normalizeInternationalNumber(raw string) (string, error) {
 	}
 	number := digits.String()
 	if len(number) < 8 || len(number) > 15 {
-		return "", errors.New("include the country code, e.g. +14155551234")
+		return "", errors.New("include the country code, e.g. +14155550105")
 	}
 	return "+" + number, nil
 }
@@ -3821,7 +3821,7 @@ func isGoogleNetworkError(err error) bool {
 
 // normalizeContactKey returns a stable dedup key for a contact entry. We
 // fold names case-insensitively and reduce phone numbers to digits-only so
-// that "+1 (650) 555-1234", "16505551234", and "650-555-1234" all collide.
+// that "+1 (650) 555-0116", "16505550116", and "650-555-0116" all collide.
 func normalizeContactKey(name, number string) string {
 	digits := make([]byte, 0, len(number))
 	for i := 0; i < len(number); i++ {
