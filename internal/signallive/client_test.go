@@ -1356,30 +1356,17 @@ func TestHandleReceiveOutputStoresIncomingSignalMessageFromSourceServiceID(t *te
 	}
 }
 
-// A line that is not JSON can never replay, so it is counted instead of
-// queued (it would stay pending forever and hold the recovery alert up), and
-// it still requests the recovery sync a malformed line always has.
-func TestHandleReceiveOutputCountsUnparseableSignalLineAndRequestsRecoverySync(t *testing.T) {
-	dataDir := t.TempDir()
-	store, err := db.New(filepath.Join(dataDir, "messages.db"))
-	if err != nil {
-		t.Fatalf("db.New(): %v", err)
-	}
-	defer store.Close()
-
-	bridge := &Bridge{
-		store:     store,
-		logger:    zerolog.Nop(),
-		configDir: t.TempDir(),
-	}
-
+// A bare fragment carries no envelope and can never replay: it is counted,
+// not queued (it would stay pending forever and hold the recovery alert up),
+// and requests no recovery sync.
+func TestHandleReceiveOutputCountsAFragmentWithoutQueueingOrSyncing(t *testing.T) {
+	bridge := &Bridge{logger: zerolog.Nop(), configDir: t.TempDir()}
 	originalRun := runSignalCLI
 	originalNow := now
 	defer func() {
 		runSignalCLI = originalRun
 		now = originalNow
 	}()
-
 	var syncCalls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		syncCalls.Add(1)
@@ -1387,24 +1374,65 @@ func TestHandleReceiveOutputCountsUnparseableSignalLineAndRequestsRecoverySync(t
 	}
 	now = func() time.Time { return time.UnixMilli(1700000000123) }
 
-	if err := bridge.handleReceiveOutput("+15551230000", []byte("{not json}\n")); err != nil {
+	if err := bridge.handleReceiveOutput("+15551230000", []byte("INFO  ReceiveHelper - synthetic\n{\n  {not json}\n")); err != nil {
 		t.Fatalf("handleReceiveOutput(): %v", err)
 	}
-
-	waitForCondition(t, 2*time.Second, func() bool {
-		return syncCalls.Load() == 1
-	})
-
 	if _, err := os.Stat(filepath.Join(bridge.configDir, "signal-receive-recovery.ndjson")); !os.IsNotExist(err) {
-		t.Fatalf("an unparseable line was queued for recovery (stat err %v)", err)
+		t.Fatalf("a fragment was queued for recovery (stat err %v)", err)
 	}
 	status := bridge.receiveRecoveryStatus()
-	if status == nil || status.PendingCount != 0 || status.UnparseableCount != 1 || status.LastUnparseableAt != 1700000000123 {
-		t.Fatalf("receive recovery status = %+v, want 0 pending and 1 unparseable", status)
+	if status == nil || status.PendingCount != 0 || status.FragmentCount != 2 || status.LastFragmentAt != 1700000000123 || status.TruncatedCount != 0 {
+		t.Fatalf("receive recovery status = %+v, want 0 pending and 2 fragments", status)
 	}
-	if snap := bridge.Status(); snap.HistorySync == nil || !snap.HistorySync.Running {
-		t.Fatalf("expected running history sync after recovery request, got %+v", snap.HistorySync)
+	if got := syncCalls.Load(); got != 0 {
+		t.Fatalf("a fragment requested %d recovery syncs, want none", got)
 	}
+}
+
+// A cut-off envelope was already acknowledged by signal-cli, so it is kept as
+// evidence of a lost message and still requests the recovery sync, but no
+// replay can parse it, so it is not pending.
+func TestHandleReceiveOutputKeepsATruncatedEnvelopeOutsideThePendingCount(t *testing.T) {
+	bridge := &Bridge{logger: zerolog.Nop(), configDir: t.TempDir()}
+	originalRun := runSignalCLI
+	originalNow := now
+	defer func() {
+		runSignalCLI = originalRun
+		now = originalNow
+	}()
+	var syncCalls atomic.Int32
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		syncCalls.Add(1)
+		return []byte("ok"), nil
+	}
+	now = func() time.Time { return time.UnixMilli(1700000000123) }
+
+	truncated := `{"account":"+15551230000","envelope":{"timestamp":17000000`
+	if err := bridge.handleReceiveOutput("+15551230000", []byte(truncated+"\n")); err != nil {
+		t.Fatalf("handleReceiveOutput(): %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return syncCalls.Load() == 1 })
+	check := func(stage string) {
+		t.Helper()
+		status := bridge.receiveRecoveryStatus()
+		if status == nil || status.PendingCount != 0 || status.TruncatedCount != 1 || status.LastTruncatedAt != 1700000000123 || status.FragmentCount != 0 {
+			t.Fatalf("%s: receive recovery status = %+v, want 0 pending and 1 truncated", stage, status)
+		}
+		recoveryLog, err := os.ReadFile(bridge.receiveRecoveryPath())
+		if err != nil {
+			t.Fatalf("%s: ReadFile(recovery): %v", stage, err)
+		}
+		var record signalReceiveRecoveryRecord
+		if err := json.Unmarshal(bytes.TrimSpace(recoveryLog), &record); err != nil {
+			t.Fatalf("%s: json.Unmarshal(recovery): %v", stage, err)
+		}
+		if record.Reason != receiveRecoveryReasonTruncated || record.Raw != truncated || record.Account != "+15551230000" || record.Error == "" {
+			t.Fatalf("%s: recovery record = %+v", stage, record)
+		}
+	}
+	check("queued")
+	bridge.replayReceiveRecoveryQueue("+15551230000")
+	check("after replay")
 }
 
 func TestHandleReceiveOutputIgnoresNonJSONSignalCLIOutput(t *testing.T) {

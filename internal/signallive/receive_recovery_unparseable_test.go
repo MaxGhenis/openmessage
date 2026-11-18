@@ -25,16 +25,16 @@ func TestHandleReceiveOutputQueuesJSONThatIsNotAReceivePayload(t *testing.T) {
 		t.Fatalf("handleReceiveOutput(): %v", err)
 	}
 	status := bridge.receiveRecoveryStatus()
-	if status == nil || status.PendingCount != 1 || status.UnparseableCount != 0 || status.LastIssueReason != "unmarshal_failed" {
+	if status == nil || status.PendingCount != 1 || status.FragmentCount != 0 || status.TruncatedCount != 0 || status.LastIssueReason != "unmarshal_failed" {
 		t.Fatalf("receive recovery status = %+v, want 1 pending unmarshal_failed", status)
 	}
 }
 
-// The six records in the live queue (2026-11-07 and 2026-11-16) are bare "{"
+// The six records in the live queue (2026-11-06 and 2026-11-16) are bare "{"
 // lines queued as unmarshal_failed by earlier versions. They count as
-// unparseable, not pending, so the watchdog's pending_count >= 5 alert stops;
+// fragments, not pending, so the watchdog's pending_count >= 5 alert stops;
 // the next replay drops them and keeps the count; a real record stays.
-func TestRecoveryQueueTreatsQueuedLoneBraceRecordsAsUnparseable(t *testing.T) {
+func TestRecoveryQueueTreatsQueuedLoneBraceRecordsAsFragments(t *testing.T) {
 	bridge := &Bridge{logger: zerolog.Nop(), configDir: t.TempDir()}
 	var lines []string
 	for _, ts := range []int64{1794024497148, 1794024497148, 1794024500344, 1794024500344, 1794866014779, 1794866014779} {
@@ -57,8 +57,8 @@ func TestRecoveryQueueTreatsQueuedLoneBraceRecordsAsUnparseable(t *testing.T) {
 		t.Helper()
 		status := bridge.receiveRecoveryStatus()
 		if status == nil || status.PendingCount != 1 || status.LastIssueAt != 1794000000000 || status.LastIssueReason != "unmarshal_failed" ||
-			status.UnparseableCount != 6 || status.LastUnparseableAt != 1794866014779 {
-			t.Fatalf("%s: receive recovery status = %+v, want 1 pending and 6 unparseable", stage, status)
+			status.FragmentCount != 6 || status.LastFragmentAt != 1794866014779 || status.TruncatedCount != 0 {
+			t.Fatalf("%s: receive recovery status = %+v, want 1 pending and 6 fragments", stage, status)
 		}
 	}
 	check("before replay")
@@ -88,12 +88,28 @@ func TestReceiveOutputHasEnvelopesIgnoresFragments(t *testing.T) {
 		{name: "log lines only", output: "INFO starting\nWARN slow\n"},
 		{name: "pretty-printed object", output: "{\n  \"error\" : \"synthetic\"\n}\n"},
 		{name: "lone brace", output: "{\n"},
-		{name: "cut-off line", output: `{"envelope":{"timest` + "\n"},
+		{name: "indented brace", output: "  {\n"},
+		{name: "cut-off envelope", output: `{"envelope":{"timest` + "\n", want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := receiveOutputHasEnvelopes([]byte(tc.output)); got != tc.want {
 				t.Fatalf("receiveOutputHasEnvelopes() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReceiveLineShapeNamesLinesWithoutText(t *testing.T) {
+	for line, want := range map[string]string{
+		"WARN  ReceiveHelper - synthetic text":                 "WARN ReceiveHelper",
+		"ERROR SignalWebSocket - synthetic text":               "ERROR SignalWebSocket",
+		"at org.example.Synthetic.method(Synthetic.java:1)":    "at org.example.Synthetic.method",
+		"Caused by: org.example.SyntheticException: some text": "Caused by: org.example.SyntheticException",
+		`{"envelope":{}}`:                  "json",
+		"synthetic free text +15551230000": "text",
+	} {
+		if got := receiveLineShape([]byte(line)); got != want {
+			t.Errorf("receiveLineShape(%q) = %q, want %q", line, got, want)
+		}
 	}
 }
