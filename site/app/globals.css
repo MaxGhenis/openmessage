@@ -13,6 +13,7 @@
   --muted: #566176;
   --line: #d9dfea;
   --line-strong: #b9c2d3;
+  --field-border: #848ea3;
   --yours: #2f4fe0;
   --on-yours: #ffffff;
   --yours-tint: #e6ebff;
@@ -45,6 +46,7 @@
     --muted: #9aa8c0;
     --line: #1e2a40;
     --line-strong: #32405a;
+    --field-border: #64728f;
     --yours: #93a6ff;
     --on-yours: #09111c;
     --yours-tint: #1a2550;
@@ -60,6 +62,7 @@
   --muted: #9aa8c0;
   --line: #1e2a40;
   --line-strong: #32405a;
+  --field-border: #64728f;
   --yours: #93a6ff;
   --on-yours: #09111c;
   --yours-tint: #1a2550;
@@ -146,10 +149,12 @@ p {
   text-wrap: pretty;
 }
 
+/* Links keep the text color; the underline carries the cue, at 3:1 or more
+   against --paper and --surface in both themes. */
 a {
   color: inherit;
   text-decoration-line: underline;
-  text-decoration-color: var(--line-strong);
+  text-decoration-color: var(--muted);
   text-decoration-thickness: 1px;
   text-underline-offset: 0.2em;
 }
@@ -238,6 +243,7 @@ pre,
 
 .masthead__inner {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
@@ -261,6 +267,7 @@ pre,
 
 .nav {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: clamp(0.25rem, 1.6vw, 1.25rem);
 }
@@ -272,9 +279,19 @@ pre,
   text-decoration: none;
 }
 
-.nav__link:hover,
-.nav__link[aria-current="page"] {
+.nav__link:hover {
   color: var(--ink);
+}
+
+/* Ink and --muted differ by under 3:1, so the current section also gets an
+   underline. "page" marks the Blog index, "true" a post inside it. */
+.nav__link[aria-current="page"],
+.nav__link[aria-current="true"] {
+  color: var(--ink);
+  text-decoration-line: underline;
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.3em;
 }
 
 .icon-btn {
@@ -327,6 +344,21 @@ pre,
   }
 }
 
+/* At 320px (WCAG reflow width) the full row needs about 340px. Drop the
+   GitHub icon, which the footer repeats, and shrink the wordmark so the
+   row fits in 280px; flex-wrap on the row and the nav covers the rest. */
+@media (max-width: 24rem) {
+  .nav__repo {
+    display: none;
+  }
+  .masthead__inner {
+    gap: 0.5rem;
+  }
+  .wordmark {
+    font-size: 1rem;
+  }
+}
+
 /* ---------- Buttons ---------- */
 
 .btn {
@@ -347,9 +379,15 @@ pre,
   cursor: pointer;
 }
 
-.btn:disabled {
+/* A button that is busy (the waitlist form while it sends) keeps focus, so it
+   takes aria-disabled rather than the disabled attribute. */
+.btn[aria-disabled="true"] {
   opacity: 0.6;
-  cursor: default;
+  cursor: progress;
+}
+
+.btn--quiet[aria-disabled="true"]:hover {
+  border-color: var(--line-strong);
 }
 
 .btn svg {
@@ -490,6 +528,16 @@ pre,
   color: var(--paper);
 }
 
+/* Forced colors replace the fill above with the same system color on every
+   tab, so the selected tab takes the system highlight instead. */
+@media (forced-colors: active) {
+  .routes__tab[aria-selected="true"] {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+  }
+}
+
 .thread {
   display: flex;
   flex-direction: column;
@@ -541,6 +589,16 @@ pre,
   max-height: 34rem;
   overflow-y: auto;
   tab-size: 2;
+}
+
+/* .readers__frame clips overflow, and .result and .thread sit flush with its
+   edges, so their focus rings draw inside the pane. */
+.result:focus-visible {
+  outline-offset: -3px;
+}
+
+.thread:focus-visible {
+  outline-offset: -3px;
 }
 
 .result__line {
@@ -638,6 +696,21 @@ pre,
   }
   .section__head {
     position: static;
+  }
+}
+
+/* On short viewports (400% zoom, landscape phones) a sticky masthead would
+   cover a third of the screen, so it scrolls away with the page. This block
+   comes after .masthead, html and .section__head so it overrides them. */
+@media (max-height: 30rem) {
+  .masthead {
+    position: static;
+  }
+  html {
+    scroll-padding-top: 1rem;
+  }
+  .section__head {
+    top: 1rem;
   }
 }
 
@@ -906,7 +979,9 @@ pre,
   min-height: 2.75rem;
   padding: 0.6rem 0.9rem;
   background: var(--surface);
-  border: 1px solid var(--line-strong);
+  /* The fill barely differs from the page, so the border marks the field:
+     --field-border holds 3:1 against --surface and --paper in both themes. */
+  border: 1px solid var(--field-border);
   border-radius: 999px;
   color: var(--ink);
   font: inherit;

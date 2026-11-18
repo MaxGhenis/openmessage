@@ -5,7 +5,17 @@ import { DOWNLOAD_PATH, REPO_URL } from "../data/facts";
 import { Logo } from "./logo";
 import { ThemeToggle } from "./theme-toggle";
 
-export function SiteHeader() {
+// `current` names the section a page belongs to. On the Blog index the Blog
+// link points at the page itself ("page"); on a post it points at the section
+// that holds the post ("true").
+function blogCurrent(current) {
+  if (current === "blog") {
+    return "page";
+  }
+  return current === "post" ? "true" : undefined;
+}
+
+export function SiteHeader({ current }) {
   return (
     <header className="masthead">
       <div className="wrap masthead__inner">
@@ -23,14 +33,14 @@ export function SiteHeader() {
           <Link className="nav__link nav__link--wide" href="/#status">
             Status
           </Link>
-          <Link className="nav__link nav__link--wide" href="/blog">
+          <Link className="nav__link nav__link--wide" href="/blog" aria-current={blogCurrent(current)}>
             Blog
           </Link>
-          <a className="icon-btn" href={REPO_URL} rel="noopener" aria-label="OpenMessage on GitHub">
+          <a className="icon-btn nav__repo" href={REPO_URL} rel="noopener" aria-label="OpenMessage on GitHub">
             <IconBrandGithub stroke={1.7} aria-hidden="true" />
           </a>
           <ThemeToggle />
-          <a className="btn btn--yours btn--small" href={`${DOWNLOAD_PATH}?source=site_header`}>
+          <a className="btn btn--yours btn--small" href={DOWNLOAD_PATH}>
             Download
           </a>
         </nav>
