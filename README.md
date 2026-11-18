@@ -286,4 +286,4 @@ Debugging a live install (failing sends, re-pairing, the two-data-dir gotcha, si
 
 ## License
 
-MIT
+See [LICENSE](LICENSE).
