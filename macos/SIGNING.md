@@ -62,11 +62,13 @@ A green run can publish a DMG that Gatekeeper rejects: step 4 warns instead of
 failing, and `build.sh` skips notarization without failing when the job lacks
 an `AC_*` secret. With neither `MACOS_CERT_P12_BASE64` nor `DEVELOPER_ID`, the
 job ships an ad-hoc-signed DMG and skips the Gatekeeper check. Check the
-published DMG yourself (see "Verifying"). If it fails, fix the secret and
-re-run the tag's release run (`gh run rerun <run-id> --repo
-MaxGhenis/openmessage`): the publish job uploads every file again with
-`--clobber` and regenerates `SHA256SUMS`. Don't replace the DMG by hand,
-because `SHA256SUMS` would no longer match it.
+published DMG yourself (see "Verifying"). If it fails, fix the secret, then
+either cut a new tag or re-run the original run within 30 days
+(`gh run rerun <run-id> --repo MaxGhenis/openmessage`). A re-run builds the
+same commit and tag, and its publish job uploads every file again with
+`--clobber`, regenerates `SHA256SUMS` and rewrites the release notes. Check
+the DMG again afterwards. Don't replace the DMG by hand, because
+`SHA256SUMS` would no longer match it.
 
 ## Secrets
 
