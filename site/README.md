@@ -50,7 +50,7 @@ vercel deploy --scope max-ghenis-projects                             # preview
 vercel deploy --prod --scope max-ghenis-projects                      # production
 ```
 
-Only production deployments store anything: the API routes check `VERCEL_ENV` before they touch Blob, and previews get no Blob token. Previews built before 2026-11-18 still carry production's token and run older code, so never submit the email form or POST a heartbeat on a preview.
+Only production deployments store anything: the API routes touch Blob only when `VERCEL_ENV` is `production`, and previews get no Blob token. A local `next dev` stores nothing either, since a default `vercel env pull` sets no `VERCEL_ENV`. Previews built before 2026-11-18 still carry production's token and run older code, so never submit the email form or POST a heartbeat on a preview.
 
 ## Server routes
 
@@ -62,11 +62,11 @@ Only production deployments store anything: the API routes check `VERCEL_ENV` be
 
 Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes (Production and Development only), `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist.
 
-To read the release-email list:
+To read the release-email list (the production pull goes to a file `next dev` doesn't load, and `.gitignore` covers it):
 
 ```bash
-vercel env pull .env.local --environment production --scope max-ghenis-projects
-bun --env-file=.env.local scripts/read-waitlist.mjs
+vercel env pull .env.waitlist.local --environment production --scope max-ghenis-projects
+bun --env-file=.env.waitlist.local scripts/read-waitlist.mjs
 ```
 
 The site sets no cookies and loads no analytics. Fonts are downloaded at build time and served from this origin.

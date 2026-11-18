@@ -20,7 +20,7 @@ import {
 } from "../lib/public-writes.mjs";
 
 const KEY_HEX = "11".repeat(32);
-const ENV = { BLOB_READ_WRITE_TOKEN: "test-token", WAITLIST_ENCRYPTION_KEY: KEY_HEX };
+const ENV = { BLOB_READ_WRITE_TOKEN: "test-token", WAITLIST_ENCRYPTION_KEY: KEY_HEX, VERCEL_ENV: "production" };
 const T0 = Date.parse("2026-10-23T12:00:00Z");
 const INSTALL = "0123456789abcdef0123456789abcdef";
 
@@ -197,20 +197,19 @@ function forbiddenBlob() {
   return { calls, put: record("put"), list: record("list") };
 }
 
-test("canStore: only production, or no VERCEL_ENV at all, with a token", () => {
-  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t" }), true, "outside Vercel the token decides");
-  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: "" }), true);
+test("canStore: only a production deployment with a token", () => {
   assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: "production" }), true);
-  for (const vercelEnv of ["preview", "development", "Production", "staging"]) {
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t" }), false, "a development pull sets no VERCEL_ENV");
+  for (const vercelEnv of ["", "preview", "development", "Production", "staging"]) {
     assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: vercelEnv }), false, vercelEnv);
   }
   assert.equal(canStore({ VERCEL_ENV: "production" }), false, "no token, no storage");
   assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "", VERCEL_ENV: "production" }), false);
 });
 
-test("a preview or development deployment never reads or writes Blob, even with production's token", async () => {
+test("outside production nothing reads or writes Blob, even with production's token", async () => {
   const beat = { schema_version: 1, install_id: INSTALL };
-  for (const VERCEL_ENV of ["preview", "development"]) {
+  for (const VERCEL_ENV of ["preview", "development", undefined]) {
     const blob = forbiddenBlob();
     const env = { ...ENV, VERCEL_ENV };
     assert.deepEqual(await handleHeartbeat(post(beat), deps(blob, { env })), { status: 200, body: { ok: true, persisted: false } });
@@ -230,7 +229,7 @@ test("a preview or development deployment never reads or writes Blob, even with 
 // shape reaches Blob, and every heartbeat that would have been stored gets
 // the same "don't retry" answer the app gets when storage is off.
 test("no request reaches Blob outside production (property)", async () => {
-  const vercelEnv = fc.string({ minLength: 1, maxLength: 12 }).filter((value) => value !== "production");
+  const vercelEnv = fc.oneof(fc.constant(undefined), fc.string({ maxLength: 12 }).filter((value) => value !== "production"));
   const heartbeat = fc.record({
     schema_version: fc.constantFrom(1, 2),
     install_id: fc.oneof(fc.stringMatching(/^[0-9a-f]{32}$/), fc.string({ maxLength: 40 })),

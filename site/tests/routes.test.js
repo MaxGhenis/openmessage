@@ -43,6 +43,7 @@ beforeEach(() => {
   list.mockReset();
   list.mockResolvedValue({ blobs: [], hasMore: false });
   process.env.BLOB_READ_WRITE_TOKEN = "test-token";
+  process.env.VERCEL_ENV = "production";
   process.env.WAITLIST_ENCRYPTION_KEY = KEY;
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -157,9 +158,10 @@ describe("POST /api/waitlist", () => {
     });
   });
 
-  test("on a preview or development deployment, refuses sign-ups and never touches Blob", async () => {
-    for (const vercelEnv of ["preview", "development"]) {
-      process.env.VERCEL_ENV = vercelEnv;
+  test("outside production (a preview, vercel dev, a plain next dev) refuses sign-ups and never touches Blob", async () => {
+    for (const vercelEnv of ["preview", "development", null]) {
+      if (vercelEnv) process.env.VERCEL_ENV = vercelEnv;
+      else delete process.env.VERCEL_ENV;
       const response = await waitlistPost(post({ email: "a@b.co", interest: "" }));
       expect(response.status).toBe(503);
     }
@@ -225,11 +227,11 @@ describe("/api/heartbeat", () => {
 
   test("GET reports the schema version the shipped client sends, and whether this deployment stores", async () => {
     expect(await (await heartbeatGet()).json()).toEqual({ ok: true, schema_version: 1, persists: true });
-    process.env.VERCEL_ENV = "production";
-    expect((await (await heartbeatGet()).json()).persists).toBe(true);
     process.env.VERCEL_ENV = "preview";
     expect(await (await heartbeatGet()).json()).toEqual({ ok: true, schema_version: 1, persists: false });
     delete process.env.VERCEL_ENV;
+    expect((await (await heartbeatGet()).json()).persists).toBe(false);
+    process.env.VERCEL_ENV = "production";
     delete process.env.BLOB_READ_WRITE_TOKEN;
     expect((await (await heartbeatGet()).json()).persists).toBe(false);
   });
@@ -336,9 +338,10 @@ describe("/api/heartbeat", () => {
     expect(await response.json()).toEqual({ ok: true, persisted: false });
     expect(put).not.toHaveBeenCalled();
   });
-  test("on a preview or development deployment, stores nothing even with production's token", async () => {
-    for (const vercelEnv of ["preview", "development"]) {
-      process.env.VERCEL_ENV = vercelEnv;
+  test("outside production (a preview, vercel dev, a plain next dev) stores nothing even with production's token", async () => {
+    for (const vercelEnv of ["preview", "development", null]) {
+      if (vercelEnv) process.env.VERCEL_ENV = vercelEnv;
+      else delete process.env.VERCEL_ENV;
       const response = await heartbeatPost(post(heartbeat));
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ ok: true, persisted: false });

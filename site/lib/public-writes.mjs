@@ -35,16 +35,17 @@ const allowedInterests = new Set(["", "mac-app", "whatsapp", "signal", "mcp", "g
 const UNCONFIGURED = "The site can't take sign-ups right now. Email max@maxghenis.com instead.";
 const PAUSED = "The site has stopped taking sign-ups for today. Email max@maxghenis.com instead.";
 
-// True when this deployment may write to Blob. Only production stores
-// anything: a preview, or `vercel dev`, can carry production's
-// BLOB_READ_WRITE_TOKEN, and a POST there would otherwise write into
-// production's store. Vercel sets VERCEL_ENV to "production", "preview" or
-// "development"; when it names anything but production, the routes store
-// nothing, whatever token the deployment carries. Outside Vercel (tests, a
-// plain `next dev`) VERCEL_ENV is unset and the token alone decides.
+// True when this deployment may write to Blob: it has a token and Vercel
+// runs it as production. A preview, `vercel dev`, or a local `next dev`
+// whose .env.local came from a default `vercel env pull` can all carry
+// production's BLOB_READ_WRITE_TOKEN, and a POST there would otherwise write
+// into production's store. Vercel sets VERCEL_ENV to "production" only on
+// production deployments (this project exposes system env vars), and to
+// "preview" or "development" elsewhere; a development pull leaves it unset.
+// GET /api/heartbeat reports the result, so a deploy that loses it shows
+// "persists": false.
 export function canStore(env) {
-  if (!env.BLOB_READ_WRITE_TOKEN) return false;
-  return !env.VERCEL_ENV || env.VERCEL_ENV === "production";
+  return Boolean(env.BLOB_READ_WRITE_TOKEN) && env.VERCEL_ENV === "production";
 }
 
 export function isValidEmail(value) {
