@@ -447,9 +447,9 @@ func TestMergeConversationIDs(t *testing.T) {
 		t.Fatalf("seed raw conversation: %v", err)
 	}
 	if err := store.UpsertConversation(&Conversation{
-		ConversationID: "whatsapp:14699991654@s.whatsapp.net",
+		ConversationID: "whatsapp:14695550142@s.whatsapp.net",
 		Name:           "Jamie Rivera",
-		Participants:   `[{"name":"Jamie Rivera","number":"+14699991654"}]`,
+		Participants:   `[{"name":"Jamie Rivera","number":"+14695550142"}]`,
 		LastMessageTS:  2000,
 		UnreadCount:    0,
 		SourcePlatform: "whatsapp",
@@ -475,14 +475,14 @@ func TestMergeConversationIDs(t *testing.T) {
 		t.Fatalf("seed raw draft: %v", err)
 	}
 
-	if err := store.MergeConversationIDs("whatsapp:raw@lid", "whatsapp:14699991654@s.whatsapp.net"); err != nil {
+	if err := store.MergeConversationIDs("whatsapp:raw@lid", "whatsapp:14695550142@s.whatsapp.net"); err != nil {
 		t.Fatalf("MergeConversationIDs(): %v", err)
 	}
 
 	if _, err := store.GetConversation("whatsapp:raw@lid"); err == nil {
 		t.Fatal("expected raw conversation to be deleted")
 	}
-	convo, err := store.GetConversation("whatsapp:14699991654@s.whatsapp.net")
+	convo, err := store.GetConversation("whatsapp:14695550142@s.whatsapp.net")
 	if err != nil {
 		t.Fatalf("GetConversation(): %v", err)
 	}
@@ -499,18 +499,18 @@ func TestMergeConversationIDs(t *testing.T) {
 		t.Fatal("favorite state should survive conversation merge")
 	}
 
-	msgs, err := store.GetMessagesByConversation("whatsapp:14699991654@s.whatsapp.net", 10)
+	msgs, err := store.GetMessagesByConversation("whatsapp:14695550142@s.whatsapp.net", 10)
 	if err != nil {
 		t.Fatalf("GetMessagesByConversation(): %v", err)
 	}
-	if len(msgs) != 1 || msgs[0].ConversationID != "whatsapp:14699991654@s.whatsapp.net" {
+	if len(msgs) != 1 || msgs[0].ConversationID != "whatsapp:14695550142@s.whatsapp.net" {
 		t.Fatalf("messages after merge = %#v", msgs)
 	}
-	drafts, err := store.ListDrafts("whatsapp:14699991654@s.whatsapp.net")
+	drafts, err := store.ListDrafts("whatsapp:14695550142@s.whatsapp.net")
 	if err != nil {
 		t.Fatalf("ListDrafts(): %v", err)
 	}
-	if len(drafts) != 1 || drafts[0].ConversationID != "whatsapp:14699991654@s.whatsapp.net" {
+	if len(drafts) != 1 || drafts[0].ConversationID != "whatsapp:14695550142@s.whatsapp.net" {
 		t.Fatalf("drafts after merge = %#v", drafts)
 	}
 }

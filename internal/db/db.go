@@ -216,8 +216,8 @@ INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m8a','conv8','Alex Thompson','+17185552222','Found that restaurant we were talking about - it is called Nopa',1738929600000,'delivered',0,'','','','','','sms','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m8b','conv8','Me','+15551234567','Nice find! Let us go next week',1738936800000,'delivered',1,'','','','','','sms','');
 
-INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa1','Jordan Rivera',0,'[{"name":"Jordan Rivera","number":"+14699991654"}]',1738959600000,0,'whatsapp');
-INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('conv9','Jordan Rivera',0,'[{"name":"Jordan Rivera","number":"+14699991654"}]',1738959000000,0,'sms');
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa1','Jordan Rivera',0,'[{"name":"Jordan Rivera","number":"+14695550142"}]',1738959600000,0,'whatsapp');
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('conv9','Jordan Rivera',0,'[{"name":"Jordan Rivera","number":"+14695550142"}]',1738959000000,0,'sms');
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa2','Weekend Plans',1,'[{"name":"Mia Torres","number":"+12025557777"},{"name":"Noah Patel","number":"+13105558888"}]',1738957200000,0,'whatsapp');
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa3','Mia Torres',0,'[{"name":"Mia Torres","number":"+12025557777"}]',1738950000000,0,'whatsapp');
 
@@ -254,20 +254,20 @@ INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender
 
 -- Jordan Rivera — WhatsApp thread. Casual side of the relationship: photos
 -- from a Lisbon trip, where they're eating tonight, asking about dessert.
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1a','wa1','Jordan Rivera','+14699991654','just landed! Lisbon was unreal',1738867200000,'delivered',0,'','','','','','whatsapp','');
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1b','wa1','Jordan Rivera','+14699991654','the Alfama photo is for you specifically',1738867500000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1a','wa1','Jordan Rivera','+14695550142','just landed! Lisbon was unreal',1738867200000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1b','wa1','Jordan Rivera','+14695550142','the Alfama photo is for you specifically',1738867500000,'delivered',0,'','','','','','whatsapp','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1c','wa1','Me','+15551234567','that light 😍 welcome back. dinner this week?',1738871100000,'delivered',1,'','','','','','whatsapp','');
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1d','wa1','Jordan Rivera','+14699991654','thursday works. you pick the place',1738876800000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1d','wa1','Jordan Rivera','+14695550142','thursday works. you pick the place',1738876800000,'delivered',0,'','','','','','whatsapp','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1e','wa1','Me','+15551234567','Nopa. 7:30. they have that short-rib thing you liked',1738884600000,'delivered',1,'','','','','','whatsapp','');
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1f','wa1','Jordan Rivera','+14699991654','sold. sending you the menu in case WhatsApp is easier than their pdf',1738955400000,'delivered',0,'','','','','','whatsapp','');
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1g','wa1','Jordan Rivera','+14699991654','also: want me to bring dessert or are we doing their olive oil cake situation?',1738959600000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1f','wa1','Jordan Rivera','+14695550142','sold. sending you the menu in case WhatsApp is easier than their pdf',1738955400000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa1g','wa1','Jordan Rivera','+14695550142','also: want me to bring dessert or are we doing their olive oil cake situation?',1738959600000,'delivered',0,'','','','','','whatsapp','');
 
 -- Jordan Rivera — SMS thread. Day-of logistics that hop to SMS because it
 -- works when someone's on airplane wifi / data-only / just faster. Short,
 -- transactional.
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m9a','conv9','Jordan Rivera','+14699991654','we still on for 7:30?',1738950000000,'delivered',0,'','','','','','sms','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m9a','conv9','Jordan Rivera','+14695550142','we still on for 7:30?',1738950000000,'delivered',0,'','','','','','sms','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m9b','conv9','Me','+15551234567','yes. running 10 min late',1738951200000,'delivered',1,'','','','','','sms','');
-INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m9c','conv9','Jordan Rivera','+14699991654','no rush, just got a table',1738952400000,'delivered',0,'','','','','','sms','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m9c','conv9','Jordan Rivera','+14695550142','no rush, just got a table',1738952400000,'delivered',0,'','','','','','sms','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('m9d','conv9','Me','+15551234567','walking up now',1738959000000,'delivered',1,'','','','','','sms','');
 
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa2a','wa2','Mia Torres','+12025557777','Should we do brunch or dinner Saturday?',1738951200000,'delivered',0,'','','','','','whatsapp','');
@@ -288,7 +288,7 @@ INSERT OR IGNORE INTO contacts VALUES('c4','David Kim','+14085557890');
 INSERT OR IGNORE INTO contacts VALUES('c5','Lisa Rodriguez','+12025551111');
 INSERT OR IGNORE INTO contacts VALUES('c6','Alex Thompson','+17185552222');
 INSERT OR IGNORE INTO contacts VALUES('c7','Rachel Green','+16505553333');
-INSERT OR IGNORE INTO contacts VALUES('c8','Jordan Rivera','+14699991654');
+INSERT OR IGNORE INTO contacts VALUES('c8','Jordan Rivera','+14695550142');
 INSERT OR IGNORE INTO contacts VALUES('c9','Mia Torres','+12025557777');
 INSERT OR IGNORE INTO contacts VALUES('c10','Noah Patel','+13105558888');
 INSERT OR IGNORE INTO contacts VALUES('c11','Priya Shah','b2b98e48-2222-4000-a000-000000000002');
@@ -301,7 +301,7 @@ INSERT OR IGNORE INTO contacts VALUES('c12','Theo Nakamura','d4d98e48-4444-4000-
 INSERT OR IGNORE INTO unified_contacts (unified_id, display_name, identifiers) VALUES(
   'u-jordan',
   'Jordan Rivera',
-  '[{"platform":"sms","value":"+14699991654"},{"platform":"whatsapp","value":"+14699991654"},{"platform":"signal","value":"a1a98e48-1111-4000-a000-000000000001"}]'
+  '[{"platform":"sms","value":"+14695550142"},{"platform":"whatsapp","value":"+14695550142"},{"platform":"signal","value":"a1a98e48-1111-4000-a000-000000000001"}]'
 );
 
 INSERT OR IGNORE INTO drafts VALUES('draft1','conv3','Count me in for Saturday! Lands End trail looks clear — 62°F and sunny. Want me to bring snacks?',1738961000000);
