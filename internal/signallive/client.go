@@ -15,11 +15,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -112,15 +114,61 @@ func (v signalCLIVersion) String() string {
 }
 
 // receiveOutputHasEnvelopes reports whether a receive call's output holds any
-// line processReceiveLine would treat as an envelope (it skips everything that
-// does not start with '{', such as signal-cli's log lines).
+// line processReceiveLine would treat as an envelope. It skips signal-cli's
+// log lines and bare fragments (see receiveLineFragment), so a call that
+// printed only "{" delivered nothing. A cut-off envelope still counts: it
+// shows signal-cli was writing one.
 func receiveOutputHasEnvelopes(output []byte) bool {
 	for _, line := range bytes.Split(output, []byte("\n")) {
-		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' {
+		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' && !receiveLineFragment(line) {
 			return true
 		}
 	}
 	return false
+}
+
+// receiveLineFragment reports whether a trimmed receive line that starts with
+// '{' is a bare fragment: not JSON, and with no quote or colon, so it holds no
+// key or value. A lone "{" is one. It cannot carry an envelope, so skipping it
+// loses nothing, and no replay can ever parse it. Six such lines, written in
+// same-millisecond pairs on 2026-11-06 and 2026-11-16, held the recovery
+// alert up; what prints them is not known (signal-cli's receive output and
+// logging do not).
+func receiveLineFragment(line []byte) bool {
+	return !json.Valid(line) && !bytes.ContainsAny(line, `":`)
+}
+
+// receiveLineTruncated reports whether a trimmed receive line that starts with
+// '{' is not JSON but carries keys or values: most likely an envelope cut off
+// or interleaved while signal-cli wrote it. signal-cli had already
+// acknowledged that envelope to the server, so the line is kept as evidence
+// of a lost message; no replay can parse it, so it is not pending.
+func receiveLineTruncated(line []byte) bool {
+	return !json.Valid(line) && bytes.ContainsAny(line, `":`)
+}
+
+const receiveRecoveryReasonTruncated = "truncated_envelope"
+
+var (
+	signalLogLinePrefix   = regexp.MustCompile(`^(TRACE|DEBUG|INFO|WARN|ERROR)\s+([A-Za-z0-9_$.]+)\s+-`)
+	signalStackLinePrefix = regexp.MustCompile(`^(at|Caused by:)\s+([A-Za-z0-9_$.]+)`)
+)
+
+// receiveLineShape names the kind of a receive output line without any of its
+// text: "<LEVEL> <logger>" for a signal-cli log line, "at <frame>" or
+// "Caused by: <class>" for a stack trace line, else json or text. Logged next
+// to a skipped fragment, it can name the fragment's writer.
+func receiveLineShape(line []byte) string {
+	if match := signalLogLinePrefix.FindSubmatch(line); match != nil {
+		return string(match[1]) + " " + string(match[2])
+	}
+	if match := signalStackLinePrefix.FindSubmatch(line); match != nil {
+		return string(match[1]) + " " + string(match[2])
+	}
+	if len(line) > 0 && line[0] == '{' {
+		return "json"
+	}
+	return "text"
 }
 
 func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
@@ -423,6 +471,14 @@ type ReceiveRecoveryStatus struct {
 	PendingCount    int    `json:"pending_count"`
 	LastIssueAt     int64  `json:"last_issue_at,omitempty"`
 	LastIssueReason string `json:"last_issue_reason,omitempty"`
+	// FragmentCount counts bare fragments (see receiveLineFragment) skipped
+	// since this process started, plus any earlier versions left in the queue
+	// file. TruncatedCount counts queued cut-off envelopes (see
+	// receiveLineTruncated). Neither is pending: no replay can parse them.
+	FragmentCount   int   `json:"fragment_count,omitempty"`
+	LastFragmentAt  int64 `json:"last_fragment_at,omitempty"`
+	TruncatedCount  int   `json:"truncated_count,omitempty"`
+	LastTruncatedAt int64 `json:"last_truncated_at,omitempty"`
 }
 
 type QRSnapshot struct {
@@ -497,6 +553,12 @@ type Bridge struct {
 	}
 	lastReceiveRecoveryAt int64
 	lastTmpSweep          time.Time
+
+	// receiveFragments and lastReceiveFragmentAt count the bare fragments
+	// receiveLineFragment rejects. They are atomics because replay counts
+	// them while it holds recoveryMu.
+	receiveFragments      atomic.Int64
+	lastReceiveFragmentAt atomic.Int64
 
 	// wg tracks background goroutines (link, receive loop, metadata refresh,
 	// sweeps, sync requests) so Close can wait for them to finish. Without
@@ -2246,11 +2308,33 @@ func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
 	failures := parseAttachmentDownloadFailures(output)
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	// A skipped fragment is logged with the shape of the lines around it
+	// (receiveLineShape: log level and logger, never text), so the next one
+	// can name what writes it.
+	var fragments []int
+	before := "start"
+	logFragments := func(after string) {
+		for _, size := range fragments {
+			b.logger.Warn().Int("bytes", size).Str("before", before).Str("after", after).
+				Msg("Skipped a Signal receive fragment that is not JSON")
+		}
+		fragments = fragments[:0]
+	}
 	for scanner.Scan() {
+		if line := bytes.TrimSpace(scanner.Bytes()); len(line) > 0 {
+			if line[0] == '{' && receiveLineFragment(line) {
+				fragments = append(fragments, len(line))
+			} else {
+				shape := receiveLineShape(line)
+				logFragments(shape)
+				before = shape
+			}
+		}
 		if _, err := b.processReceiveLineWithFailures(account, scanner.Bytes(), true, failures); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
 	}
+	logFragments("end")
 	if err := scanner.Err(); err != nil {
 		// Leave the WAL in place — startup drain will retry.
 		return err
@@ -2388,7 +2472,16 @@ func (b *Bridge) processReceiveLineWithFailures(
 	}
 	payloadAccount, env, err := ParseReceiveEnvelope(account, line)
 	if err != nil {
-		if allowRecovery {
+		switch {
+		case receiveLineFragment(line):
+			// Queued, it would stay pending forever and hold the recovery
+			// alert up. It carries no envelope, so a recovery sync would
+			// recover nothing: count it and move on.
+			b.noteReceiveFragments(1, now().UnixMilli())
+			return true, nil
+		case allowRecovery && receiveLineTruncated(line):
+			b.recordReceiveRecoveryIssue(account, line, receiveRecoveryReasonTruncated, err)
+		case allowRecovery:
 			b.recordReceiveRecoveryIssue(account, line, "unmarshal_failed", err)
 		}
 		return false, nil
@@ -2473,10 +2566,42 @@ func ParseReceiveEnvelope(fallbackAccount string, line []byte) (string, Envelope
 	return payloadAccount, env, nil
 }
 
+func (b *Bridge) noteReceiveFragments(count int, atMS int64) {
+	if count <= 0 {
+		return
+	}
+	b.receiveFragments.Add(int64(count))
+	for {
+		last := b.lastReceiveFragmentAt.Load()
+		if atMS <= last || b.lastReceiveFragmentAt.CompareAndSwap(last, atMS) {
+			return
+		}
+	}
+}
+
+// recoveryRecordFragment and recoveryRecordTruncated classify a queued
+// record's line as receiveLineFragment and receiveLineTruncated do. Versions
+// before them queued both as unmarshal_failed.
+func recoveryRecordFragment(record signalReceiveRecoveryRecord) bool {
+	line := bytes.TrimSpace([]byte(record.Raw))
+	return len(line) > 0 && line[0] == '{' && receiveLineFragment(line)
+}
+
+func recoveryRecordTruncated(record signalReceiveRecoveryRecord) bool {
+	line := bytes.TrimSpace([]byte(record.Raw))
+	return len(line) > 0 && line[0] == '{' && receiveLineTruncated(line)
+}
+
 func (b *Bridge) recordReceiveRecoveryIssue(account string, rawLine []byte, reason string, err error) {
 	if err := b.appendReceiveRecoveryRecord(account, rawLine, reason, err); err != nil {
 		b.logger.Warn().Err(err).Str("reason", reason).Msg("Failed to quarantine Signal receive payload")
 	}
+	b.triggerReceiveRecoverySync(account, reason)
+}
+
+// triggerReceiveRecoverySync asks the primary device for a sync, at most once
+// per receiveRecoveryWindow.
+func (b *Bridge) triggerReceiveRecoverySync(account, reason string) {
 	if !b.shouldTriggerReceiveRecovery() {
 		return
 	}
@@ -2544,6 +2669,8 @@ func (b *Bridge) replayReceiveRecoveryQueue(account string) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	remaining := make([][]byte, 0)
 	recovered := 0
+	dropped := 0
+	var lastDroppedAt int64
 	for scanner.Scan() {
 		recordLine := bytes.TrimSpace(scanner.Bytes())
 		if len(recordLine) == 0 {
@@ -2552,6 +2679,13 @@ func (b *Bridge) replayReceiveRecoveryQueue(account string) {
 		var record signalReceiveRecoveryRecord
 		if err := json.Unmarshal(recordLine, &record); err != nil {
 			remaining = append(remaining, append([]byte(nil), recordLine...))
+			continue
+		}
+		if recoveryRecordFragment(record) {
+			// It can never replay and carries no envelope; keep it only as
+			// a count. A truncated record stays, as evidence.
+			dropped++
+			lastDroppedAt = max(lastDroppedAt, record.TimestampMS)
 			continue
 		}
 		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
@@ -2572,6 +2706,10 @@ func (b *Bridge) replayReceiveRecoveryQueue(account string) {
 	if err := rewriteRecoveryQueue(path, remaining); err != nil {
 		b.logger.Warn().Err(err).Msg("Failed to rewrite Signal receive recovery queue")
 		return
+	}
+	if dropped > 0 {
+		b.noteReceiveFragments(dropped, lastDroppedAt)
+		b.logger.Info().Int("dropped", dropped).Msg("Dropped Signal recovery records that are bare fragments")
 	}
 	if recovered > 0 {
 		b.logger.Debug().Int("recovered", recovered).Msg("Replayed Signal recovery payloads")
@@ -2619,32 +2757,44 @@ func (b *Bridge) receiveRecoveryStatus() *ReceiveRecoveryStatus {
 	}
 	b.recoveryMu.Lock()
 	defer b.recoveryMu.Unlock()
-	raw, err := os.ReadFile(b.receiveRecoveryPath())
-	if err != nil {
-		return nil
+	status := &ReceiveRecoveryStatus{
+		FragmentCount:  int(b.receiveFragments.Load()),
+		LastFragmentAt: b.lastReceiveFragmentAt.Load(),
 	}
-	scanner := bufio.NewScanner(bytes.NewReader(raw))
-	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	status := &ReceiveRecoveryStatus{}
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		status.PendingCount++
-		var record signalReceiveRecoveryRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			if status.LastIssueAt == 0 && status.LastIssueReason == "" {
-				status.LastIssueReason = "invalid_record"
+	if raw, err := os.ReadFile(b.receiveRecoveryPath()); err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(raw))
+		scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+		for scanner.Scan() {
+			line := bytes.TrimSpace(scanner.Bytes())
+			if len(line) == 0 {
+				continue
 			}
-			continue
-		}
-		if record.TimestampMS >= status.LastIssueAt {
-			status.LastIssueAt = record.TimestampMS
-			status.LastIssueReason = strings.TrimSpace(record.Reason)
+			var record signalReceiveRecoveryRecord
+			if err := json.Unmarshal(line, &record); err != nil {
+				status.PendingCount++
+				if status.LastIssueAt == 0 && status.LastIssueReason == "" {
+					status.LastIssueReason = "invalid_record"
+				}
+				continue
+			}
+			switch {
+			case recoveryRecordFragment(record):
+				status.FragmentCount++
+				status.LastFragmentAt = max(status.LastFragmentAt, record.TimestampMS)
+				continue
+			case recoveryRecordTruncated(record):
+				status.TruncatedCount++
+				status.LastTruncatedAt = max(status.LastTruncatedAt, record.TimestampMS)
+				continue
+			}
+			status.PendingCount++
+			if record.TimestampMS >= status.LastIssueAt {
+				status.LastIssueAt = record.TimestampMS
+				status.LastIssueReason = strings.TrimSpace(record.Reason)
+			}
 		}
 	}
-	if status.PendingCount == 0 {
+	if status.PendingCount == 0 && status.FragmentCount == 0 && status.TruncatedCount == 0 {
 		return nil
 	}
 	return status
