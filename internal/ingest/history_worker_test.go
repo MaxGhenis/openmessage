@@ -1360,7 +1360,7 @@ func TestHistoryWorkerRepeatedCatchUpIsIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // (i) Registration
 
-func TestHistoryWorkerRegistrationIsGoogleOnly(t *testing.T) {
+func TestHistoryWorkerRegistrationIsGoogleAndSignalOnly(t *testing.T) {
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
 	if err != nil {
 		t.Fatalf("sqlite.Open(): %v", err)
@@ -1382,20 +1382,38 @@ func TestHistoryWorkerRegistrationIsGoogleOnly(t *testing.T) {
 		return WorkerConfig{Store: store, Messages: messages, Reactions: reactions, Decoders: registrations}
 	}
 
-	for _, platform := range []bridge.Platform{bridge.PlatformWhatsApp, bridge.PlatformSignal} {
-		t.Run(string(platform), func(t *testing.T) {
+	// Google catch-ups and the Signal Desktop archive feed history.
+	for _, platform := range []bridge.Platform{bridge.PlatformGoogle, bridge.PlatformSignal} {
+		t.Run("accepts/"+string(platform), func(t *testing.T) {
+			const codec = "test.hwt.history"
+			worker, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder, History: true}))
+			if err != nil {
+				t.Fatalf("NewWorker(History on %s) error = %v", platform, err)
+			}
+			if !worker.decoders[codec].history {
+				t.Fatalf("NewWorker(History on %s) registered a live codec", platform)
+			}
+		})
+	}
+	// WhatsApp history needs placement rules this worker does not have, and an
+	// unknown platform has none at all.
+	for _, platform := range []bridge.Platform{bridge.PlatformWhatsApp, "telegram"} {
+		t.Run("rejects/"+string(platform), func(t *testing.T) {
 			const codec = "test.hwt.history"
 			_, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder, History: true}))
-			want := fmt.Sprintf("history codec %q is only supported for %q", codec, bridge.PlatformGoogle)
+			want := fmt.Sprintf("history codec %q is only supported for %q and %q", codec, bridge.PlatformGoogle, bridge.PlatformSignal)
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("NewWorker(History on %s) error = %v, want %q", platform, err, want)
 			}
-			// Control: the same registration without History is valid, so the
-			// rejection is about history, not the platform or codec.
-			if _, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder})); err != nil {
-				t.Fatalf("NewWorker(live %s) error = %v", platform, err)
-			}
 		})
+	}
+	// Control: the same WhatsApp registration without History is valid, so the
+	// rejection is about history, not the platform or codec.
+	if _, err := NewWorker(config(DecoderRegistration{Codec: "test.hwt.history", Platform: bridge.PlatformWhatsApp, Decoder: decoder})); err != nil {
+		t.Fatalf("NewWorker(live whatsapp) error = %v", err)
+	}
+	if _, err := NewWorker(config(NewSignalDesktopHistoryDecoderRegistration())); err != nil {
+		t.Fatalf("NewWorker(Signal Desktop history codec): %v", err)
 	}
 
 	worker, err := NewWorker(config(hwtRegistrations(&Counters{})...))
@@ -1425,8 +1443,8 @@ const (
 var (
 	hwtPropRosters     = [][]string{{hwtKarl, hwtShoshana}, {hwtShoshana, hwtAda}, {hwtKarl, hwtAda}}
 	hwtPropStaleRoster = []string{hwtAda, hwtBea}
-	hwtPropReactors = []string{hwtKarl, hwtShoshana, hwtAda}
-	hwtPropEmoji    = []string{"👍", "❤️", "😂"}
+	hwtPropReactors    = []string{hwtKarl, hwtShoshana, hwtAda}
+	hwtPropEmoji       = []string{"👍", "❤️", "😂"}
 )
 
 type hwtPropReaction struct{ Emoji, Actor string }
