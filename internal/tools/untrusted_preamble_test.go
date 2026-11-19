@@ -262,6 +262,10 @@ var preambleModes = []preambleMode{
 		name: "v2-outbox",
 		setup: func(t *testing.T) (*app.App, Options, map[string]map[string]any) {
 			harness := newV2ToolHarness(t)
+			// Reads come from the legacy store, but the outbox's v2 store
+			// holds sender messages too, so a send result that quoted its
+			// v2 thread would carry the marker.
+			seedUntrustedV2Conversation(t, harness.deps.V2Store)
 			deps := harness.deps
 			return harness.app, Options{Reads: harness.app.Store, V2: &deps}, nil
 		},
@@ -433,6 +437,9 @@ func seedUntrustedV2Conversation(t *testing.T, store *sqlite.Store) {
 		return time.Date(year, month, day, hour, minute, 0, 0, time.UTC).UnixMilli()
 	}
 	nowMS := time.Now().UnixMilli()
+	// Remote thread IDs equal the conversation IDs, as v2wire.MirrorConversation
+	// writes them, so the outbox's mirror finds these rows instead of
+	// colliding with them.
 	if err := store.UpsertAccount(sqlite.Account{
 		AccountID: preambleV2Account, BridgeKey: "google_messages", DisplayName: "Google",
 		Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}", CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
@@ -441,12 +448,12 @@ func seedUntrustedV2Conversation(t *testing.T, store *sqlite.Store) {
 	}
 	for _, conversation := range []sqlite.Conversation{
 		{
-			ConversationID: preambleConversationID, AccountID: preambleV2Account, RemoteConversationID: "remote-preamble-alice",
+			ConversationID: preambleConversationID, AccountID: preambleV2Account, RemoteConversationID: preambleConversationID,
 			Kind: sqlite.ConversationKindDirect, NotificationMode: sqlite.NotificationModeAll, MetadataJSON: "{}",
 			LastMessageAtMS: at(2025, time.June, 1, 9, 0), CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
 		},
 		{
-			ConversationID: preambleGroupConversationID, AccountID: preambleV2Account, RemoteConversationID: "remote-preamble-group",
+			ConversationID: preambleGroupConversationID, AccountID: preambleV2Account, RemoteConversationID: preambleGroupConversationID,
 			Kind: sqlite.ConversationKindGroup, Title: "Preamble group", NotificationMode: sqlite.NotificationModeAll,
 			MetadataJSON: "{}", CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
 		},
@@ -468,11 +475,13 @@ func seedUntrustedV2Conversation(t *testing.T, store *sqlite.Store) {
 			t.Fatalf("UpsertIdentity(%s): %v", identity.IdentityID, err)
 		}
 	}
-	if err := store.ReplaceConversationParticipants(preambleConversationID, []sqlite.ConversationParticipant{
-		{AccountID: preambleV2Account, ConversationID: preambleConversationID, IdentityID: selfID, Role: sqlite.ParticipantRoleMember, IsActive: true},
-		{AccountID: preambleV2Account, ConversationID: preambleConversationID, IdentityID: aliceID, Role: sqlite.ParticipantRoleMember, IsActive: true},
-	}); err != nil {
-		t.Fatalf("ReplaceConversationParticipants(): %v", err)
+	for _, conversationID := range []string{preambleConversationID, preambleGroupConversationID} {
+		if err := store.ReplaceConversationParticipants(conversationID, []sqlite.ConversationParticipant{
+			{AccountID: preambleV2Account, ConversationID: conversationID, IdentityID: selfID, Role: sqlite.ParticipantRoleMember, IsActive: true},
+			{AccountID: preambleV2Account, ConversationID: conversationID, IdentityID: aliceID, Role: sqlite.ParticipantRoleMember, IsActive: true},
+		}); err != nil {
+			t.Fatalf("ReplaceConversationParticipants(%s): %v", conversationID, err)
+		}
 	}
 	messages, err := sqlite.NewMessageRepository(store, time.Now)
 	if err != nil {
@@ -490,8 +499,18 @@ func seedUntrustedV2Conversation(t *testing.T, store *sqlite.Store) {
 			Body:         untrustedMarker + " a year later " + preambleV2Source,
 			OccurredAtMS: at(2025, time.June, 1, 9, 0),
 		},
+		// The group the group send lands in holds a sender's message too, so
+		// a send result that quoted its thread would carry the marker.
+		{
+			MessageID: "preamble-v2-group-in-1", RemoteMessageID: "remote-preamble-v2-group-in-1",
+			ConversationID: preambleGroupConversationID,
+			Body:           untrustedMarker + " in the group " + preambleV2Source,
+			OccurredAtMS:   at(2025, time.May, 1, 9, 0),
+		},
 	} {
-		message.ConversationID = preambleConversationID
+		if message.ConversationID == "" {
+			message.ConversationID = preambleConversationID
+		}
 		message.AccountID = preambleV2Account
 		message.SenderIdentityID = &sender
 		message.Direction = sqlite.MessageDirectionIncoming
