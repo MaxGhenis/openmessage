@@ -1,5 +1,10 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { PHASE_PRODUCTION_BUILD } from "next/constants.js";
+
+import { productionBuildProblem } from "./lib/deploy-checks.mjs";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,4 +39,13 @@ const nextConfig = {
   }
 };
 
-export default nextConfig;
+// A production build stops if it would ship a promise the deployment can't
+// keep (lib/deploy-checks.mjs).
+export default function config(phase) {
+  if (phase === PHASE_PRODUCTION_BUILD) {
+    const vercelConfig = JSON.parse(readFileSync(path.join(dirname, "vercel.json"), "utf8"));
+    const problem = productionBuildProblem(process.env, vercelConfig);
+    if (problem) throw new Error(problem);
+  }
+  return nextConfig;
+}
