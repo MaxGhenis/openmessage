@@ -184,6 +184,13 @@ pre,
   font-variant-ligatures: none;
 }
 
+/* Paths such as ~/Library/Caches/com.openmessage.app have no spaces. Let
+   inline code break inside a word rather than widen a narrow screen. break-word
+   leaves a table cell's minimum width alone, so tables scroll instead. */
+:not(pre) > code {
+  overflow-wrap: break-word;
+}
+
 ::selection {
   background: var(--yours-tint);
   color: var(--ink);

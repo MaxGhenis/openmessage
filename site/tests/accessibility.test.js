@@ -110,6 +110,12 @@ describe("browser toolbar color", () => {
   });
 });
 
+describe("narrow screens", () => {
+  test("inline code breaks inside a long path instead of widening the page", () => {
+    expect(block(":not(pre) > code")).toMatch(/overflow-wrap:\s*break-word;/);
+  });
+});
+
 describe("masthead", () => {
   test("the row and the nav wrap rather than overflow", () => {
     expect(block(".masthead__inner")).toMatch(/flex-wrap:\s*wrap/);
