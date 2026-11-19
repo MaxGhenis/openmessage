@@ -1,9 +1,11 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -263,8 +265,63 @@ func textResult(text string) *mcp.CallToolResult {
 	return mcp.NewToolResultText(text)
 }
 
+// untrustedWarningKey names the structured-content field that carries the
+// untrusted-content warning.
+const untrustedWarningKey = "untrusted_content_warning"
+
+// structuredResult returns text plus a structured payload. A payload that
+// sets contains_untrusted_text also carries the warning itself, first:
+// some MCP clients, Claude Code among them, give the model only the
+// structured content and drop the text block that starts with
+// messagePreamble.
 func structuredResult(structured any, text string) *mcp.CallToolResult {
+	if payload, ok := structured.(map[string]any); ok && payload["contains_untrusted_text"] == true {
+		warned := make(warnedPayload, len(payload)+1)
+		for key, value := range payload {
+			warned[key] = value
+		}
+		warned[untrustedWarningKey] = strings.TrimSpace(messagePreamble)
+		structured = warned
+	}
 	return mcp.NewToolResultStructured(structured, text)
+}
+
+// warnedPayload is a structured payload that carries message text. It
+// marshals like a map (keys sorted) except that untrustedWarningKey comes
+// first, so a reader of the JSON meets the warning before any message text.
+type warnedPayload map[string]any
+
+func (p warnedPayload) MarshalJSON() ([]byte, error) {
+	keys := make([]string, 0, len(p))
+	for key := range p {
+		if key != untrustedWarningKey {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	if _, ok := p[untrustedWarningKey]; ok {
+		keys = append([]string{untrustedWarningKey}, keys...)
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, key := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		name, err := json.Marshal(key)
+		if err != nil {
+			return nil, err
+		}
+		value, err := json.Marshal(p[key])
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(name)
+		buf.WriteByte(':')
+		buf.Write(value)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 // formatMessageBody returns the display text for a message, annotating media
