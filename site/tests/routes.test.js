@@ -164,7 +164,7 @@ describe("POST /api/waitlist", () => {
     put.mockClear();
     const limited = await waitlistPost(post({ email: "late@b.co", interest: "" }, { address }));
     expect(limited.status).toBe(429);
-    expect((await limited.json()).error).toBe("Your IP address has reached the sign-up limit. Try again later.");
+    expect((await limited.json()).error).toBe("Your IP address has reached the sign-up limit. Try again in 10 minutes.");
     expect(put).not.toHaveBeenCalled();
     // Another address is unaffected.
     expect((await waitlistPost(post({ email: "late@b.co", interest: "" }))).status).toBe(200);

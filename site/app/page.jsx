@@ -29,8 +29,8 @@ import { formatDate, getLatestRelease, releaseCopy } from "../lib/release";
 import { clockTime, parseTranscript } from "../lib/transcript";
 import appScreenshot from "../public/screens/app-demo-sms.png";
 
-// Re-check GitHub for the latest release at most once an hour.
-export const revalidate = 3600;
+// Re-check GitHub for the latest release at most every five minutes.
+export const revalidate = 300;
 
 const ROUTE_LABELS = { sms: "SMS", whatsapp: "WhatsApp", signal: "Signal" };
 const DEMO_PERSON = DEMO_ARGS.name;
@@ -168,7 +168,7 @@ export default async function HomePage() {
                   <h3>One call spans a person&rsquo;s networks</h3>
                   <p>
                     <code>get_person_messages</code> takes a name and looks through your 1,000 most
-                    recent conversations, groups included, for ones whose name or participant list
+                    recent conversations, including groups, for ones whose name or participant list
                     contains it. By default it returns the oldest 50 messages across those
                     conversations, whatever the network. <code>person_stats</code> summarizes that
                     person&rsquo;s one-to-one history.

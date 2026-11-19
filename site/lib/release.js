@@ -10,7 +10,9 @@ import { RELEASE, REPO } from "../data/facts.js";
 
 const API = `https://api.github.com/repos/${REPO}`;
 const HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
-const REVALIDATE_SECONDS = 3600;
+// Short, so the page names the release the button serves within minutes of a
+// new one; the button itself always follows GitHub's latest release.
+const REVALIDATE_SECONDS = 300;
 
 export const FALLBACK_RELEASE = {
   tag: RELEASE.tag,

@@ -65,8 +65,9 @@ export default function GoogleMessagesPost() {
       </p>
       <Receipts ids={["googleRefresh", "supervisorBackoff"]} />
       <p>
-        It also compares each network&rsquo;s silence with its own recent traffic and flags a
-        network that has gone quiet for longer than that history explains.
+        The code on <code>main</code> also compares each network&rsquo;s silence with its own
+        recent traffic and flags a network that has gone quiet for longer than that history
+        explains.
       </p>
       <Receipts ids={["silenceDefaults", "statusSilence"]} />
     </Post>

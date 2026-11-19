@@ -10,11 +10,11 @@ export default function WhatsAppPost() {
   return (
     <Post
       slug={slug}
-      lead={`OpenMessage connects to WhatsApp as a linked device, from a session on your Mac. Version ${RELEASE.version} syncs new messages, receipts and the history WhatsApp sends a newly linked device.`}
+      lead={`OpenMessage connects to WhatsApp as a linked device on your Mac. Version ${RELEASE.version} syncs new messages, receipts and the history WhatsApp sends a newly linked device.`}
     >
       <h2>A linked device on your Mac</h2>
       <p>
-        You scan the QR code OpenMessage shows with WhatsApp on your phone, as you would for
+        OpenMessage shows a QR code, and you scan it with WhatsApp on your phone, as you would for
         WhatsApp Web. OpenMessage
         then holds its own linked-device session through whatsmeow, an open-source library that
         WhatsApp does not support. OpenMessage keeps the session&rsquo;s keys in their own SQLite

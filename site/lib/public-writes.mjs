@@ -171,7 +171,12 @@ export async function handleWaitlist(request, { put, list, env, allow, now = Dat
     return { status: 400, body: { error: "Invalid interest selection." } };
   }
   if (!allow(clientAddress(request))) {
-    return { status: 429, body: { error: "Your IP address has reached the sign-up limit. Try again later." } };
+    return {
+      status: 429,
+      body: {
+        error: `Your IP address has reached the sign-up limit. Try again in ${WAITLIST.perAddress.windowMs / 60_000} minutes.`,
+      },
+    };
   }
 
   const key = Buffer.from(env.WAITLIST_ENCRYPTION_KEY || "", "hex");

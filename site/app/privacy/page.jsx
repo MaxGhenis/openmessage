@@ -66,14 +66,14 @@ export default function PrivacyPage() {
             <li>Any files your agent saved elsewhere.</li>
           </ul>
           <p>
-            Then clear the notifications that show message text from Notification Center. The app
-            posts some itself, and its server posts others through{" "}
+            Then, in Notification Center, clear the notifications that show your message text.
+            The app posts some itself, and its server posts others through{" "}
             <code>terminal-notifier</code> or AppleScript.
           </p>
           <p>
             None of this touches the messages on your phone or any other device you have linked.
-            It also leaves OpenMessage linked to your accounts: unlink it in WhatsApp, Signal and
-            Google Messages on your phone, where Signal lists it as &ldquo;OpenMessage&rdquo;.
+            To finish, unlink OpenMessage in WhatsApp, Signal and Google Messages on your phone.
+            Signal lists it as &ldquo;OpenMessage&rdquo;.
           </p>
           <Receipts
             ids={[
@@ -187,10 +187,10 @@ export default function PrivacyPage() {
           <p>
             If you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>, this site stores
             one record per install per day: the install ID, version, operating system, CPU type,
-            which networks you have paired, and the time it arrived. It stores no IP address and
-            no message data. The app picks the install ID at random and keeps it from day to day,
-            so the records link an install&rsquo;s days together without naming anyone. The site
-            keeps them until I delete them.
+            which networks you have paired, and the time the report arrived. It stores no IP
+            address and no message data. The app picks the install ID at random and keeps it from
+            day to day, so the records link an install&rsquo;s days together without naming
+            anyone. The site keeps them until I delete them.
           </p>
 
           <h2>What this site collects</h2>
