@@ -36,6 +36,9 @@ func testApp(t *testing.T) *app.App {
 
 func structuredMap(t *testing.T, result *mcp.CallToolResult) map[string]any {
 	t.Helper()
+	if warned, ok := result.StructuredContent.(warnedPayload); ok {
+		return map[string]any(warned)
+	}
 	payload, ok := result.StructuredContent.(map[string]any)
 	if !ok {
 		t.Fatalf("expected structured content map, got %T", result.StructuredContent)

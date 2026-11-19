@@ -123,6 +123,33 @@ func receiveOutputHasEnvelopes(output []byte) bool {
 	return false
 }
 
+// receiveFailureOutput is a failed receive call's output without the
+// envelopes it printed. signal-cli prints each received message as one JSON
+// line, and a call can print some before it fails; those lines carry bodies
+// that senders wrote. The loop stores them through handleReceiveOutput. The
+// failure text, which becomes lastError (shown by get_status and
+// /api/status) and the poller's error and goes to the logs, keeps only
+// signal-cli's own diagnostics. A line cut off mid-write still starts with
+// '{', so it is left out too. The account-invalid and poison matchers still
+// read the whole output.
+func receiveFailureOutput(output []byte) []byte {
+	lines := bytes.Split(output, []byte("\n"))
+	kept := lines[:0:0]
+	for _, line := range lines {
+		if strings.HasPrefix(sanitizeSignalOutput(string(line)), "{") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return bytes.Join(kept, []byte("\n"))
+}
+
+// receiveFailureError is the error a failed receive call reports, without
+// the envelopes it printed (see receiveFailureOutput).
+func receiveFailureError(err error, output []byte) error {
+	return commandError("receive Signal messages", err, receiveFailureOutput(output))
+}
+
 func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 	if len(bytes.TrimSpace(output)) != 0 {
 		return false
@@ -1936,7 +1963,7 @@ func (b *Bridge) runReceiveLoop(
 					consecutivePoisonFailures = 0
 					lastPoisonFingerprint = ""
 					b.logger.Warn().
-						Err(commandError("receive Signal messages", err, output)).
+						Err(receiveFailureError(err, output)).
 						Int("confirmations", consecutiveAccountInvalid).
 						Int("required", receiveAccountInvalidLimit).
 						Msg("Signal receive reported an invalid account; retrying once before parking reauth")
@@ -1954,7 +1981,7 @@ func (b *Bridge) runReceiveLoop(
 				b.connected = false
 				b.connecting = false
 				b.needsReauth = true
-				b.lastError = cleanSignalCommandOutput(err, output)
+				b.lastError = cleanSignalCommandOutput(err, receiveFailureOutput(output))
 				b.logger.Warn().Str("account", b.account).Msg("Signal account needs re-pairing (signal-cli reports unregistered/unauthorized)")
 				b.mu.Unlock()
 				b.emitStatusChange()
@@ -1962,7 +1989,7 @@ func (b *Bridge) runReceiveLoop(
 					Kind:        PollerFailureReauth,
 					Operation:   "receive",
 					Fingerprint: SignalAccountInvalidFingerprint,
-					Err:         commandError("receive Signal messages", err, output),
+					Err:         receiveFailureError(err, output),
 				}
 			}
 			consecutiveAccountInvalid = 0
@@ -1977,7 +2004,7 @@ func (b *Bridge) runReceiveLoop(
 				consecutivePoisonFailures = 1
 			}
 			consecutiveFailures++
-			receiveErr := commandError("receive Signal messages", err, output)
+			receiveErr := receiveFailureError(err, output)
 			if consecutivePoisonFailures >= receivePoisonLimit {
 				detail := fmt.Sprintf(
 					"signal-cli repeatedly failed in IncomingMessageHandler.getSender() because content is null; upgrade signal-cli to %s or newer",
@@ -1999,7 +2026,7 @@ func (b *Bridge) runReceiveLoop(
 				}
 				b.connected = false
 				b.connecting = false
-				b.lastError = cleanSignalCommandOutput(err, output)
+				b.lastError = cleanSignalCommandOutput(err, receiveFailureOutput(output))
 				b.mu.Unlock()
 				b.emitStatusChange()
 				return PollerExit{
