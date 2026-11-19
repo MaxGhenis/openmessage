@@ -1,102 +1,254 @@
+import { Receipts } from "../../components/receipts";
 import { SiteFooter } from "../../components/site-footer";
 import { SiteHeader } from "../../components/site-header";
+import { RELEASE, REPO_URL } from "../../data/facts";
+import { pageMetadata } from "../../lib/metadata";
 
-export const metadata = {
-  title: "Privacy"
-};
+export const metadata = pageMetadata({
+  title: "Privacy",
+  description:
+    "Everything the OpenMessage app and this site send anywhere, and what stays on your Mac.",
+  path: "/privacy"
+});
+
+const UPDATED = "November 19, 2026";
 
 export default function PrivacyPage() {
   return (
-    <main className="min-h-screen">
-      <SiteHeader compact />
-
-      <section className="mx-auto max-w-[860px] px-6 py-18 lg:px-10">
-        <div className="article-copy">
-          <div className="eyebrow">Privacy policy</div>
-          <h1 className="mt-6 font-semibold tracking-[-0.065em]">Everything important stays on your machine.</h1>
-          <p className="max-w-[42rem] text-lg leading-8">
-            OpenMessage is built as a local-first messaging client. It does not require an
-            OpenMessage account and does not route your message store through
-            OpenMessage-operated servers. The marketing site may collect basic website analytics
-            if enabled, but that is separate from the product and never includes message content.
+    <>
+      <SiteHeader />
+      <main id="main" className="wrap">
+        <header className="page-head">
+          <h1>What OpenMessage does with your data</h1>
+          <p>
+            OpenMessage has no accounts and no server in the path of your messages.
           </p>
+          <p className="dateline">Updated {UPDATED}</p>
+        </header>
 
-          <div className="mt-8 inline-flex rounded-full border border-[var(--border)] bg-[color:rgba(13,23,40,0.8)] px-4 py-2 text-sm text-[var(--text-muted)]">
-            Last updated: April 11, 2026
+        <div className="prose">
+          <h2>What stays on your Mac</h2>
+          <p>
+            OpenMessage keeps your messages, contacts, drafts and search index in a SQLite
+            database, <code>messages.db</code>, in{" "}
+            <code>~/Library/Application Support/OpenMessage</code>. It keeps each network&rsquo;s
+            login in the same folder, outside the database. OpenMessage encrypts neither the
+            database nor the logins.
+          </p>
+          <Receipts
+            ids={[
+              "dataFolder",
+              "messagesDb",
+              "googleSessionFile",
+              "sessionFiles",
+              "signalConfigDir",
+              "plainOpen",
+              "googleSessionJson",
+              "whatsappSessionStore"
+            ]}
+          />
+
+          <h2>Deleting your data from your Mac</h2>
+          <p>To delete your messages and logins from your Mac, quit the app and remove:</p>
+          <ul>
+            <li>
+              <code>~/Library/Application Support/OpenMessage</code>, which holds the database
+              and logins.
+            </li>
+            <li>
+              <code>~/Library/Caches/com.openmessage.app</code>, where the app&rsquo;s window
+              caches the photos and other attachments it has shown you.
+            </li>
+            <li>
+              <code>~/.local/share/openmessage</code>, if you have run a command-line build. That
+              build keeps its data there, and the Mac app copies that build&rsquo;s database and
+              Google Messages login into its own folder without removing them.
+            </li>
+            <li>
+              Attachments the <code>download_media</code> tool saved, in files whose names start
+              with <code>openmessage-</code>. They sit in <code>/tmp</code>, or in{" "}
+              <code>$TMPDIR</code> if a command-line build ran the server.
+            </li>
+            <li>Any files your agent saved elsewhere.</li>
+          </ul>
+          <p>
+            Then, in Notification Center, clear the notifications that show your message text.
+            The app posts some itself, and its local server posts others through{" "}
+            <code>terminal-notifier</code> or AppleScript.
+          </p>
+          <p>
+            None of these steps touches the messages on your phone or any other device you have
+            linked. To finish, on your phone, unlink the device OpenMessage added in WhatsApp,
+            Signal and Google Messages. Signal lists it as &ldquo;OpenMessage&rdquo;.
+          </p>
+          <Receipts
+            ids={[
+              "appBundleId",
+              "mediaCache",
+              "cliDataDir",
+              "legacyCopy",
+              "downloadMediaTmp",
+              "appEnv",
+              "notificationBody",
+              "appServerNotifications",
+              "serverNotifier",
+              "signalDeviceName"
+            ]}
+          />
+
+          <h2>What the app sends, and where</h2>
+          <p>Version {RELEASE.version} of the app sends data to these places and no others.</p>
+          <div className="table-scroll">
+            <table className="ledger">
+              <thead>
+                <tr>
+                  <th scope="col">Goes to</th>
+                  <th scope="col">What</th>
+                  <th scope="col">When</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">Google, WhatsApp, Signal</th>
+                  <td data-label="What">
+                    The messages you send, the traffic that keeps the link up and brings in new
+                    messages, and an online status your WhatsApp contacts may see
+                  </td>
+                  <td data-label="When">While you have that network paired</td>
+                </tr>
+                <tr>
+                  <th scope="row">Sites your threads link to</th>
+                  <td data-label="What">
+                    Requests from your Mac for the first link in each message, any page it
+                    redirects to, and the preview image the page names, which another site may
+                    host. OpenMessage skips
+                    links whose own address is private or local
+                  </td>
+                  <td data-label="When">When you open a thread that contains a link</td>
+                </tr>
+                <tr>
+                  <th scope="row">Google Fonts</th>
+                  <td data-label="What">A request for the app&rsquo;s typeface</td>
+                  <td data-label="When">When the app window loads</td>
+                </tr>
+                <tr>
+                  <th scope="row">Anthropic</th>
+                  <td data-label="What">
+                    Up to 200 messages with their times and senders, plus the message count, date
+                    range and participants. They come from the conversation you named, or from
+                    the one-to-one conversations that match the name you gave
+                  </td>
+                  <td data-label="When">
+                    When you give <code>generate_story</code>, <code>generate_person_story</code> or{" "}
+                    <code>generate_viz</code> an Anthropic API key
+                  </td>
+                </tr>
+                <tr>
+                  <th scope="row">jsDelivr and Google Fonts</th>
+                  <td data-label="What">Requests for a chart library and fonts</td>
+                  <td data-label="When">
+                    When you open a page that <code>generate_viz</code> or <code>render_story</code>{" "}
+                    made
+                  </td>
+                </tr>
+                <tr>
+                  <th scope="row">The model behind your agent</th>
+                  <td data-label="What">
+                    Whatever the MCP tools return to your agent, which passes it to its model
+                  </td>
+                  <td data-label="When">When you connect an agent and it calls a tool</td>
+                </tr>
+                <tr>
+                  <th scope="row">openmessage.ai</th>
+                  <td data-label="What">
+                    A random install ID, the version, operating system, CPU type and which
+                    networks you have paired. No message data
+                  </td>
+                  <td data-label="When">
+                    When you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>. The Mac
+                    app does not set it
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
-
-          <h2>Summary</h2>
+          <Receipts
+            ids={[
+              "whatsappPresence",
+              "linkPreviewFirst",
+              "linkPreviewGuard",
+              "previewImage",
+              "uiFonts",
+              "storyApiKey",
+              "storySample",
+              "storyPrompt",
+              "vizTemplate",
+              "telemetryOptIn",
+              "appEnv",
+              "telemetryEndpoint"
+            ]}
+          />
           <p>
-            <strong>OpenMessage does not collect, transmit, or retain your message data on our
-            infrastructure.</strong> Message history, contacts, local search indexes, and transport
-            sessions stay on your device unless you explicitly forward content elsewhere.
+            If you grant access to macOS Contacts, the app shows contact photos, which it reads on
+            your Mac and sends nowhere.
           </p>
 
-          <h2>What data OpenMessage accesses</h2>
+          <h2>What this site keeps from install reports</h2>
+          <p>
+            If you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>, this site stores
+            one record per install per day: the install ID, version, operating system, CPU type,
+            which networks you have paired, and the time the report arrived. It stores no IP
+            address and no message data. The app picks the install ID at random and keeps it from
+            day to day, so the records link an install&rsquo;s days together without naming
+            anyone. The site keeps them until I delete them.
+          </p>
+
+          <h2>What this site collects</h2>
           <ul>
-            <li>Your message history, conversations, media, and metadata for connected transports such as Google Messages, WhatsApp, and Signal.</li>
-            <li>Contact names, numbers, and optional local contact photos if you grant macOS Contacts access.</li>
-            <li>Local session credentials needed to keep Google Messages, WhatsApp, and Signal paired.</li>
-            <li>Public URL metadata when link previews are enabled and a conversation contains a public link.</li>
+            <li>
+              The site sets no cookies and runs no analytics scripts. In your browser&rsquo;s local
+              storage it saves only your light or dark theme choice.
+            </li>
+            <li>
+              Vercel hosts the site, so each request you make, including your IP address, passes
+              through Vercel.
+            </li>
+            <li>
+              To limit abuse, the server counts sign-ups and install reports per IP address in
+              memory. It never writes the counts to storage, and they disappear when the server
+              instance restarts.
+            </li>
+            <li>
+              The download button redirects to GitHub, which counts downloads per release. The
+              site records nothing about the click.
+            </li>
+            <li>
+              If you leave an email address, the site encrypts it with AES-256-GCM before storing
+              it, and I use it only for OpenMessage release news. Email me at{" "}
+              <a href="mailto:max@maxghenis.com">max@maxghenis.com</a> and I&rsquo;ll delete it.
+            </li>
           </ul>
 
-          <h2>Where data is stored</h2>
-          <ul>
-            <li><strong>Messages and contacts:</strong> local SQLite databases in the app&apos;s Application Support directory.</li>
-            <li><strong>Transport sessions:</strong> local session files and local bridge stores used for reconnecting paired services.</li>
-            <li><strong>Media and previews:</strong> cached locally when downloaded or derived on your machine.</li>
-          </ul>
-
-          <h2>What data is transmitted</h2>
-          <ul>
-            <li><strong>To messaging providers:</strong> the minimum traffic required to send, receive, and pair with the connected services, using the same network surfaces those services already expose.</li>
-            <li><strong>To OpenMessage:</strong> nothing for message sync. We do not operate an OpenMessage cloud backend for your message history, contacts, or transport sessions.</li>
-            <li><strong>To AI tools:</strong> only when you choose to connect a local MCP client or send content to an external model provider from your own machine.</li>
-            <li><strong>For link previews:</strong> preview metadata is fetched directly from your device to the public URL. Private and localhost-style addresses are intentionally refused.</li>
-            <li><strong>For product updates:</strong> if you submit your email through the website&apos;s updates form, that address and your optional interest are stored as encrypted signup records in the site&apos;s Vercel project so OpenMessage can send product updates or tester invites.</li>
-            <li><strong>For website analytics:</strong> if Google Analytics is enabled on openmessage.ai, the marketing site may send pageview, referral, browser/device, and download-redirect events to Google. This applies to the website only, not the local messaging runtime.</li>
-          </ul>
-
-          <h2>Third-party services</h2>
+          <h2>The networks&rsquo; own policies</h2>
           <p>
-            OpenMessage talks to the messaging networks you choose to connect, such as Google
-            Messages, WhatsApp, and Signal. Their privacy policies still govern the underlying messaging
-            services themselves. OpenMessage does not add a separate OpenMessage-hosted data layer on top.
+            OpenMessage connects to accounts you already have with Google, WhatsApp and Signal,
+            and each company handles your messages under its own privacy policy.
           </p>
 
-          <h2>Notifications and diagnostics</h2>
-          <p>
-            Native notifications are generated locally on your device. Diagnostics and issue-report
-            exports are generated locally too; you decide whether to copy or share them.
-          </p>
-
-          <h2>Data deletion</h2>
-          <p>
-            Removing OpenMessage removes the app. To delete locally stored data, remove the app&apos;s
-            Application Support directory and any local bridge session stores. Your messages remain
-            with the underlying messaging services regardless of OpenMessage.
-          </p>
-
-          <h2>Changes to this policy</h2>
-          <p>
-            If this policy changes, the updated version will be posted here with a new date.
-            OpenMessage is open source, so the codebase remains the best canonical reference for
-            what the app actually does.
-          </p>
+          <h2>Changes</h2>
+          <p>I update the date whenever I change this policy.</p>
 
           <h2>Contact</h2>
           <p>
-            Questions about privacy or data handling can go to{" "}
-            <a href="mailto:max@maxghenis.com">max@maxghenis.com</a> or{" "}
-            <a href="https://github.com/MaxGhenis/openmessage/issues" target="_blank" rel="noreferrer">
-              the GitHub issue tracker
+            Write to <a href="mailto:max@maxghenis.com">max@maxghenis.com</a> or open an issue on{" "}
+            <a href={`${REPO_URL}/issues`} rel="noopener">
+              GitHub
             </a>
             .
           </p>
         </div>
-      </section>
-
+      </main>
       <SiteFooter />
-    </main>
+    </>
   );
 }

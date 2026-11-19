@@ -1,9 +1,4 @@
-macos/
-cmd/
-internal/
-*.db
-session.json
-.build/
-go.mod
-go.sum
-openmessages
+# openmessage.ai deploys from site/. A deploy from the repo root uploads only
+# vercel.json, whose build command fails with a pointer to site/.
+*
+!vercel.json

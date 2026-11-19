@@ -34,6 +34,7 @@ Use this before shipping a TestFlight/App Store build, public website update, or
 ## 5. Website And Storefront
 
 - Update website copy when launch-quality platform support changes.
+- After a release is published, move `site/data/facts.js` to the new tag (`RELEASE`, `MAIN_COMMIT`, the counts), run `bun run test` in `site/`, fix every receipt it flags, then update the copy and deploy from `site/` (see `site/README.md`). Until that lands, the homepage tells visitors it still describes the previous version.
 - Regenerate screenshots from sanitized demo data only.
 - Verify `openmessage.ai` and any deep links return 200 before announcing.
 - Confirm the App Store/TestFlight notes match the shipped platform support.
