@@ -4,8 +4,8 @@
 // (lib/public-writes.mjs), one per address per UTC day. This reads them back
 // with the same key and keeps each address's latest record.
 //
-//   vercel env pull .env.local --environment production --scope max-ghenis-projects
-//   bun --env-file=.env.local scripts/read-waitlist.mjs
+//   vercel env pull .env.waitlist.local --environment production --scope max-ghenis-projects
+//   bun --env-file=.env.waitlist.local scripts/read-waitlist.mjs
 //
 // It only reads. Output contains email addresses; keep it off shared screens.
 

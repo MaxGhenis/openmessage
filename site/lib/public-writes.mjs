@@ -3,7 +3,8 @@
 // each request could store a new object (the waitlist kept a fresh UUID path
 // per submission, and the heartbeat took any caller-chosen install id).
 //
-// Three layers:
+// Four layers:
+//  - deployment: only a production deployment stores anything (canStore);
 //  - request shape: a JSON Content-Type, a small body cap and strict field
 //    formats. A browser preflights a cross-site application/json request,
 //    and the routes answer no CORS headers, so another site can't use its
@@ -38,6 +39,21 @@ const UNCONFIGURED = "The site can't take sign-ups right now. Email max@maxgheni
 const PAUSED = "The site has stopped taking sign-ups for today. Email max@maxghenis.com instead.";
 // components/updates-form.jsx shows this, and falls back to the same text.
 export const WAITLIST_THANKS = "Thanks. I'll email you when a release ships.";
+
+// True when this deployment may write to Blob: it has a token and Vercel
+// runs it as production. A preview, `vercel dev`, or a local `next dev`
+// whose .env.local came from a default `vercel env pull` can all carry
+// production's BLOB_READ_WRITE_TOKEN, and a POST there would otherwise write
+// into production's store. Vercel sets VERCEL_ENV to "production" only on
+// production deployments (this project exposes system env vars), and to
+// "preview" or "development" elsewhere; a development pull leaves it unset.
+// A production pull writes VERCEL_ENV="production" too, which is why the
+// README sends that pull to .env.waitlist.local, a file `next dev` ignores.
+// GET /api/heartbeat reports the result, so a deploy that loses it shows
+// "persists": false.
+export function canStore(env) {
+  return Boolean(env.BLOB_READ_WRITE_TOKEN) && env.VERCEL_ENV === "production";
+}
 
 // Control and format characters (ESC, NUL, bidi overrides, zero-width
 // spaces) have no place in an address, and scripts/read-waitlist.mjs prints
@@ -180,8 +196,8 @@ export async function handleWaitlist(request, { put, list, env, allow, now = Dat
   }
 
   const key = Buffer.from(env.WAITLIST_ENCRYPTION_KEY || "", "hex");
-  if (!env.BLOB_READ_WRITE_TOKEN || key.length !== 32) {
-    log("Waitlist storage is not configured.");
+  if (!canStore(env) || key.length !== 32) {
+    log("Waitlist storage is not configured on this deployment.");
     return { status: 503, body: { error: UNCONFIGURED } };
   }
 
@@ -221,8 +237,8 @@ export async function handleHeartbeat(request, { put, list, env, allow, now = Da
   if (!allow(clientAddress(request))) {
     return { status: 429, body: { ok: false } };
   }
-  if (!env.BLOB_READ_WRITE_TOKEN) {
-    // No-op if not configured; respond OK so the app doesn't retry.
+  if (!canStore(env)) {
+    // Not configured, or not production: answer OK so the app doesn't retry.
     return { status: 200, body: { ok: true, persisted: false } };
   }
 

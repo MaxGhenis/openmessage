@@ -45,6 +45,7 @@ beforeEach(() => {
   list.mockReset();
   list.mockResolvedValue({ blobs: [], hasMore: false });
   process.env.BLOB_READ_WRITE_TOKEN = "test-token";
+  process.env.VERCEL_ENV = "production";
   process.env.WAITLIST_ENCRYPTION_KEY = KEY;
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -52,6 +53,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.BLOB_READ_WRITE_TOKEN;
   delete process.env.WAITLIST_ENCRYPTION_KEY;
+  delete process.env.VERCEL_ENV;
   vi.restoreAllMocks();
 });
 
@@ -182,6 +184,20 @@ describe("POST /api/waitlist", () => {
     });
   });
 
+  test("outside production (a preview, vercel dev, a next dev on a default pull) refuses sign-ups and never touches Blob", async () => {
+    for (const vercelEnv of ["preview", "development", null]) {
+      if (vercelEnv) process.env.VERCEL_ENV = vercelEnv;
+      else delete process.env.VERCEL_ENV;
+      const response = await waitlistPost(post({ email: "a@b.co", interest: "" }));
+      expect(response.status).toBe(503);
+    }
+    expect(put).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+    process.env.VERCEL_ENV = "production";
+    expect((await waitlistPost(post({ email: "a@b.co", interest: "" }))).status).toBe(200);
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
   test("answers 503 when storage is not configured, and 502 when the write fails", async () => {
     delete process.env.WAITLIST_ENCRYPTION_KEY;
     expect((await waitlistPost(post({ email: "a@b.co", interest: "" }))).status).toBe(503);
@@ -282,8 +298,15 @@ describe("/api/heartbeat", () => {
     schema_version: 1
   };
 
-  test("GET reports the schema version the shipped client sends", async () => {
-    expect(await (await heartbeatGet()).json()).toEqual({ ok: true, schema_version: 1 });
+  test("GET reports the schema version the shipped client sends, and whether this deployment stores", async () => {
+    expect(await (await heartbeatGet()).json()).toEqual({ ok: true, schema_version: 1, persists: true });
+    process.env.VERCEL_ENV = "preview";
+    expect(await (await heartbeatGet()).json()).toEqual({ ok: true, schema_version: 1, persists: false });
+    delete process.env.VERCEL_ENV;
+    expect((await (await heartbeatGet()).json()).persists).toBe(false);
+    process.env.VERCEL_ENV = "production";
+    delete process.env.BLOB_READ_WRITE_TOKEN;
+    expect((await (await heartbeatGet()).json()).persists).toBe(false);
   });
 
   test("stores one record per install per day and replaces it on a repeat", async () => {
@@ -411,6 +434,17 @@ describe("/api/heartbeat", () => {
     const response = await heartbeatPost(post(heartbeat));
     expect(await response.json()).toEqual({ ok: true, persisted: false });
     expect(put).not.toHaveBeenCalled();
+  });
+  test("outside production (a preview, vercel dev, a next dev on a default pull) stores nothing even with production's token", async () => {
+    for (const vercelEnv of ["preview", "development", null]) {
+      if (vercelEnv) process.env.VERCEL_ENV = vercelEnv;
+      else delete process.env.VERCEL_ENV;
+      const response = await heartbeatPost(post(heartbeat));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true, persisted: false });
+    }
+    expect(put).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
   });
 });
 

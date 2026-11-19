@@ -51,23 +51,23 @@ vercel deploy --scope max-ghenis-projects                             # preview
 vercel deploy --prod --scope max-ghenis-projects                      # production
 ```
 
-Previews share production's Blob store, so never submit the email form or POST a heartbeat on a preview.
+Only production deployments store anything: the API routes touch Blob only when `VERCEL_ENV` is `production`, and previews built since 2026-11-18 18:45 UTC get no Blob token. A local `next dev` whose `.env.local` came from a default `vercel env pull` stores nothing, since that pull sets no `VERCEL_ENV`. A production pull does set it, so never pull production into a file `next dev` loads (`.env`, `.env.local`, `.env.development` or `.env.development.local`), and delete any such file that contains `VERCEL_ENV="production"`: a later default pull keeps its keys. Three previews built on 2026-11-18 before 18:45 UTC still carry production's token and run code without this check, so never submit the email form or POST a heartbeat on any preview.
 
 ## Server routes
 
 | Route | Used by | Behavior |
 |---|---|---|
-| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. Answers 415 unless the Content-Type is `application/json`. `GET` returns `{"ok":true,"schema_version":1}`. |
+| `POST /api/heartbeat` | App processes started with `OPENMESSAGE_TELEMETRY=1` | Stores one record per install per UTC day. Answers 415 unless the Content-Type is `application/json`. `GET` returns `{"ok":true,"schema_version":1,"persists":true}`, with `persists` false on any deployment that would store nothing; an answer with no `persists` key comes from code without that check. |
 | `GET /download` | Download buttons and shared links | 307 to the disk image on the latest GitHub release. |
 | `POST /api/waitlist` | The release-email form | Stores the address encrypted with AES-256-GCM. Answers 415 unless the Content-Type is `application/json`. |
 
-Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes, `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist.
+Environment variables (set in Vercel): `BLOB_READ_WRITE_TOKEN` for both API routes (Production and Development only), `WAITLIST_ENCRYPTION_KEY` (64 hex characters) for the waitlist.
 
-To read the release-email list:
+To read the release-email list (the production pull goes to a file `next dev` doesn't load, and `.gitignore` covers it):
 
 ```bash
-vercel env pull .env.local --environment production --scope max-ghenis-projects
-bun --env-file=.env.local scripts/read-waitlist.mjs
+vercel env pull .env.waitlist.local --environment production --scope max-ghenis-projects
+bun --env-file=.env.waitlist.local scripts/read-waitlist.mjs
 ```
 
 The site sets no cookies and loads no analytics. Fonts are downloaded at build time and served from this origin.

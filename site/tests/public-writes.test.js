@@ -3,6 +3,10 @@
 import assert from "node:assert/strict";
 import { createDecipheriv, createHash } from "node:crypto";
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import fc from "fast-check";
 import { test } from "vitest";
 
@@ -10,6 +14,7 @@ import {
   HEARTBEAT,
   WAITLIST,
   WAITLIST_THANKS,
+  canStore,
   createRateLimiter,
   handleHeartbeat,
   handleWaitlist,
@@ -20,7 +25,7 @@ import {
 } from "../lib/public-writes.mjs";
 
 const KEY_HEX = "11".repeat(32);
-const ENV = { BLOB_READ_WRITE_TOKEN: "test-token", WAITLIST_ENCRYPTION_KEY: KEY_HEX };
+const ENV = { BLOB_READ_WRITE_TOKEN: "test-token", WAITLIST_ENCRYPTION_KEY: KEY_HEX, VERCEL_ENV: "production" };
 const T0 = Date.parse("2026-10-23T12:00:00Z");
 const INSTALL = "0123456789abcdef0123456789abcdef";
 
@@ -244,6 +249,74 @@ test("heartbeat: at the daily budget the app is told OK and nothing is written",
   assert.equal(blob.count("heartbeats/2026-10-23/"), HEARTBEAT.dailyCap);
 });
 
+// A Blob stand-in that fails the test if a route reads or writes it at all.
+function forbiddenBlob() {
+  const calls = [];
+  const record = (name) => async (...args) => {
+    calls.push([name, ...args]);
+    throw new Error(`${name} called on a deployment that must not store`);
+  };
+  return { calls, put: record("put"), list: record("list") };
+}
+
+test("canStore: only a production deployment with a token", () => {
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: "production" }), true);
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t" }), false, "a development pull sets no VERCEL_ENV");
+  for (const vercelEnv of ["", "preview", "development", "Production", "staging"]) {
+    assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "t", VERCEL_ENV: vercelEnv }), false, vercelEnv);
+  }
+  assert.equal(canStore({ VERCEL_ENV: "production" }), false, "no token, no storage");
+  assert.equal(canStore({ BLOB_READ_WRITE_TOKEN: "", VERCEL_ENV: "production" }), false);
+});
+
+test("outside production nothing reads or writes Blob, even with production's token", async () => {
+  const beat = { schema_version: 1, install_id: INSTALL };
+  for (const VERCEL_ENV of ["preview", "development", undefined]) {
+    const blob = forbiddenBlob();
+    const env = { ...ENV, VERCEL_ENV };
+    assert.deepEqual(await handleHeartbeat(post(beat), deps(blob, { env })), { status: 200, body: { ok: true, persisted: false } });
+    const signup = await handleWaitlist(post({ email: "a@b.co" }), deps(blob, { env }));
+    assert.equal(signup.status, 503);
+    assert.match(signup.body.error, /can't take sign-ups/);
+    assert.deepEqual(blob.calls, [], VERCEL_ENV);
+  }
+  const production = fakeBlob();
+  const env = { ...ENV, VERCEL_ENV: "production" };
+  assert.deepEqual(await handleHeartbeat(post(beat), deps(production, { env })), { status: 200, body: { ok: true } });
+  assert.equal((await handleWaitlist(post({ email: "a@b.co" }), deps(production, { env }))).status, 200);
+  assert.equal(production.objects.size, 2);
+});
+
+// Invariant: on any deployment other than production, no request of any
+// shape reaches Blob, and every heartbeat that would have been stored gets
+// the same "don't retry" answer the app gets when storage is off.
+test("no request reaches Blob outside production (property)", async () => {
+  const vercelEnv = fc.oneof(fc.constant(undefined), fc.string({ maxLength: 12 }).filter((value) => value !== "production"));
+  const heartbeat = fc.record({
+    schema_version: fc.constantFrom(1, 2),
+    install_id: fc.oneof(fc.stringMatching(/^[0-9a-f]{32}$/), fc.string({ maxLength: 40 })),
+    version: fc.string({ maxLength: 40 }),
+  });
+  const signup = fc.record({
+    email: fc.oneof(fc.emailAddress(), fc.string({ maxLength: 40 })),
+    interest: fc.constantFrom("", "general", "mcp", "other"),
+  });
+  await fc.assert(
+    fc.asyncProperty(vercelEnv, fc.array(fc.oneof(heartbeat.map((h) => ["heartbeat", h]), signup.map((s) => ["waitlist", s])), { maxLength: 12 }), async (VERCEL_ENV, requests) => {
+      const blob = forbiddenBlob();
+      const env = { ...ENV, VERCEL_ENV };
+      for (const [route, body] of requests) {
+        const result = route === "heartbeat" ? await handleHeartbeat(post(body), deps(blob, { env })) : await handleWaitlist(post(body), deps(blob, { env }));
+        assert.notEqual(result.status, 502, "a 502 means a storage call was made");
+        if (route === "heartbeat" && result.status === 200) assert.equal(result.body.persisted, false);
+        if (route === "waitlist" && result.status === 200) assert.equal(result.body.message, "Thanks.", "only the honeypot answers 200");
+      }
+      assert.deepEqual(blob.calls, []);
+    }),
+    { numRuns: 200 }
+  );
+});
+
 // Invariant: whatever sequence of requests arrives, a day's folder never
 // holds more than the cap, it holds exactly one object per distinct address
 // accepted that day, and a refusal at the cap writes nothing.
@@ -321,4 +394,53 @@ test("heartbeat storage never exceeds the cap or the distinct installs (property
     { numRuns: 120 }
   );
   assert.ok(cappedSeen > 0, "the generated sequences reached the cap");
+});
+
+// The file a `vercel env pull` command in `text` writes when it pulls
+// production, or null. Vercel CLI 56.2.1 writes .env.local unless given a
+// file, takes -e/--environment, and defaults to development.
+const VALUE_FLAGS = new Set(["-e", "--environment", "-S", "--scope", "--cwd", "-t", "--token", "--git-branch", "-A", "--local-config", "-Q", "--global-config"]);
+function productionPullTarget(text) {
+  const words = text.split(/\s+/).map((w) => w.replace(/^[`'"(]+|[`'",;)]+$/g, "")).filter(Boolean);
+  const at = words.findIndex((w, i) => w === "pull" && words[i - 1] === "env" && words[i - 2] === "vercel");
+  if (at < 0) return null;
+  let environment = "development";
+  let file = null;
+  for (let i = at + 1; i < words.length; i++) {
+    const w = words[i];
+    if (["&&", "||", "|", "#", "//"].includes(w)) break;
+    if (w.startsWith("--environment=")) environment = w.slice("--environment=".length);
+    else if (w === "-e" || w === "--environment") environment = words[++i];
+    else if (VALUE_FLAGS.has(w)) i += 1;
+    else if (!w.startsWith("-") && file === null) file = w;
+  }
+  return environment === "production" ? file || ".env.local" : null;
+}
+const NEXT_DEV_LOADS = /^\.env(\.local|\.development(\.local)?)?$/;
+
+test("productionPullTarget reads the file a production pull writes", () => {
+  const cases = {
+    "vercel env pull .env.waitlist.local --environment production --scope s": ".env.waitlist.local",
+    "vercel env pull --environment production --scope s": ".env.local",
+    "vercel env pull --environment=production .env.local": ".env.local",
+    "vercel env pull -e production ./.env.development.local": "./.env.development.local",
+    "`vercel env pull site/.env --yes --environment production`": "site/.env",
+    "vercel env pull .env.local": null,
+    "vercel env pull --environment preview": null,
+    "vercel env ls production": null,
+  };
+  for (const [command, file] of Object.entries(cases)) assert.equal(productionPullTarget(command), file, command);
+});
+
+test("no doc tells anyone to pull production env into a file next dev loads", () => {
+  // next dev loads .env, .env.local, .env.development and .env.development.local;
+  // a production pull writes VERCEL_ENV="production" and the Blob token there.
+  const site = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  for (const file of ["README.md", "../CLAUDE.md", "scripts/read-waitlist.mjs"]) {
+    const text = readFileSync(path.join(site, file), "utf8").replace(/\\\n/g, " ");
+    for (const line of text.split("\n")) {
+      const target = productionPullTarget(line);
+      if (target !== null) assert.ok(!NEXT_DEV_LOADS.test(path.posix.basename(target)), `${file}: ${line.trim()}`);
+    }
+  }
 });
