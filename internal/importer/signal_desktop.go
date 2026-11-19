@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/pbkdf2"
 
@@ -30,10 +31,12 @@ import (
 var (
 	signalDesktopDefaultDir = filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Signal")
 	signalDesktopLookPath   = exec.LookPath
-	runSignalDesktopHelper  = func(ctx context.Context, helperPath, nodePath string, args ...string) ([]byte, error) {
+	// runSignalDesktopHelper returns the helper's stdout, the JSON export.
+	// On failure the *exec.ExitError carries stderr separately.
+	runSignalDesktopHelper = func(ctx context.Context, helperPath, nodePath string, args ...string) ([]byte, error) {
 		commandArgs := append([]string{helperPath}, args...)
 		cmd := exec.CommandContext(ctx, nodePath, commandArgs...)
-		return cmd.CombinedOutput()
+		return cmd.Output()
 	}
 	runSignalSafeStoragePassword = func(ctx context.Context) ([]byte, error) {
 		cmd := exec.CommandContext(ctx, "security", "find-generic-password", "-s", "Signal Safe Storage", "-w")
@@ -276,7 +279,10 @@ func (s *SignalDesktop) exportDesktopArchive(supportDir, dbPath string, sinceMS 
 		strconv.FormatInt(sinceMS, 10),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("export Signal Desktop archive: %w: %s", err, strings.TrimSpace(string(output)))
+		// Never put stdout in the error: it is the export, every message
+		// body in it, and import_messages hands errors to the model
+		// verbatim, without the untrusted-content preamble.
+		return nil, fmt.Errorf("export Signal Desktop archive: %w%s", err, signalDesktopHelperStderr(err))
 	}
 
 	var exported signalDesktopExport
@@ -284,6 +290,31 @@ func (s *SignalDesktop) exportDesktopArchive(supportDir, dbPath string, sinceMS 
 		return nil, fmt.Errorf("decode Signal Desktop export: %w", err)
 	}
 	return &exported, nil
+}
+
+// signalDesktopHelperStderrLimit caps how much of the helper's stderr an
+// export error carries.
+const signalDesktopHelperStderrLimit = 2000
+
+// signalDesktopHelperStderr returns ": <stderr>" from a failed helper run,
+// capped, or "" when the error carries none.
+func signalDesktopHelperStderr(err error) string {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return ""
+	}
+	stderr := strings.TrimSpace(string(exitErr.Stderr))
+	if stderr == "" {
+		return ""
+	}
+	if len(stderr) > signalDesktopHelperStderrLimit {
+		cut := signalDesktopHelperStderrLimit
+		for cut > 0 && !utf8.RuneStart(stderr[cut]) {
+			cut--
+		}
+		stderr = stderr[:cut] + "…"
+	}
+	return ": " + stderr
 }
 
 func (s *SignalDesktop) openMessageConversation(raw signalDesktopConversationRow, latestTS int64, byServiceID, byE164 map[string]signalDesktopIdentity) (string, *db.Conversation, bool) {

@@ -156,15 +156,18 @@ mode this prevents and the `~/.mcp.json` recipe.
   copy under the export root; an attachment its platform can no longer
   deliver comes back as "attachment unavailable" with the reason
 
-A tool result that carries message-derived text (bodies, transcripts, story
-quotes, top phrases) starts with `messagePreamble` (internal/tools/tools.go),
-the untrusted-content warning, before any header. Structured payloads that
-carry such text also set `contains_untrusted_text: true`.
-`internal/tools/untrusted_preamble_test.go` calls every registered tool in
-legacy, v2-primary and client mode against a store seeded with a marker only
-senders wrote. It fails if a result carries the marker without the preamble.
-It also fails if a registered tool has no entry in its argument table, so add
-one for each new tool.
+A tool result that includes text from stored messages (bodies, transcripts,
+story quotes, top phrases) starts with `messagePreamble`
+(internal/tools/tools.go), the untrusted-content warning, before any header. A
+structured payload that includes such text also sets
+`contains_untrusted_text: true`. `internal/tools/untrusted_preamble_test.go`
+enforces this. It seeds message bodies, a transcript and an import file with a
+marker only senders wrote, stubs the Google transport so sends and reactions
+succeed, and calls every tool in six registration shapes: legacy, v2-primary,
+client, client v2-primary, v2 outbox and v2 outbox primary. It fails if a
+result carries the marker without the preamble. It also fails if a tool
+registered in one of those shapes has no entry in its argument table, so give
+each new tool an entry.
 
 Optional API story generation uses `claude-sonnet-5-5` with medium effort and
 a 16,000-token limit when the caller supplies an Anthropic API key. Without a
