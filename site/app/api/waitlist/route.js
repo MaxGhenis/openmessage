@@ -3,8 +3,8 @@ import { NextResponse } from "next/server";
 
 import { WAITLIST, createRateLimiter, handleWaitlist } from "../../../lib/public-writes.mjs";
 
-// Bounds (body size, address format, per-address rate, daily object budget)
-// live in lib/public-writes.mjs.
+// Bounds (JSON Content-Type, body size, address format, per-address rate,
+// daily object budget) live in lib/public-writes.mjs.
 const allow = createRateLimiter(WAITLIST.perAddress);
 
 export async function POST(request) {

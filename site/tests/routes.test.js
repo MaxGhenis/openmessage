@@ -3,12 +3,14 @@
 // directly; this file checks that the routes wire them up and that what the
 // waitlist stores, scripts/read-waitlist.mjs reads back.
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import fc from "fast-check";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { RELEASE, REPO_URL } from "../data/facts.js";
-import { HEARTBEAT, WAITLIST } from "../lib/public-writes.mjs";
+import { MAIN_COMMIT, RELEASE, REPO_URL } from "../data/facts.js";
+import { HEARTBEAT, WAITLIST, WAITLIST_THANKS, isJSONContentType } from "../lib/public-writes.mjs";
+import { fileAt, git, listAt } from "./git.js";
 
 const put = vi.fn();
 const list = vi.fn();
@@ -17,7 +19,7 @@ vi.mock("@vercel/blob", () => ({ put: (...args) => put(...args), list: (...args)
 const { POST: waitlistPost } = await import("../app/api/waitlist/route.js");
 const { GET: heartbeatGet, POST: heartbeatPost } = await import("../app/api/heartbeat/route.js");
 const { GET: downloadGet } = await import("../app/download/route.js");
-const { decryptRecord, latestPerAddress } = await import("../scripts/read-waitlist.mjs");
+const { decryptRecord, latestPerAddress, printable } = await import("../scripts/read-waitlist.mjs");
 
 const KEY = randomBytes(32).toString("hex");
 const STORED_FIELDS = ["arch", "install_id", "os", "platforms", "received_at", "version"];
@@ -25,12 +27,12 @@ const STORED_FIELDS = ["arch", "install_id", "os", "platforms", "received_at", "
 // Each route keeps a per-address rate limit for the life of the module, so
 // every request gets its own client address unless a test pins one.
 let requestCount = 0;
-function post(body, { address } = {}) {
+function post(body, { address, contentType = "application/json" } = {}) {
   requestCount += 1;
   return new Request("https://openmessage.ai/api/x", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": contentType,
       "x-vercel-forwarded-for": address ?? `198.18.${(requestCount >> 8) & 255}.${requestCount & 255}`
     },
     body: typeof body === "string" ? body : JSON.stringify(body)
@@ -59,7 +61,7 @@ describe("POST /api/waitlist", () => {
   test("what the route stores, the reader script decrypts back to the same signup", async () => {
     const response = await waitlistPost(post({ email: "  Reader@Example.com ", interest: "general", website: "" }));
     expect(response.status).toBe(200);
-    expect((await response.json()).ok).toBe(true);
+    expect(await response.json()).toEqual({ ok: true, message: WAITLIST_THANKS });
 
     expect(put).toHaveBeenCalledTimes(1);
     const [pathname, stored, options] = put.mock.calls[0];
@@ -122,14 +124,38 @@ describe("POST /api/waitlist", () => {
   test.each([
     ["an invalid address", { email: "nope", interest: "" }, 400, "Enter a valid email address."],
     ["an address over 254 characters", { email: `${"a".repeat(250)}@b.co`, interest: "" }, 400, "Enter a valid email address."],
+    ["an address with a terminal escape", { email: "a\u001b[8m@b.co", interest: "" }, 400, "Enter a valid email address."],
+    ["an address with a bidi override", { email: "a\u202eoc.b@c.co", interest: "" }, 400, "Enter a valid email address."],
     ["an unknown interest", { email: "a@b.co", interest: "crypto" }, 400, "Invalid interest selection."],
     ["a body that is not JSON", "{", 400, "Invalid request body."],
-    ["a body over 2 KiB", { email: "a@b.co", interest: "", padding: "x".repeat(WAITLIST.maxBodyBytes) }, 413, "Request is too large."]
+    ["a body over 2 KiB", { email: "a@b.co", interest: "", padding: "x".repeat(WAITLIST.maxBodyBytes) }, 413, "The site can't take an address that long. Use a shorter one."]
   ])("rejects %s with the error the form shows", async (_label, body, status, error) => {
     const response = await waitlistPost(post(body));
     expect(response.status).toBe(status);
-    expect((await response.json()).error).toBe(error);
+    const payload = await response.json();
+    expect(payload.error).toBe(error);
+    // The form marks the email field invalid for this one error.
+    expect(payload.field).toBe(error === "Enter a valid email address." ? "email" : undefined);
     expect(put).not.toHaveBeenCalled();
+  });
+
+  // Browsers send these cross-site without a CORS preflight.
+  test.each(["text/plain;charset=UTF-8", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"])(
+    "refuses a %s request with 415 and stores nothing",
+    async (contentType) => {
+      const response = await waitlistPost(post({ email: "victim@example.com", interest: "", website: "" }, { contentType }));
+      expect(response.status).toBe(415);
+      expect((await response.json()).error).toBe("Set the Content-Type header to application/json.");
+      expect(put).not.toHaveBeenCalled();
+    }
+  );
+
+  test("accepts JSON with a charset parameter", async () => {
+    const response = await waitlistPost(
+      post({ email: "charset@example.com", interest: "", website: "" }, { contentType: "application/json; charset=utf-8" })
+    );
+    expect(response.status).toBe(200);
+    expect(put).toHaveBeenCalledTimes(1);
   });
 
   test("an address past its limit gets 429 and stores nothing", async () => {
@@ -140,7 +166,7 @@ describe("POST /api/waitlist", () => {
     put.mockClear();
     const limited = await waitlistPost(post({ email: "late@b.co", interest: "" }, { address }));
     expect(limited.status).toBe(429);
-    expect((await limited.json()).error).toMatch(/^Too many sign-ups/);
+    expect((await limited.json()).error).toBe("Your IP address has reached the sign-up limit. Try again in 10 minutes.");
     expect(put).not.toHaveBeenCalled();
     // Another address is unaffected.
     expect((await waitlistPost(post({ email: "late@b.co", interest: "" }))).status).toBe(200);
@@ -210,6 +236,53 @@ describe("scripts/read-waitlist.mjs", () => {
       }),
       { numRuns: 200 }
     );
+  });
+
+  // The script prints addresses to a terminal, where ESC sequences could hide
+  // later rows, retitle the window or plant a disguised link.
+  test("printable replaces each control or format character with ? and keeps the rest", () => {
+    expect(printable("x\u001b[8m\u001b]8;;https://evil.example/\u0007ok@b.co")).toBe("x?[8m?]8;;https://evil.example/?ok@b.co");
+    expect(printable("a\u202eb\u200b@c.co")).toBe("a?b?@c.co");
+    expect(printable("jöhn@exämple.com")).toBe("jöhn@exämple.com");
+    const controlOrFormat = /[\p{Cc}\p{Cf}]/u;
+    const unit = fc.oneof(
+      fc.constantFrom("\u0000", "\u0007", "\u001b", "\u009b", "\u00ad", "\u200b", "\u202e", "\ufeff", "\u{e0001}"),
+      fc.string({ unit: "binary", minLength: 1, maxLength: 1 })
+    );
+    fc.assert(
+      fc.property(fc.string({ unit, maxLength: 40 }), (value) => {
+        const before = Array.from(value);
+        const after = Array.from(printable(value));
+        expect(after).toHaveLength(before.length);
+        after.forEach((char, i) => {
+          expect(controlOrFormat.test(char)).toBe(false);
+          expect(char).toBe(controlOrFormat.test(before[i]) ? "?" : before[i]);
+        });
+      }),
+      { numRuns: 300 }
+    );
+  });
+});
+
+// The form is a client component, so these check its source against the
+// route's contract rather than render it.
+describe("components/updates-form.jsx", () => {
+  const form = readFileSync(new URL("../components/updates-form.jsx", import.meta.url), "utf8");
+
+  test("falls back to the same thanks the route sends", () => {
+    expect(form).toContain(`const THANKS = ${JSON.stringify(WAITLIST_THANKS)};`);
+    expect(form).toContain("payload?.message || THANKS");
+  });
+
+  test("keeps the submit button focusable while sending", () => {
+    expect(form).toContain('aria-disabled={sending ? "true" : undefined}');
+    expect(form).not.toMatch(/\sdisabled[=\s>]/);
+  });
+
+  test("marks the field invalid only for the route's invalid-address error", () => {
+    expect(form).toContain('response.status === 400 && payload?.field === "email"');
+    expect(form).toContain('aria-describedby={invalid ? "updates-status" : undefined}');
+    expect(form).toContain('id="updates-status"');
   });
 });
 
@@ -312,6 +385,30 @@ describe("/api/heartbeat", () => {
     const response = await heartbeatPost(post(body));
     expect(response.status).toBe(status);
     expect(put).not.toHaveBeenCalled();
+  });
+
+  test("refuses a request not sent as JSON with 415, and accepts JSON with a charset", async () => {
+    const plain = await heartbeatPost(post(heartbeat, { contentType: "text/plain;charset=UTF-8" }));
+    expect(plain.status).toBe(415);
+    expect(await plain.json()).toEqual({ ok: false });
+    expect(put).not.toHaveBeenCalled();
+    const charset = await heartbeatPost(post(heartbeat, { contentType: "application/json; charset=utf-8" }));
+    expect(charset.status).toBe(200);
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  // The 415 stays safe only while every app version that sends heartbeats
+  // sets application/json. v0.1.0 has no telemetry package.
+  test("every tagged release and main that sends heartbeats sets a JSON Content-Type", () => {
+    const refs = [...git(["tag", "-l", "v*"]).split("\n").filter(Boolean), MAIN_COMMIT];
+    const senders = refs.filter((ref) => listAt(ref, "internal/telemetry").includes("internal/telemetry/telemetry.go"));
+    expect(senders).toContain(RELEASE.tag);
+    expect(senders).toContain(MAIN_COMMIT);
+    for (const ref of senders) {
+      const sets = fileAt(ref, "internal/telemetry/telemetry.go").match(/req\.Header\.Set\("Content-Type", "([^"]*)"\)/);
+      expect(sets?.[1], ref).toBe("application/json");
+      expect(isJSONContentType(new Request("https://openmessage.ai/api/heartbeat", { headers: { "Content-Type": sets[1] } }))).toBe(true);
+    }
   });
 
   test("an address past its limit gets 429 and stores nothing", async () => {

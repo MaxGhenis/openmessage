@@ -3,11 +3,13 @@ import path from "node:path";
 
 import { ImageResponse } from "next/og";
 
+import { OG_ALT, OG_SIZE } from "../lib/metadata.js";
+
 // The card shown when the site is shared. Built once at build time from the
 // same two typefaces as the page; the font files come from @fontsource, so
 // nothing is fetched over the network.
-export const alt = "OpenMessage: your texts, WhatsApp and Signal in one SQLite database your agent can query";
-export const size = { width: 1200, height: 630 };
+export const alt = OG_ALT;
+export const size = OG_SIZE;
 export const contentType = "image/png";
 
 function font(pkg, file) {
@@ -59,7 +61,7 @@ export default async function OpengraphImage() {
             {"get_person_messages {\"name\": \"Jordan Rivera\"}"}
           </div>
           <div style={{ display: "flex", fontSize: 26, color: "#9aa8c0" }}>
-            A Mac app and a local MCP server on the same file. Free, with no account.
+            A Mac app and a local MCP server read the same database. OpenMessage costs nothing and needs no sign-up.
           </div>
         </div>
       </div>

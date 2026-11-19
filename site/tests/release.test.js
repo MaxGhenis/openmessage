@@ -1,13 +1,16 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { RELEASE } from "../data/facts.js";
 import {
   FALLBACK_RELEASE,
+  compareVersions,
   formatDate,
-  commitsAheadOf,
   formatMegabytes,
+  getLatestRelease,
   normalizeRelease,
-  parseCommitTotal
+  releaseCopy,
+  releaseStatus,
+  UNKNOWN_LEAD
 } from "../lib/release.js";
 
 const payload = {
@@ -78,41 +81,145 @@ describe("fallback", () => {
   });
 });
 
-describe("parseCommitTotal", () => {
-  const link = (last) =>
-    `<https://api.github.com/repositories/1/commits?sha=main&per_page=1&page=2>; rel="next", <https://api.github.com/repositories/1/commits?sha=main&per_page=1&page=${last}>; rel="last"`;
-
-  test("reads the last page number as the commit total", () => {
-    expect(parseCommitTotal(link(254))).toBe(254);
+describe("compareVersions", () => {
+  test.each([
+    ["0.2.9", "0.2.9", 0],
+    ["0.2.10", "0.2.9", 1],
+    ["0.3.0", "0.2.9", 1],
+    ["1.0.0", "0.99.99", 1],
+    ["0.2.8", "0.2.9", -1],
+    ["0.10.0", "0.9.0", 1]
+  ])("%s against %s -> %s", (a, b, expected) => {
+    expect(compareVersions(a, b)).toBe(expected);
   });
 
   test.each([
-    ["no header", null],
-    ["an empty header", ""],
-    ["a header with only prev/first", '<https://api.github.com/x?page=1>; rel="first"'],
-    ["a zero page", link(0)],
-    ["a non-numeric page", link("abc")]
-  ])("returns null for %s", (_label, input) => {
-    expect(parseCommitTotal(input)).toBeNull();
-  });
-
-  test("does not confuse per_page with page", () => {
-    expect(parseCommitTotal('<https://api.github.com/x?per_page=1>; rel="last"')).toBeNull();
-    expect(parseCommitTotal('<https://api.github.com/x?page=7&per_page=1>; rel="last"')).toBeNull();
-    expect(parseCommitTotal('<https://api.github.com/x?per_page=1&page=7>; rel="last"')).toBe(7);
+    ["v0.2.9", "0.2.9"],
+    ["0.2", "0.2.9"],
+    ["0.2.9-beta", "0.2.9"],
+    ["", "0.2.9"],
+    [null, "0.2.9"],
+    ["0.2.9", undefined]
+  ])("returns null for %s against %s", (a, b) => {
+    expect(compareVersions(a, b)).toBeNull();
   });
 });
 
-describe("commitsAheadOf", () => {
-  test.each([
-    [254, 138, 116],
-    [138, 138, 0],
-    [137, 138, null],
-    [null, 138, null],
-    [254, null, null],
-    [254.5, 138, null]
-  ])("main %s, release %s -> %s", (mainTotal, releaseTotal, expected) => {
-    expect(commitsAheadOf(mainTotal, releaseTotal)).toBe(expected);
+describe("releaseStatus", () => {
+  const live = (version) => ({ tag: `v${version}`, version, publishedAt: "2026-05-01T00:00:00.000Z", dmgBytes: null, live: true });
+
+  test("same when GitHub confirms the release the copy describes", () => {
+    expect(releaseStatus(live(RELEASE.version))).toBe("same");
+  });
+
+  test("newer only when GitHub reports a later release", () => {
+    expect(releaseStatus(live("0.2.10"), "0.2.9")).toBe("newer");
+    expect(releaseStatus(live("0.3.0"), "0.2.9")).toBe("newer");
+  });
+
+  test("unknown when GitHub did not answer, even though the fallback names the same version", () => {
+    expect(FALLBACK_RELEASE.version).toBe(RELEASE.version);
+    expect(releaseStatus(FALLBACK_RELEASE)).toBe("unknown");
+  });
+
+  test("unknown for an older or unreadable release", () => {
+    expect(releaseStatus(live("0.2.8"), "0.2.9")).toBe("unknown");
+    expect(releaseStatus({ ...live("0.2.9"), version: "zero" }, "0.2.9")).toBe("unknown");
+    expect(releaseStatus(null)).toBe("unknown");
+  });
+});
+
+describe("releaseCopy", () => {
+  const live = (version, extra = {}) => ({
+    tag: `v${version}`,
+    version,
+    publishedAt: "2026-05-01T00:00:00.000Z",
+    dmgBytes: 21661450,
+    live: true,
+    ...extra
+  });
+  const silent = { status: "unknown", hero: "", lead: UNKNOWN_LEAD, jsonLd: {}, showNewer: false, showMainList: false };
+
+  test("names the confirmed release beside the button and shows the list of changes on main", () => {
+    expect(releaseCopy(live("0.2.9"), "0.2.9")).toEqual({
+      status: "same",
+      hero: "Version 0.2.9 came out May 1, 2026, as a 22 MB download.",
+      lead: "The download button serves version 0.2.9, which came out May 1, 2026.",
+      jsonLd: { softwareVersion: "0.2.9", datePublished: "2026-05-01" },
+      showNewer: false,
+      showMainList: true
+    });
+  });
+
+  test("names a newer release, shows the newer note and hides the list of changes on main", () => {
+    const copy = releaseCopy(live("0.3.0"), "0.2.9");
+    expect(copy.status).toBe("newer");
+    expect(copy.hero).toBe("Version 0.3.0 came out May 1, 2026, as a 22 MB download.");
+    expect(copy.showNewer).toBe(true);
+    expect(copy.showMainList).toBe(false);
+  });
+
+  // The button redirects to the latest release's disk image, which 404s while
+  // a release has none, so the page does not name that release.
+  test("says nothing about a version when the release has no disk image", () => {
+    expect(releaseCopy(live("0.2.9", { dmgBytes: null }), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(live("0.3.0", { dmgBytes: null }), "0.2.9")).toEqual(silent);
+  });
+
+  test("says nothing about a version when GitHub did not answer, though the fallback names one", () => {
+    expect(releaseCopy(FALLBACK_RELEASE)).toEqual(silent);
+  });
+
+  test("says nothing about a version for an older, unreadable or undated release", () => {
+    expect(releaseCopy(live("0.2.8"), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(live("0.2.9", { version: "zero" }), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(live("0.2.9", { publishedAt: "soon" }), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(null)).toEqual(silent);
+  });
+});
+
+describe("getLatestRelease", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const answer = (status, body) =>
+    vi.fn(async () => ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => (typeof body === "function" ? body() : body)
+    }));
+
+  test("returns the live release GitHub reports", async () => {
+    vi.stubGlobal("fetch", answer(200, payload));
+    expect(await getLatestRelease()).toEqual(normalizeRelease(payload));
+  });
+
+  test("falls back when GitHub answers with an error, sends something that is not a release, or does not answer", async () => {
+    vi.stubGlobal("fetch", answer(403, { message: "API rate limit exceeded" }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    // An error status falls back even when its body looks like a release.
+    vi.stubGlobal("fetch", answer(403, payload));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    vi.stubGlobal("fetch", answer(200, { ...payload, prerelease: true }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    vi.stubGlobal("fetch", answer(200, () => {
+      throw new SyntaxError("Unexpected token < in JSON");
+    }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+  });
+
+  test("the fallback leads to copy that names no version", async () => {
+    vi.stubGlobal("fetch", answer(500, {}));
+    expect(releaseCopy(await getLatestRelease()).hero).toBe("");
   });
 });
 

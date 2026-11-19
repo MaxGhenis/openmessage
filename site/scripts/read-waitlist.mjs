@@ -43,6 +43,14 @@ export function latestPerAddress(signups) {
   return [...latest.values()].sort((a, b) => Date.parse(a.submittedAt) - Date.parse(b.submittedAt));
 }
 
+// Replaces each control or format character (terminal escapes, bidi
+// overrides, zero-width characters) with "?", so a stored address can't hide
+// output, rewrite the window title or plant a link in the terminal that
+// prints it. The route rejects such addresses; this covers older records.
+export function printable(value) {
+  return `${value ?? ""}`.replace(/[\p{Cc}\p{Cf}]/gu, "?");
+}
+
 async function main() {
   const token = process.env.BLOB_READ_WRITE_TOKEN;
   const keyHex = process.env.WAITLIST_ENCRYPTION_KEY;
@@ -72,7 +80,7 @@ async function main() {
 
   const addresses = latestPerAddress(signups);
   for (const signup of addresses) {
-    console.log(`${signup.submittedAt}\t${signup.email}\t${signup.interest}`);
+    console.log([signup.submittedAt, signup.email, signup.interest].map(printable).join("\t"));
   }
   console.error(`${addresses.length} address(es) from ${signups.length} record(s).`);
 }
