@@ -156,18 +156,33 @@ mode this prevents and the `~/.mcp.json` recipe.
   copy under the export root; an attachment its platform can no longer
   deliver comes back as "attachment unavailable" with the reason
 
-A tool result that includes text from stored messages (bodies, transcripts,
-story quotes, top phrases) starts with `messagePreamble`
+A tool result that includes text read back from stored messages or an import
+(bodies, transcripts, story quotes, top phrases) starts with `messagePreamble`
 (internal/tools/tools.go), the untrusted-content warning, before any header. A
-structured payload that includes such text also sets
-`contains_untrusted_text: true`. `internal/tools/untrusted_preamble_test.go`
-enforces this. It seeds message bodies, a transcript and an import file with a
-marker only senders wrote, stubs the Google transport so sends and reactions
-succeed, and calls every tool in six registration shapes: legacy, v2-primary,
-client, client v2-primary, v2 outbox and v2 outbox primary. It fails if a
-result carries the marker without the preamble. It also fails if a tool
-registered in one of those shapes has no entry in its argument table, so give
-each new tool an entry.
+structured payload that includes such text sets `contains_untrusted_text:
+true`, and `structuredResult` then adds `untrusted_content_warning`, the same
+wording, as the payload's first JSON field: some MCP clients, Claude Code among
+them, give the model only the structured content. A send result that returns
+only the message the caller just sent needs no preamble. Errors keep message
+text out instead: a failed Signal receive's `last_error` (shown by
+`get_status` and `/api/status`) leaves out the envelopes it printed, and a
+Signal Desktop import error leaves out the export.
+
+`internal/tools/untrusted_preamble_test.go` enforces this. It seeds a marker
+that only senders wrote in legacy and v2 message bodies, a transcript, an
+import file, attachment bytes and the Google transport's latest-message
+preview. It calls every tool in seven registration shapes: legacy, v2-primary,
+client, client v2-primary, client-live (a running app scripted in memory), v2
+outbox and v2 outbox primary; the v2-primary shapes read through `v2read`, as
+production does. It fails if a result carries the marker without the preamble,
+or structured content carries it without the warning field first. A tool the
+test expects to succeed in a shape must also show its success text, so an
+early empty result can't pass for a clean one: sends in legacy, v2-primary,
+client-live and both outbox shapes (the legacy group send calls the Google
+client directly, so only the outbox shapes reach it, and client mode refuses
+group sends), and reactions in legacy, client-live and both outbox shapes. It
+also fails if a tool registered in any shape has no entry in its argument
+table, so give each new tool an entry.
 
 Optional API story generation uses `claude-sonnet-5-5` with medium effort and
 a 16,000-token limit when the caller supplies an Anthropic API key. Without a
