@@ -56,7 +56,7 @@ describe("MCP tools", () => {
     expect([...siteTools].sort()).toEqual(registeredTools(RELEASE.tag));
   });
 
-  // The release's internal/tools package as function bodies keyed by name:
+  // The release's internal/tools package as a map from each function name to its body:
   // top-level funcs, plus package-level seams such as `downloadWhatsAppMedia = func(`
   // inside a var block. gofmt puts a top-level func's closing brace alone at
   // column 0 and a var-block func literal's closing brace at one tab.

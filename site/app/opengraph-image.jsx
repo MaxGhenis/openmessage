@@ -61,7 +61,7 @@ export default async function OpengraphImage() {
             {"get_person_messages {\"name\": \"Jordan Rivera\"}"}
           </div>
           <div style={{ display: "flex", fontSize: 26, color: "#9aa8c0" }}>
-            A Mac app and a local MCP server read the same database. Free, with no sign-up.
+            A Mac app and a local MCP server read the same database. OpenMessage costs nothing and needs no sign-up.
           </div>
         </div>
       </div>

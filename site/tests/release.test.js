@@ -195,8 +195,12 @@ describe("getLatestRelease", () => {
     expect(await getLatestRelease()).toEqual(normalizeRelease(payload));
   });
 
-  test("falls back when GitHub refuses, sends something that is not a release, or cannot be reached", async () => {
+  test("falls back when GitHub answers with an error, sends something that is not a release, or does not answer", async () => {
     vi.stubGlobal("fetch", answer(403, { message: "API rate limit exceeded" }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    // An error status falls back even when its body looks like a release.
+    vi.stubGlobal("fetch", answer(403, payload));
     expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
 
     vi.stubGlobal("fetch", answer(200, { ...payload, prerelease: true }));

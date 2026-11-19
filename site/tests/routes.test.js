@@ -126,7 +126,7 @@ describe("POST /api/waitlist", () => {
     ["an address with a bidi override", { email: "a\u202eoc.b@c.co", interest: "" }, 400, "Enter a valid email address."],
     ["an unknown interest", { email: "a@b.co", interest: "crypto" }, 400, "Invalid interest selection."],
     ["a body that is not JSON", "{", 400, "Invalid request body."],
-    ["a body over 2 KiB", { email: "a@b.co", interest: "", padding: "x".repeat(WAITLIST.maxBodyBytes) }, 413, "The request is too large. Use a shorter email address."]
+    ["a body over 2 KiB", { email: "a@b.co", interest: "", padding: "x".repeat(WAITLIST.maxBodyBytes) }, 413, "The site can't take an address that long. Use a shorter one."]
   ])("rejects %s with the error the form shows", async (_label, body, status, error) => {
     const response = await waitlistPost(post(body));
     expect(response.status).toBe(status);

@@ -46,7 +46,7 @@ describe("receipts in use", () => {
 
   // A repeated key in an object literal silently replaces the earlier entry,
   // so read the keys from the source rather than from the imported object.
-  test("no receipt key is defined twice", () => {
+  test("defines no receipt key twice", () => {
     const source = readFileSync(path.join(siteRoot, "data/facts.js"), "utf8");
     const start = source.indexOf("export const RECEIPTS = {");
     expect(start).toBeGreaterThan(-1);

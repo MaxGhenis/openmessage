@@ -48,8 +48,8 @@ export default function PrivacyPage() {
             ]}
           />
 
-          <h2>Deleting your data from this Mac</h2>
-          <p>To delete your messages and logins from this Mac, quit the app and remove:</p>
+          <h2>Deleting your data from your Mac</h2>
+          <p>To delete your messages and logins from your Mac, quit the app and remove:</p>
           <ul>
             <li>
               <code>~/Library/Application Support/OpenMessage</code>, which holds the database
@@ -61,19 +61,25 @@ export default function PrivacyPage() {
             </li>
             <li>
               <code>~/.local/share/openmessage</code>, if you have run a command-line build. That
-              build keeps its data there, and the app copies from that folder without emptying it.
+              build keeps its data there, and the Mac app copies that build&rsquo;s database and
+              Google Messages login into its own folder without removing them.
+            </li>
+            <li>
+              Attachments the <code>download_media</code> tool saved, in files whose names start
+              with <code>openmessage-</code>. They sit in <code>/tmp</code>, or in{" "}
+              <code>$TMPDIR</code> if a command-line build ran the server.
             </li>
             <li>Any files your agent saved elsewhere.</li>
           </ul>
           <p>
             Then, in Notification Center, clear the notifications that show your message text.
-            The app posts some itself, and its server posts others through{" "}
+            The app posts some itself, and its local server posts others through{" "}
             <code>terminal-notifier</code> or AppleScript.
           </p>
           <p>
-            None of this touches the messages on your phone or any other device you have linked.
-            To finish, unlink OpenMessage in WhatsApp, Signal and Google Messages on your phone.
-            Signal lists it as &ldquo;OpenMessage&rdquo;.
+            None of these steps touches the messages on your phone or any other device you have
+            linked. To finish, on your phone, unlink the device OpenMessage added in WhatsApp,
+            Signal and Google Messages. Signal lists it as &ldquo;OpenMessage&rdquo;.
           </p>
           <Receipts
             ids={[
@@ -81,6 +87,8 @@ export default function PrivacyPage() {
               "mediaCache",
               "cliDataDir",
               "legacyCopy",
+              "downloadMediaTmp",
+              "appEnv",
               "notificationBody",
               "appServerNotifications",
               "serverNotifier",
@@ -111,8 +119,9 @@ export default function PrivacyPage() {
                 <tr>
                   <th scope="row">Sites your threads link to</th>
                   <td data-label="What">
-                    Requests from your Mac for each linked page, any page it redirects to, and the
-                    preview image the page names, which another site may host. OpenMessage skips
+                    Requests from your Mac for the first link in each message, any page it
+                    redirects to, and the preview image the page names, which another site may
+                    host. OpenMessage skips
                     links whose own address is private or local
                   </td>
                   <td data-label="When">When you open a thread that contains a link</td>
@@ -166,6 +175,7 @@ export default function PrivacyPage() {
           <Receipts
             ids={[
               "whatsappPresence",
+              "linkPreviewFirst",
               "linkPreviewGuard",
               "previewImage",
               "uiFonts",
@@ -196,8 +206,8 @@ export default function PrivacyPage() {
           <h2>What this site collects</h2>
           <ul>
             <li>
-              The site sets no cookies, runs no analytics scripts and saves only your light or dark
-              theme choice, in your browser&rsquo;s local storage.
+              The site sets no cookies and runs no analytics scripts. In your browser&rsquo;s local
+              storage it saves only your light or dark theme choice.
             </li>
             <li>
               Vercel hosts the site, so each request you make, including your IP address, passes

@@ -152,7 +152,7 @@ function encryptWaitlistRecord(record, key) {
 export async function handleWaitlist(request, { put, list, env, allow, now = Date.now, log = console.error, dailyCap = WAITLIST.dailyCap }) {
   const body = await readJSONBody(request, WAITLIST.maxBodyBytes);
   if (body.status === 415) return { status: 415, body: { error: "Set the Content-Type header to application/json." } };
-  if (body.status === 413) return { status: 413, body: { error: "The request is too large. Use a shorter email address." } };
+  if (body.status === 413) return { status: 413, body: { error: "The site can't take an address that long. Use a shorter one." } };
   if (body.status) return { status: 400, body: { error: "Invalid request body." } };
   const payload = body.value;
 

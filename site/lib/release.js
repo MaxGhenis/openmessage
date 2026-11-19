@@ -4,14 +4,16 @@ import { RELEASE, REPO } from "../data/facts.js";
 // GitHub which release that is instead of trusting a constant. The copy
 // describes RELEASE, and the tests check it there. When GitHub confirms that
 // release with its disk image, the page names it as what the button serves;
-// when GitHub reports a newer one, the page says so; and when GitHub is
-// unreachable, rate-limited or reports anything else, including a release
-// without the disk image, the page names no version beside the button.
+// when GitHub reports a newer one, the page says so; and when GitHub does not
+// answer, answers with an error such as its rate limit, or reports anything
+// else, including a release without the disk image, the page names no version
+// beside the button.
 
 const API = `https://api.github.com/repos/${REPO}`;
 const HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
-// Short, so the page names the release the button serves within minutes of a
-// new one; the button itself always follows GitHub's latest release.
+// Short, so once a new release ships the page names it within one five-minute
+// revalidation of the next visit (the visit that triggers regeneration still
+// gets the old page). The button itself always follows GitHub's latest release.
 const REVALIDATE_SECONDS = 300;
 
 export const FALLBACK_RELEASE = {
@@ -81,7 +83,7 @@ export function releaseStatus(release, described = RELEASE.version) {
   return order === 1 ? "newer" : "unknown";
 }
 
-export const UNKNOWN_LEAD = "The download button serves the latest release on GitHub.";
+export const UNKNOWN_LEAD = "The download button links to the disk image on GitHub's latest release.";
 
 // Pure: everything the homepage says about the release, from GitHub's answer.
 // A version, date or size appears beside the button, in the status lead or in

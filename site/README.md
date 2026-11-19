@@ -33,7 +33,7 @@ The hero transcript in `data/demo.js` is real output. It was captured from the r
 
 ## When a release ships
 
-The Download button follows GitHub's latest release, and the homepage asks GitHub which release that is. When GitHub confirms `RELEASE` in `data/facts.js` and the release carries `OpenMessage.dmg`, the page names it as what the button serves. When GitHub reports a newer release with the disk image, the page says it still describes `RELEASE`. When GitHub is unreachable or rate-limited, or the release has no disk image yet, the page names no version beside the button; the copy still names `RELEASE` wherever it makes a claim. To catch up with a new release:
+The Download button follows GitHub's latest release, and the homepage asks GitHub which release that is. When GitHub confirms `RELEASE` in `data/facts.js` and the release carries `OpenMessage.dmg`, the page names it as what the button serves. When GitHub reports a newer release with the disk image, the page says it still describes `RELEASE`. When GitHub does not answer, answers with an error such as its rate limit, or the release has no disk image yet, the page names no version beside the button; the copy still names `RELEASE` wherever it makes a claim. To catch up with a new release:
 
 1. Set `RELEASE` to the new tag and move `MAIN_COMMIT` to current main.
 2. Run `bun run test`. Fix each receipt it flags by re-reading the code at the new ref. If the claim is no longer true, change the copy.

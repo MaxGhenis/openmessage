@@ -80,7 +80,8 @@ describe("pages that use it", () => {
   test("the root layout suffixes page titles in og:title as it does in <title>", () => {
     const layout = read("app/layout.jsx");
     const titleTemplate = /title:\s*\{\s*default:\s*title,\s*template:\s*"%s \| OpenMessage"\s*\}/;
-    expect(layout).toMatch(new RegExp(`metadata = \\{[\\s\\S]*?${titleTemplate.source}`));
+    // The metadata object's own title sits at two spaces of indentation.
+    expect(layout).toMatch(new RegExp(`^  ${titleTemplate.source}`, "m"));
     expect(layout).toMatch(new RegExp(`openGraph:\\s*\\{\\s*${titleTemplate.source}`));
   });
 

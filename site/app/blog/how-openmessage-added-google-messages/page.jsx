@@ -37,9 +37,10 @@ export default function GoogleMessagesPost() {
           Google no longer offers QR pairing
         </a>{" "}
         in the US, so US users pair with cookies. The unreleased code on <code>main</code> drops QR
-        pairing, leaving cookies or a cURL request that carries them as the only way to pair.
+        pairing. You sign in to Google inside the app, which collects the cookies for you, and if
+        that sign-in gives you trouble, you can still paste cookies or a cURL request.
       </p>
-      <Receipts ids={["googleQrRetired"]} />
+      <Receipts ids={["googleQrRetired", "mainGoogleSignIn", "mainPairingFallback"]} />
 
       <h2>The live event path</h2>
       <p>

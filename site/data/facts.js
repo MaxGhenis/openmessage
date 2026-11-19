@@ -146,6 +146,12 @@ export const RECEIPTS = {
     line: 130,
     expect: "failed to persist sent message"
   },
+  sendMediaPersistError: {
+    ref: "release",
+    path: "internal/tools/send_media_to_conversation.go",
+    line: 106,
+    expect: "failed to persist sent message"
+  },
   sendResult: {
     ref: "release",
     path: "internal/tools/send_message.go",
@@ -202,6 +208,23 @@ export const RECEIPTS = {
     path: "internal/tools/import_messages.go",
     line: 89,
     expect: "importSignalDesktop(a.Store, path, name, address)"
+  },
+  whatsappDesktopImport: { ref: "release", path: "cmd/import.go", line: 97, expect: "importer.WhatsAppNative" },
+  localSyncInterval: { ref: "release", path: "cmd/serve.go", line: 266, expect: "time.NewTicker(30 * time.Second)" },
+  imessageSync: { ref: "release", path: "cmd/serve.go", line: 241, expect: "importer.IMessage{MyName: identityName}" },
+  signalDesktopSync: {
+    ref: "release",
+    path: "cmd/serve.go",
+    line: 232,
+    expect: "if signalStatus := a.SignalStatus(); signalStatus.Paired {"
+  },
+  whatsappDesktopSync: { ref: "release", path: "cmd/serve.go", line: 227, expect: "if !a.UsesWhatsAppLiveBridge() {" },
+  localSyncOff: { ref: "release", path: "cmd/serve.go", line: 205, expect: "if app.Sandboxed() || isDemo {" },
+  appSandboxFlag: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/BackendManager.swift",
+    line: 117,
+    expect: '"OPENMESSAGES_APP_SANDBOX": "1"'
   },
   dataFolder: {
     ref: "release",
@@ -310,6 +333,12 @@ export const RECEIPTS = {
     line: 76,
     expect: "try? fm.copyItem(atPath: src, toPath: dst)"
   },
+  downloadMediaTmp: {
+    ref: "release",
+    path: "internal/tools/download_media.go",
+    line: 92,
+    expect: "tmpDir := os.TempDir()"
+  },
   signalDeviceName: {
     ref: "release",
     path: "internal/signallive/client.go",
@@ -335,9 +364,32 @@ export const RECEIPTS = {
     line: 255,
     expect: "func isPrivatePreviewIP"
   },
+  linkPreviewFirst: {
+    ref: "release",
+    path: "internal/web/static/index.html",
+    line: 6897,
+    expect: "extractMessageURLs(m.Body)[0]"
+  },
   storyApiKey: { ref: "release", path: "internal/tools/story.go", line: 119, expect: 'strArg(args, "api_key")' },
   demoMode: { ref: "release", path: "cmd/serve.go", line: 437, expect: "func RunDemo" },
-  demoOffline: { ref: "release", path: "cmd/serve.go", line: 107, expect: "if !isDemo {" },
+  demoSkipsGoogle: {
+    ref: "release",
+    path: "cmd/serve.go",
+    line: 143,
+    expect: "Demo mode — skipping phone connection"
+  },
+  demoSkipsWhatsApp: {
+    ref: "release",
+    path: "cmd/serve.go",
+    line: 151,
+    expect: "Demo mode — skipping WhatsApp live bridge"
+  },
+  demoSkipsSignal: {
+    ref: "release",
+    path: "cmd/serve.go",
+    line: 159,
+    expect: "Demo mode — skipping Signal live bridge"
+  },
   sourcePlatformColumn: {
     ref: "release",
     path: "internal/db/db.go",
@@ -454,6 +506,18 @@ export const RECEIPTS = {
     path: "cmd/pair.go",
     line: 325,
     expect: "OpenMessage no longer supports Google Messages QR pairing"
+  },
+  mainGoogleSignIn: {
+    ref: "main",
+    path: "macos/OpenMessage/Sources/PairingView.swift",
+    line: 33,
+    expect: "OpenMessage uses Google Account pairing instead of QR codes."
+  },
+  mainPairingFallback: {
+    ref: "main",
+    path: "macos/OpenMessage/Sources/PairingView.swift",
+    line: 101,
+    expect: "Trouble signing in? Use the advanced method"
   },
   outboxFlag: { ref: "main", path: "cmd/v2stack.go", line: 56, expect: "OPENMESSAGES_V2_SEND" },
   outboxUncertain: {

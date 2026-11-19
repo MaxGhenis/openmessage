@@ -112,7 +112,7 @@ export default async function HomePage() {
             </div>
             <p className="hero__release">
               {copy.hero && `${copy.hero} `}
-              OpenMessage is free, needs no sign-up and runs on macOS {MIN_MACOS} or later.
+              OpenMessage costs nothing, needs no sign-up and runs on macOS {MIN_MACOS} or later.
             </p>
 
             <div className="readers">
@@ -186,10 +186,10 @@ export default async function HomePage() {
                 <div className="fact">
                   <h3>{WARNED_TOOLS.length} tools warn the model about message text</h3>
                   <p>
-                    Before the message text in results from {toolNames(WARNED_TOOLS)}, OpenMessage
-                    puts a warning that tells the model to ignore instructions inside message
-                    bodies. {toolNames(UNWARNED_QUOTING_TOOLS)} quote message text without that
-                    warning.
+                    OpenMessage puts a warning before the message text in results from{" "}
+                    {toolNames(WARNED_TOOLS)}. The warning tells the model to ignore instructions
+                    inside message bodies. {toolNames(UNWARNED_QUOTING_TOOLS)} quote message text
+                    without it.
                   </p>
                   <Receipts ids={["untrustedPreamble", "storyQuotes", "statsPhrases"]} />
                 </div>
@@ -238,12 +238,32 @@ signal|11`}</code>
                   <h3>Import older history</h3>
                   <p>
                     The command line and the <code>import_messages</code> tool load older history
-                    from four sources: iMessage&rsquo;s <code>chat.db</code> on your Mac, a Google
-                    Chat Takeout, a WhatsApp chat export and Signal Desktop. You can read imported
-                    iMessage and Google Chat threads but not reply to them, because OpenMessage has
-                    no live connection to either.
+                    from iMessage&rsquo;s <code>chat.db</code> on your Mac, a Google Chat Takeout, a
+                    WhatsApp chat export and Signal Desktop. The command line can also read
+                    WhatsApp Desktop&rsquo;s own database. You can read imported iMessage and
+                    Google Chat threads but not reply to them, because OpenMessage has no live
+                    connection to either.
                   </p>
-                  <Receipts ids={["imessageImport", "importCommands", "importSources"]} />
+                  <p>
+                    When you run <code>openmessage serve</code> from a command-line build, it
+                    imports new messages from iMessage every 30 seconds. It does the same for
+                    Signal Desktop once you link Signal, and for WhatsApp Desktop until you link
+                    WhatsApp. The Mac app turns that sync off.
+                  </p>
+                  <Receipts
+                    ids={[
+                      "imessageImport",
+                      "importCommands",
+                      "importSources",
+                      "whatsappDesktopImport",
+                      "localSyncInterval",
+                      "imessageSync",
+                      "signalDesktopSync",
+                      "whatsappDesktopSync",
+                      "localSyncOff",
+                      "appSandboxFlag"
+                    ]}
+                  />
                 </div>
                 <div className="fact">
                   <h3>OpenMessage keeps logins beside the database</h3>
@@ -281,7 +301,7 @@ signal|11`}</code>
               <Image
                 className="shot__img"
                 src={appScreenshot}
-                alt="OpenMessage's web interface. The sidebar highlights Jordan Rivera, above a second Jordan Rivera row that holds the Signal thread. The thread shows four SMS messages under tabs for SMS and WhatsApp."
+                alt="In OpenMessage's web interface, the sidebar highlights Jordan Rivera, above a second Jordan Rivera row that holds the Signal thread. The open thread shows four SMS messages under tabs for SMS and WhatsApp."
                 sizes="(max-width: 72rem) 100vw, 67rem"
                 placeholder="empty"
               />
@@ -327,13 +347,20 @@ signal|11`}</code>
                     <code>send_message</code> reports &ldquo;Message sent&rdquo; when the network
                     accepts the message, and its result says nothing about delivery or reading. For
                     SMS, <code>send_to_conversation</code> and <code>send_group_message</code> report
-                    success without checking Google&rsquo;s answer. <code>send_message</code> and{" "}
-                    <code>send_to_conversation</code> can also report an error after the network
-                    has taken the message, when OpenMessage fails to save its own copy. An agent
-                    that retries on that error sends the message twice.
+                    success without checking Google&rsquo;s answer. <code>send_message</code>,{" "}
+                    <code>send_to_conversation</code> and <code>send_media_to_conversation</code> can
+                    also report an error after the network has taken the message, when OpenMessage
+                    fails to save its own copy. An agent that retries on that error sends the
+                    message twice.
                   </p>
                   <Receipts
-                    ids={["sendResult", "sendUnchecked", "groupSendUnchecked", "sendPersistError"]}
+                    ids={[
+                      "sendResult",
+                      "sendUnchecked",
+                      "groupSendUnchecked",
+                      "sendPersistError",
+                      "sendMediaPersistError"
+                    ]}
                   />
                 </div>
                 <div className="fact">
@@ -341,7 +368,7 @@ signal|11`}</code>
                   <p>
                     Text that a tool returns goes to the model behind your agent, so anyone who can
                     text you can put instructions in front of that model. The warning some tools add
-                    tells the model to ignore them, and nothing makes it comply.
+                    tells the model to ignore such instructions, and nothing makes the model comply.
                   </p>
                 </div>
                 <div className="fact">
@@ -556,7 +583,7 @@ signal|11`}</code>
                 in a browser to see the demo conversations. The demo connects to none of the three
                 networks.
               </p>
-              <Receipts ids={["demoMode", "demoOffline"]} />
+              <Receipts ids={["demoMode", "demoSkipsGoogle", "demoSkipsWhatsApp", "demoSkipsSignal"]} />
             </div>
           </div>
         </section>
