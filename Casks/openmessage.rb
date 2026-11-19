@@ -8,22 +8,25 @@
 #     brew install --cask maxghenis/openmessage/openmessage
 #
 # The release workflow publishes a SHA256SUMS file alongside the DMG; bump the
-# `version` and `sha256` fields when cutting a new release.
+# `version` and `sha256` fields after each release publishes (see the
+# "Homebrew Cask" section of docs/release-checklist.md).
 
 cask "openmessage" do
-  version "0.2.0"
-  sha256 :no_check # replace with the real sha256 from SHA256SUMS once cut
+  version "0.2.9"
+  sha256 "a0f96618f65b4ecbc7bbe005229040fd70ccaa9e760b0b48761d36a6f7bd9ad9"
 
   url "https://github.com/MaxGhenis/openmessage/releases/download/v#{version}/OpenMessage.dmg"
   name "OpenMessage"
   desc "Local-first desktop for SMS, RCS, WhatsApp, and Signal with built-in MCP"
-  homepage "https://openmessage.ai"
+  homepage "https://openmessage.ai/"
+
+  depends_on macos: :sonoma
 
   app "OpenMessage.app"
 
   zap trash: [
     "~/Library/Application Support/OpenMessage",
-    "~/Library/Preferences/com.openmessage.OpenMessage.plist",
     "~/Library/Caches/com.openmessage.OpenMessage",
+    "~/Library/Preferences/com.openmessage.OpenMessage.plist",
   ]
 end

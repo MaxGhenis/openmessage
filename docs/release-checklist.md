@@ -44,3 +44,22 @@ Use this before shipping a TestFlight/App Store build, public website update, or
 - No failing required CI checks.
 - Release artifacts are generated from the intended commit.
 - Rollback path is known before promoting a website deployment or public build.
+
+## 7. Homebrew Cask
+
+Do this after the release workflow has published the release, so the cask pins the bytes users actually download.
+
+```bash
+tag=vX.Y.Z
+checksums_dir="$(mktemp -d)"
+gh release download "$tag" --repo MaxGhenis/openmessage --pattern SHA256SUMS --dir "$checksums_dir"
+grep ' OpenMessage.dmg$' "$checksums_dir/SHA256SUMS"
+gh release view "$tag" --repo MaxGhenis/openmessage --json assets \
+  --jq '.assets[] | select(.name == "OpenMessage.dmg") | .digest | ltrimstr("sha256:")'
+```
+
+- The two hashes must match. The cask's `sha256` takes exactly the 64 hex digits; GitHub's digest starts with `sha256:`, which the `ltrimstr` drops. A release cut by hand may have no SHA256SUMS; use the digest then.
+- In `Casks/openmessage.rb`, set `version` to the tag without its `v` and `sha256` to that hash, then open a PR. Until it merges, the cask keeps installing whatever version `main` pins.
+- In the same PR, keep `depends_on macos:` matching the release's `LSMinimumSystemVersion` in `macos/OpenMessage/Sources/Info.plist` (14.0 is `:sonoma`).
+- Don't replace a published DMG with different bytes; cut a new tag instead. Once the cask pins a DMG, a replacement fails every fresh `brew install` with a checksum error until a PR with the new hash reaches `main`, and `gh release upload --clobber` deletes the old asset before the new one lands. If a replacement can't be avoided, re-run all jobs of the tag's original release run (GitHub allows re-runs for 30 days), which rebuilds the DMG and regenerates SHA256SUMS. A manual `gh release upload ... --clobber` of the DMG alone leaves SHA256SUMS stale, so take the hash from the digest then. Either way, bump the cask right after.
+- This repo, which serves as its own tap, holds the only official copy of the cask: `MaxGhenis/homebrew-tap` and `homebrew/cask` don't carry it. If either ever does, bump that copy too.
