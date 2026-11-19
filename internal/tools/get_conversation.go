@@ -49,6 +49,7 @@ func getConversationHandler(a *app.App, configured ...Options) server.ToolHandle
 		}
 
 		var sb strings.Builder
+		sb.WriteString(messagePreamble)
 		// Show conversation info
 		if convErr == nil && conv != nil {
 			platform := conv.SourcePlatform
@@ -62,7 +63,6 @@ func getConversationHandler(a *app.App, configured ...Options) server.ToolHandle
 			sb.WriteString("---\n")
 		}
 
-		sb.WriteString(messagePreamble)
 		summaries := make([]messageSummary, 0, len(msgs))
 		for _, m := range msgs {
 			summaries = append(summaries, summarizeMessage(m))

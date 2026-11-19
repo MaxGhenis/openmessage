@@ -48,7 +48,9 @@ func conversationStatsHandler(a *app.App) server.ToolHandlerFunc {
 		stats := story.ComputeStats(msgs, nil)
 		statsJSON, _ := json.MarshalIndent(stats, "", "  ")
 
+		// Top phrases (here and in the stats JSON) are message text.
 		var sb strings.Builder
+		sb.WriteString(messagePreamble)
 		conv, _ := a.Store.GetConversation(convID)
 		if conv != nil {
 			platform := conv.SourcePlatform
@@ -136,7 +138,10 @@ func generateStoryHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("generate story: %v", err)), nil
 		}
 
+		// Quotes are message bodies, and an API-written narrative is built
+		// from them.
 		var sb strings.Builder
+		sb.WriteString(messagePreamble)
 		fmt.Fprintf(&sb, "# %s\n\n", s.Title)
 		fmt.Fprintf(&sb, "%s\n\n", s.Summary)
 		fmt.Fprintf(&sb, "---\n\n")
@@ -199,7 +204,9 @@ func personStatsHandler(a *app.App) server.ToolHandlerFunc {
 		stats := story.ComputeStats(msgs, nil)
 		statsJSON, _ := json.MarshalIndent(stats, "", "  ")
 
+		// Top phrases (here and in the stats JSON) are message text.
 		var sb strings.Builder
+		sb.WriteString(messagePreamble)
 		fmt.Fprintf(&sb, "Stats for messages with '%s' across %d conversation(s):\n", name, len(convNames))
 		for _, cn := range convNames {
 			fmt.Fprintf(&sb, "  - %s\n", cn)
@@ -284,7 +291,10 @@ func generatePersonStoryHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("generate story: %v", err)), nil
 		}
 
+		// Quotes are message bodies, and an API-written narrative is built
+		// from them.
 		var sb strings.Builder
+		sb.WriteString(messagePreamble)
 		fmt.Fprintf(&sb, "# %s\n\n", s.Title)
 		fmt.Fprintf(&sb, "*Based on %d messages across %d conversation(s): %s*\n\n",
 			s.Stats.TotalMessages, len(convNames), strings.Join(convNames, ", "))
@@ -382,6 +392,7 @@ func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.Too
 		}
 
 		var sb strings.Builder
+		sb.WriteString(messagePreamble)
 		fmt.Fprintf(&sb, "Messages with '%s' from %s to %s (%d messages from %d conversation(s): %s)\n\n",
 			name, afterStr, beforeStr, len(deduped), len(convNames), strings.Join(convNames, ", "))
 		// Only when the read actually hit the cap (pre-dedup count): a window
@@ -389,7 +400,6 @@ func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.Too
 		if capped && len(msgs) >= limit {
 			fmt.Fprintf(&sb, "Note: limit capped at %d on the v2 store and the window holds more; only the newest messages are shown — narrow the range for complete coverage.\n\n", maxPersonMessagesRangeLimit)
 		}
-		sb.WriteString(messagePreamble)
 
 		for _, m := range deduped {
 			// Local time, matching the local-time window bounds above.

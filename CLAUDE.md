@@ -156,6 +156,16 @@ mode this prevents and the `~/.mcp.json` recipe.
   copy under the export root; an attachment its platform can no longer
   deliver comes back as "attachment unavailable" with the reason
 
+A tool result that carries message-derived text (bodies, transcripts, story
+quotes, top phrases) starts with `messagePreamble` (internal/tools/tools.go),
+the untrusted-content warning, before any header. Structured payloads that
+carry such text also set `contains_untrusted_text: true`.
+`internal/tools/untrusted_preamble_test.go` calls every registered tool in
+legacy, v2-primary and client mode against a store seeded with a marker only
+senders wrote. It fails if a result carries the marker without the preamble.
+It also fails if a registered tool has no entry in its argument table, so add
+one for each new tool.
+
 Optional API story generation uses `claude-sonnet-5-5` with medium effort and
 a 16,000-token limit when the caller supplies an Anthropic API key. Without a
 key, or if the API fails or refuses the request, it generates a local
