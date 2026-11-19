@@ -42,6 +42,8 @@ test("next.config.mjs stops a production build without CRON_SECRET, and only a b
   }
   process.env.CRON_SECRET = "s3cret";
   assert.equal(typeof config(PHASE_PRODUCTION_BUILD).headers, "function");
+  // tests/config.test.js checks the headers on the server phase's config.
+  assert.equal(config(PHASE_PRODUCTION_BUILD), config(PHASE_PRODUCTION_SERVER), "a build gets the same config as every other phase");
   delete process.env.CRON_SECRET;
   process.env.VERCEL_ENV = "preview";
   assert.equal(typeof config(PHASE_PRODUCTION_BUILD).redirects, "function", "a preview build goes ahead");

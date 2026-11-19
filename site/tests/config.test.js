@@ -2,9 +2,14 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PHASE_PRODUCTION_SERVER } from "next/constants.js";
 import { describe, expect, test } from "vitest";
 
-import nextConfig from "../next.config.mjs";
+import config from "../next.config.mjs";
+
+// next.config.mjs exports a function of the build phase. Every phase gets the
+// same object (tests/deploy-checks.test.js); only a build also checks the env.
+const nextConfig = config(PHASE_PRODUCTION_SERVER);
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 

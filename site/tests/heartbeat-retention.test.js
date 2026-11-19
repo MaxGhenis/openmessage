@@ -359,5 +359,6 @@ describe("GET /api/cron/expire-heartbeats", () => {
 test("the privacy page states the retention period the cron enforces", () => {
   const page = readFileSync(path.join(siteRoot, "app/privacy/page.jsx"), "utf8").replace(/\s+/g, " ");
   expect(page).toContain(`deletes each record once it is ${RETENTION.heartbeatDays} days old`);
-  expect(page).not.toMatch(/Nothing deletes them/);
+  // Earlier wordings that said the records never expire.
+  expect(page).not.toMatch(/Nothing deletes them|keeps them until I delete them/);
 });
