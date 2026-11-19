@@ -13,6 +13,7 @@ import { test } from "vitest";
 import {
   HEARTBEAT,
   WAITLIST,
+  WAITLIST_THANKS,
   canStore,
   createRateLimiter,
   handleHeartbeat,
@@ -80,14 +81,58 @@ test("readJSONBody caps the body by header and by actual size", async () => {
   assert.deepEqual(await readJSONBody(post(JSON.stringify("é".repeat(60))), 100), { status: 413 });
 });
 
+// A cross-site page can send these Content-Types (or none) without a CORS
+// preflight; application/json needs one, and the routes never grant it.
+test("readJSONBody reads only a JSON Content-Type, whatever its case or parameters", async () => {
+  for (const type of ["application/json", "Application/JSON", "application/json; charset=utf-8"]) {
+    assert.deepEqual(await readJSONBody(post({ a: 1 }, { headers: { "content-type": type } }), 100), { value: { a: 1 } }, type);
+  }
+  for (const type of ["text/plain;charset=UTF-8", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "text/json"]) {
+    assert.deepEqual(await readJSONBody(post({ a: 1 }, { headers: { "content-type": type } }), 100), { status: 415 }, type);
+  }
+  // A Blob body with no type leaves the request with no Content-Type at all.
+  const untyped = new Request("https://openmessage.ai/api/test", { method: "POST", body: new Blob(['{"a":1}']) });
+  assert.equal(untyped.headers.get("content-type"), null);
+  assert.deepEqual(await readJSONBody(untyped, 100), { status: 415 });
+});
+
 test("formats: emails are bounded and install ids match the app's", () => {
   assert.equal(isValidEmail("a@b.co"), true);
   assert.equal(isValidEmail(`${"a".repeat(WAITLIST.maxEmailLength - 5)}@b.co`), true);
   assert.equal(isValidEmail(`${"a".repeat(WAITLIST.maxEmailLength - 4)}@b.co`), false);
+  assert.equal(isValidEmail("jöhn@exämple.com"), true, "an internationalized address");
+  for (const bad of ["a\u001b[8m@b.co", "\u001b]0;title\u0007@b.co", "a\u0000b@c.co", "a\u202eb@c.co", "a\u200b@b.co", "a@b.co\u009b", "a\u00ad@b.co"]) {
+    assert.equal(isValidEmail(bad), false, JSON.stringify(bad));
+  }
   assert.equal(isInstallID(INSTALL), true);
   for (const bad of [INSTALL.toUpperCase(), INSTALL.slice(1), `${INSTALL}0`, "attacker-install-000001", 42, null]) {
     assert.equal(isInstallID(bad), false, String(bad));
   }
+});
+
+// scripts/read-waitlist.mjs prints addresses to a terminal, so one control or
+// format character anywhere makes an otherwise valid address invalid.
+const controlOrFormat = fc
+  .oneof(
+    fc.integer({ min: 0x00, max: 0x1f }),
+    fc.integer({ min: 0x7f, max: 0x9f }),
+    fc.constantFrom(0xad, 0x200b, 0x200e, 0x202e, 0x2066, 0xfeff, 0xe0001)
+  )
+  .map((codePoint) => String.fromCodePoint(codePoint));
+
+test("an address with a control or format character anywhere is invalid (property)", () => {
+  const local = fc.stringMatching(/^[a-z0-9][a-z0-9._+-]{0,20}$/);
+  const domain = fc.stringMatching(/^[a-z0-9-]{1,15}\.[a-z]{2,6}$/);
+  fc.assert(
+    fc.property(local, domain, controlOrFormat, fc.nat(), (name, host, char, at) => {
+      assert.match(char, /^[\p{Cc}\p{Cf}]$/u);
+      const address = `${name}@${host}`;
+      assert.equal(isValidEmail(address), true, address);
+      const i = at % (address.length + 1);
+      assert.equal(isValidEmail(address.slice(0, i) + char + address.slice(i)), false);
+    }),
+    { numRuns: 300 }
+  );
 });
 
 test("rate limiter: limit per window, a fresh window after it, bounded keys", () => {
@@ -112,7 +157,7 @@ test("underDailyBudget stops at the cap", async () => {
 test("waitlist: one encrypted object per address per day, and the path hides the address", async () => {
   const blob = fakeBlob();
   const first = await handleWaitlist(post({ email: "Ann@Example.com", interest: "mcp" }), deps(blob));
-  assert.equal(first.status, 200);
+  assert.deepEqual(first, { status: 200, body: { ok: true, message: WAITLIST_THANKS } });
   const again = await handleWaitlist(post({ email: "ann@example.com ", interest: "signal" }), deps(blob));
   assert.equal(again.status, 200);
   assert.equal(blob.objects.size, 1, "a repeat sign-up replaces the day's object");
@@ -134,10 +179,20 @@ test("waitlist: rejects without writing", async () => {
     [post({ email: "a@b.co", interest: "other" }), 400],
     [post("x".repeat(WAITLIST.maxBodyBytes + 1)), 413],
     [post("{"), 400],
+    // What <form enctype="text/plain"> on another site sends.
+    [post({ email: "a@b.co", interest: "", x: "=" }, { headers: { "content-type": "text/plain" } }), 415],
+    // SGR 8 (conceal) and an OSC 8 link, which would hide or disguise later output in a terminal.
+    [post({ email: "x\u001b[8m\u001b]8;;https://evil.example/\u0007ok\u001b]8;;\u0007@b.co" }), 400],
   ];
   for (const [request, status] of cases) {
     assert.equal((await handleWaitlist(request, deps(blob))).status, status);
   }
+  // Only the invalid-address error names the field, so the form marks it alone.
+  assert.deepEqual(await handleWaitlist(post({ email: "a\u001b@b.co" }), deps(blob)), {
+    status: 400,
+    body: { error: "Enter a valid email address.", field: "email" },
+  });
+  assert.equal((await handleWaitlist(post({ email: "a@b.co", interest: "other" }), deps(blob))).body.field, undefined);
   assert.deepEqual(await handleWaitlist(post({ email: "a@b.co", website: "spam" }), deps(blob)), { status: 200, body: { ok: true, message: "Thanks." } });
   assert.equal((await handleWaitlist(post({ email: "a@b.co" }), deps(blob, { env: { BLOB_READ_WRITE_TOKEN: "t" } }))).status, 503);
   assert.equal((await handleWaitlist(post({ email: "a@b.co" }), deps(blob, { env: { ...ENV, WAITLIST_ENCRYPTION_KEY: "abcd" } }))).status, 503);
@@ -178,6 +233,9 @@ test("heartbeat: one object per install per day, only for the app's id format", 
     assert.equal((await handleHeartbeat(post(bad), deps(blob))).status, 400);
   }
   assert.equal((await handleHeartbeat(post("x".repeat(HEARTBEAT.maxBodyBytes + 1)), deps(blob))).status, 413);
+  assert.deepEqual(await handleHeartbeat(post(beat, { headers: { "content-type": "text/plain;charset=UTF-8" } }), deps(blob)), { status: 415, body: { ok: false } });
+  // A charset parameter still reads as JSON; the repeat replaces the same object.
+  assert.deepEqual(await handleHeartbeat(post(beat, { headers: { "content-type": "application/json; charset=utf-8" } }), deps(blob)), { status: 200, body: { ok: true } });
   assert.deepEqual(await handleHeartbeat(post(beat), deps(blob, { env: {} })), { status: 200, body: { ok: true, persisted: false } });
   assert.equal((await handleHeartbeat(post(beat), deps(blob, { allow: () => false }))).status, 429);
   assert.equal(blob.objects.size, 1);

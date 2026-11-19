@@ -10,11 +10,12 @@ export default function WhatsAppPost() {
   return (
     <Post
       slug={slug}
-      lead={`OpenMessage connects to WhatsApp as a linked device, from a session on your Mac. Version ${RELEASE.version} syncs new messages, receipts and the history WhatsApp sends a newly linked device.`}
+      lead={`OpenMessage connects to WhatsApp as a linked device on your Mac. Version ${RELEASE.version} syncs new messages, receipts and the history WhatsApp sends a newly linked device.`}
     >
       <h2>A linked device on your Mac</h2>
       <p>
-        You scan a QR code from WhatsApp on your phone, as you would for WhatsApp Web. OpenMessage
+        OpenMessage shows a QR code, and you scan it with WhatsApp on your phone, as you would for
+        WhatsApp Web. OpenMessage
         then holds its own linked-device session through whatsmeow, an open-source library that
         WhatsApp does not support. OpenMessage keeps the session&rsquo;s keys in their own SQLite
         file beside the message database.
@@ -24,9 +25,9 @@ export default function WhatsAppPost() {
       <h2>What it syncs</h2>
       <p>
         New messages arrive as events, and OpenMessage writes them to the same{" "}
-        <code>messages</code> table as SMS and Signal. The session also handles delivery receipts, typing notices from the other
-        person, and the history WhatsApp sends a newly linked device. You can send text, replies,
-        attachments and reactions.
+        <code>messages</code> table as SMS and Signal. OpenMessage also handles delivery receipts and
+        typing notices from the other person, and imports each batch of history WhatsApp sends. You
+        can send text, replies, attachments and reactions.
       </p>
       <Receipts ids={["whatsappReceipts", "whatsappTyping", "whatsappHistory"]} />
 
@@ -44,8 +45,8 @@ export default function WhatsAppPost() {
           WhatsApp&rsquo;s terms
         </a>{" "}
         forbid reverse engineering its service and let it suspend an account at any time. A
-        linked-device client on whatsmeow falls on the wrong side of that. Pair an account
-        you could stand to lose.
+        linked-device client that uses whatsmeow breaks those terms, so pair an account you could
+        stand to lose.
       </p>
     </Post>
   );

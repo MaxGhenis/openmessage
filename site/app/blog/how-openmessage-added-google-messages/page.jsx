@@ -10,21 +10,21 @@ export default function GoogleMessagesPost() {
   return (
     <Post
       slug={slug}
-      lead="OpenMessage connected to Google Messages first. Google Messages carries SMS and RCS from an Android phone, and the way OpenMessage handles it set the pattern for WhatsApp and Signal."
+      lead="Google Messages carries SMS and RCS from an Android phone. OpenMessage pairs with it, receives new messages as they arrive and stores them in the same table as WhatsApp and Signal messages."
     >
       <p>
-        In April I wrote that the Google connection recovered cleanly when something went wrong.
-        Version {RELEASE.version} cannot renew an expired Google session, so you pair again when
-        one lapses.
+        In April I wrote that the Google connection recovered cleanly when something went wrong,
+        but version {RELEASE.version} cannot renew an expired Google Messages login, so you pair
+        again when it lapses.
       </p>
 
       <h2>Pairing</h2>
       <p>
-        OpenMessage links to your phone the way Google Messages for web does. It uses a fork of
-        the open-source mautrix-gmessages library, which Google does not support. You can pair
-        by scanning a QR code with the Google Messages app. You can also give OpenMessage the
-        cookies your browser holds for <code>messages.google.com</code>, then tap a matching emoji
-        on your phone.
+        OpenMessage links to your phone the way Google Messages for web does, through a fork of
+        mautrix-gmessages, an open-source library that Google does not support. You can pair by
+        scanning a QR code with the Google Messages app. You can also give OpenMessage the cookies
+        your browser holds for <code>messages.google.com</code>, then tap a matching emoji on your
+        phone.
       </p>
       <Receipts
         ids={["gmessagesFork", "googleQrPairing", "googleCookiePairing", "googleEmojiConfirm"]}
@@ -36,16 +36,17 @@ export default function GoogleMessagesPost() {
         >
           Google no longer offers QR pairing
         </a>{" "}
-        in the US, so there you pair with cookies. Code on <code>main</code> drops QR setup and
-        sets up Google Messages through your Google account instead.
+        in the US, so US users pair with cookies. The unreleased code on <code>main</code> drops QR
+        pairing. You sign in to Google inside the app, which collects the cookies for you, and if
+        that sign-in gives you trouble, you can still paste cookies or a cURL request.
       </p>
-      <Receipts ids={["googleQrRetired"]} />
+      <Receipts ids={["googleQrRetired", "mainGoogleSignIn", "mainPairingFallback"]} />
 
       <h2>The live event path</h2>
       <p>
-        After you pair, the backend holds a session with Google and receives events as they happen.
-        It writes each incoming message to the local database and tells the app which
-        conversation changed, so the thread redraws.
+        After you pair, OpenMessage holds a session with Google and takes each event as Google
+        sends it. It writes each incoming message to the local database and tells the app&rsquo;s
+        interface which conversation changed, so the thread redraws.
       </p>
       <Receipts ids={["googleHandleMessage", "googleStoreMessage", "googleNotifyUi"]} />
 
@@ -53,23 +54,23 @@ export default function GoogleMessagesPost() {
       <p>
         OpenMessage writes Google Messages rows to the same <code>messages</code> table that
         WhatsApp and Signal use, and tags each row with its network. Search, the sidebar and the MCP tools read
-        that table, so one query or one tool call covers all three.
+        that table, so one query or one tool call can cover all three.
       </p>
       <Receipts ids={["messagesDb", "searchIndex", "toolRegistry"]} />
 
       <h2>What breaks</h2>
       <p>
-        The cookies behind a Google account session rotate, and a session can expire after the
-        backend has been offline for a while. Code on <code>main</code> refreshes the session from
-        your local Chrome profile and reconnects with backoff; it has not shipped in a release
-        yet.
+        The cookies behind a Google Messages login rotate, and the login can expire when
+        OpenMessage stays offline for a while. The code on <code>main</code> refreshes the login
+        from your local Chrome profile and reconnects with backoff.
       </p>
       <Receipts ids={["googleRefresh", "supervisorBackoff"]} />
       <p>
-        On <code>main</code>, OpenMessage compares each network&rsquo;s silence with its own recent
-        traffic and flags a network that has gone quiet for longer than that history explains.
+        The code on <code>main</code> also compares each network&rsquo;s silence with its own
+        recent traffic and flags a network that has gone quiet for longer than that history
+        explains.
       </p>
-      <Receipts ids={["silenceDefaults"]} />
+      <Receipts ids={["silenceDefaults", "statusSilence"]} />
     </Post>
   );
 }

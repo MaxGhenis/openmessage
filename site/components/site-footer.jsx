@@ -7,15 +7,14 @@ export function SiteFooter() {
     <footer className="foot">
       <div className="wrap foot__inner">
         <p>
-          OpenMessage is free and open source, made by{" "}
           <a href="https://maxghenis.com" rel="noopener">
             Max Ghenis
           </a>{" "}
           and{" "}
           <a href={`${REPO_URL}/graphs/contributors`} rel="noopener">
             contributors
-          </a>
-          .
+          </a>{" "}
+          build OpenMessage as free, open-source software.
         </p>
         <nav className="foot__links" aria-label="Footer">
           <a href={REPO_URL} rel="noopener">

@@ -1,13 +1,20 @@
 import { RELEASE, REPO } from "../data/facts.js";
 
 // The Download button redirects to GitHub's "latest release", so the page asks
-// GitHub which release that is instead of trusting a constant. If GitHub is
-// unreachable or rate-limited the page falls back to the release these facts
-// were checked against, and says nothing it cannot back up.
+// GitHub which release that is instead of trusting a constant. The copy
+// describes RELEASE, and the tests check it there. When GitHub confirms that
+// release with its disk image, the page names it as what the button serves;
+// when GitHub reports a newer one, the page says so; and when GitHub does not
+// answer, answers with an error such as its rate limit, or reports anything
+// else, including a release without the disk image, the page names no version
+// beside the button.
 
 const API = `https://api.github.com/repos/${REPO}`;
 const HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
-const REVALIDATE_SECONDS = 3600;
+// Short, so once a new release ships the page names it within one five-minute
+// revalidation of the next visit (the visit that triggers regeneration still
+// gets the old page). The button itself always follows GitHub's latest release.
+const REVALIDATE_SECONDS = 300;
 
 export const FALLBACK_RELEASE = {
   tag: RELEASE.tag,
@@ -39,30 +46,69 @@ export function normalizeRelease(payload) {
   return { tag, version: tag.slice(1), publishedAt, dmgBytes, live: true };
 }
 
-// Pure: reads the commit total out of the Link header GitHub sends for
-// `commits?per_page=1`, whose last page number is the number of commits.
-// Null when the header is missing or has no last page.
-export function parseCommitTotal(linkHeader) {
-  if (typeof linkHeader !== "string") {
+// Pure: compares two "x.y.z" versions numerically. Returns -1, 0 or 1, or null
+// when either is not three dot-separated whole numbers.
+export function compareVersions(a, b) {
+  const parse = (version) => {
+    if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
+      return null;
+    }
+    const parts = version.split(".").map(Number);
+    return parts.every(Number.isSafeInteger) ? parts : null;
+  };
+  const left = parse(a);
+  const right = parse(b);
+  if (!left || !right) {
     return null;
   }
-  const match = linkHeader.match(/[?&]page=(\d+)>;\s*rel="last"/);
-  if (!match) {
-    return null;
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) {
+      return left[index] < right[index] ? -1 : 1;
+    }
   }
-  const total = Number(match[1]);
-  return Number.isSafeInteger(total) && total > 0 ? total : null;
+  return 0;
 }
 
-// Pure: commits on main beyond the release, given main's total. Null if the
-// total is unknown or smaller than the release's own count (which would mean
-// the inputs disagree, so no number is better than a wrong one).
-export function commitsAheadOf(mainTotal, releaseTotal) {
-  if (!Number.isSafeInteger(mainTotal) || !Number.isSafeInteger(releaseTotal)) {
-    return null;
+// Pure: how the release GitHub reports relates to the one the copy describes.
+// "same" when GitHub answered with that release, "newer" when it answered with
+// a later one, and "unknown" otherwise: no answer, or an older or odd tag.
+export function releaseStatus(release, described = RELEASE.version) {
+  if (!release || release.live !== true) {
+    return "unknown";
   }
-  const ahead = mainTotal - releaseTotal;
-  return ahead >= 0 ? ahead : null;
+  const order = compareVersions(release.version, described);
+  if (order === 0) {
+    return "same";
+  }
+  return order === 1 ? "newer" : "unknown";
+}
+
+export const UNKNOWN_LEAD = "The download button links to the disk image on GitHub's latest release.";
+
+// Pure: everything the homepage says about the release, from GitHub's answer.
+// A version, date or size appears beside the button, in the status lead or in
+// the JSON-LD only when GitHub confirmed a release no older than the one the
+// copy describes, dated and carrying the disk image the button downloads. The
+// list of changes on main shows only when GitHub confirmed that release itself,
+// and the newer-release note only when it reported a later one.
+export function releaseCopy(release, described = RELEASE.version) {
+  const status = releaseStatus(release, described);
+  const date = status === "unknown" ? "" : formatDate(release.publishedAt);
+  const size = status === "unknown" ? "" : formatMegabytes(release.dmgBytes);
+  if (!date || !size) {
+    return { status: "unknown", hero: "", lead: UNKNOWN_LEAD, jsonLd: {}, showNewer: false, showMainList: false };
+  }
+  return {
+    status,
+    hero: `Version ${release.version} came out ${date}, as a ${size} download.`,
+    lead: `The download button serves version ${release.version}, which came out ${date}.`,
+    jsonLd: {
+      softwareVersion: release.version,
+      datePublished: new Date(Date.parse(release.publishedAt)).toISOString().slice(0, 10)
+    },
+    showNewer: status === "newer",
+    showMainList: status === "same"
+  };
 }
 
 async function getJson(url) {
@@ -81,27 +127,10 @@ export async function getLatestRelease() {
   }
 }
 
-// How many commits main has, or null when GitHub can't say. One small request:
-// the count comes from the pagination header, so no commit data is downloaded.
-export async function getMainCommitTotal() {
-  try {
-    const response = await fetch(`${API}/commits?sha=main&per_page=1`, {
-      headers: HEADERS,
-      next: { revalidate: REVALIDATE_SECONDS }
-    });
-    if (!response.ok) {
-      return null;
-    }
-    return parseCommitTotal(response.headers.get("link"));
-  } catch {
-    return null;
-  }
-}
-
 // "2026-04-21T18:56:16Z" -> "April 21, 2026", in UTC so every visitor and
 // every build reads the same date.
 export function formatDate(iso) {
-  const time = Date.parse(iso);
+  const time = typeof iso === "string" ? Date.parse(iso) : NaN;
   if (Number.isNaN(time)) {
     return "";
   }
