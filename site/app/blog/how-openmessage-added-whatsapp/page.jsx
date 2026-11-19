@@ -14,7 +14,8 @@ export default function WhatsAppPost() {
     >
       <h2>A linked device on your Mac</h2>
       <p>
-        You scan a QR code from WhatsApp on your phone, as you would for WhatsApp Web. OpenMessage
+        You scan the QR code OpenMessage shows with WhatsApp on your phone, as you would for
+        WhatsApp Web. OpenMessage
         then holds its own linked-device session through whatsmeow, an open-source library that
         WhatsApp does not support. OpenMessage keeps the session&rsquo;s keys in their own SQLite
         file beside the message database.
@@ -44,7 +45,7 @@ export default function WhatsAppPost() {
           WhatsApp&rsquo;s terms
         </a>{" "}
         forbid reverse engineering its service and let it suspend an account at any time. A
-        linked-device client built on whatsmeow breaks those terms, so pair an account you could
+        linked-device client that uses whatsmeow breaks those terms, so pair an account you could
         stand to lose.
       </p>
     </Post>

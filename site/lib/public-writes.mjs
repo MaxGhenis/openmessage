@@ -152,7 +152,7 @@ function encryptWaitlistRecord(record, key) {
 export async function handleWaitlist(request, { put, list, env, allow, now = Date.now, log = console.error, dailyCap = WAITLIST.dailyCap }) {
   const body = await readJSONBody(request, WAITLIST.maxBodyBytes);
   if (body.status === 415) return { status: 415, body: { error: "Set the Content-Type header to application/json." } };
-  if (body.status === 413) return { status: 413, body: { error: "Request is too large." } };
+  if (body.status === 413) return { status: 413, body: { error: "The request is too large. Use a shorter email address." } };
   if (body.status) return { status: 400, body: { error: "Invalid request body." } };
   const payload = body.value;
 
@@ -196,7 +196,7 @@ export async function handleWaitlist(request, { put, list, env, allow, now = Dat
     });
   } catch (error) {
     log("Waitlist submit failed:", error);
-    return { status: 502, body: { error: "The site couldn't save your email right now. Try again shortly." } };
+    return { status: 502, body: { error: "The site couldn't save your address right now. Try again shortly." } };
   }
 
   return { status: 200, body: { ok: true, message: WAITLIST_THANKS } };

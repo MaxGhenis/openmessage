@@ -11,7 +11,7 @@ export const metadata = pageMetadata({
   path: "/privacy"
 });
 
-const UPDATED = "November 18, 2026";
+const UPDATED = "November 19, 2026";
 
 export default function PrivacyPage() {
   return (
@@ -35,12 +35,6 @@ export default function PrivacyPage() {
             login in the same folder, outside the database. OpenMessage encrypts neither the
             database nor the logins.
           </p>
-          <p>
-            To delete your messages and logins from this Mac, quit the app, remove that folder and
-            any files your agent saved elsewhere, and clear OpenMessage&rsquo;s notifications,
-            which show message text. Removing the folder leaves your messages on your phone and
-            any other device you have linked.
-          </p>
           <Receipts
             ids={[
               "dataFolder",
@@ -50,8 +44,47 @@ export default function PrivacyPage() {
               "signalConfigDir",
               "plainOpen",
               "googleSessionJson",
-              "whatsappSessionStore",
-              "notificationBody"
+              "whatsappSessionStore"
+            ]}
+          />
+
+          <h2>Deleting your data from this Mac</h2>
+          <p>To delete your messages and logins from this Mac, quit the app and remove:</p>
+          <ul>
+            <li>
+              <code>~/Library/Application Support/OpenMessage</code>, which holds the database
+              and logins.
+            </li>
+            <li>
+              <code>~/Library/Caches/com.openmessage.app</code>, where the app&rsquo;s window
+              caches the photos and other attachments it has shown you.
+            </li>
+            <li>
+              <code>~/.local/share/openmessage</code>, if you have run a command-line build. That
+              build keeps its data there, and the app copies from that folder without emptying it.
+            </li>
+            <li>Any files your agent saved elsewhere.</li>
+          </ul>
+          <p>
+            Then clear the notifications that show message text from Notification Center. The app
+            posts some itself, and its server posts others through{" "}
+            <code>terminal-notifier</code> or AppleScript.
+          </p>
+          <p>
+            None of this touches the messages on your phone or any other device you have linked.
+            It also leaves OpenMessage linked to your accounts: unlink it in WhatsApp, Signal and
+            Google Messages on your phone, where Signal lists it as &ldquo;OpenMessage&rdquo;.
+          </p>
+          <Receipts
+            ids={[
+              "appBundleId",
+              "mediaCache",
+              "cliDataDir",
+              "legacyCopy",
+              "notificationBody",
+              "appServerNotifications",
+              "serverNotifier",
+              "signalDeviceName"
             ]}
           />
 
@@ -76,11 +109,11 @@ export default function PrivacyPage() {
                   <td data-label="When">While you have that network paired</td>
                 </tr>
                 <tr>
-                  <th scope="row">Sites linked in your threads</th>
+                  <th scope="row">Sites your threads link to</th>
                   <td data-label="What">
-                    Requests from your Mac for the linked page, any page it redirects to, and the
-                    preview image it names, wherever that is. OpenMessage skips links whose own
-                    address is private or local
+                    Requests from your Mac for each linked page, any page it redirects to, and the
+                    preview image the page names, which another site may host. OpenMessage skips
+                    links whose own address is private or local
                   </td>
                   <td data-label="When">When you open a thread that contains a link</td>
                 </tr>
@@ -111,7 +144,9 @@ export default function PrivacyPage() {
                 </tr>
                 <tr>
                   <th scope="row">The model behind your agent</th>
-                  <td data-label="What">Whatever your agent reads through the MCP tools</td>
+                  <td data-label="What">
+                    Whatever the MCP tools return to your agent, which passes it to its model
+                  </td>
                   <td data-label="When">When you connect an agent and it calls a tool</td>
                 </tr>
                 <tr>
@@ -148,25 +183,25 @@ export default function PrivacyPage() {
             your Mac and sends nowhere.
           </p>
 
-          <h2>What an install report keeps</h2>
+          <h2>What this site keeps from install reports</h2>
           <p>
             If you start OpenMessage with <code>OPENMESSAGE_TELEMETRY=1</code>, this site stores
             one record per install per day: the install ID, version, operating system, CPU type,
             which networks you have paired, and the time it arrived. It stores no IP address and
             no message data. The app picks the install ID at random and keeps it from day to day,
-            so the records link an install&rsquo;s days together without naming anyone. Nothing
-            deletes them automatically.
+            so the records link an install&rsquo;s days together without naming anyone. The site
+            keeps them until I delete them.
           </p>
 
           <h2>What this site collects</h2>
           <ul>
             <li>
-              The site sets no cookies and runs no analytics scripts. Your browser saves your light
-              or dark theme choice.
+              The site sets no cookies, runs no analytics scripts and saves only your light or dark
+              theme choice, in your browser&rsquo;s local storage.
             </li>
             <li>
-              Vercel hosts the site and handles each request, including your IP address, to serve
-              it.
+              Vercel hosts the site, so each request you make, including your IP address, passes
+              through Vercel.
             </li>
             <li>
               To limit abuse, the server counts sign-ups and install reports per IP address in
@@ -174,8 +209,8 @@ export default function PrivacyPage() {
               instance restarts.
             </li>
             <li>
-              The download button redirects to GitHub. The site records nothing about it; GitHub
-              counts downloads per release.
+              The download button redirects to GitHub, which counts downloads per release. The
+              site records nothing about the click.
             </li>
             <li>
               If you leave an email address, the site encrypts it with AES-256-GCM before storing
@@ -187,7 +222,7 @@ export default function PrivacyPage() {
           <h2>The networks&rsquo; own policies</h2>
           <p>
             OpenMessage connects to accounts you already have with Google, WhatsApp and Signal,
-            and each of them handles your messages under its own privacy policy.
+            and each company handles your messages under its own privacy policy.
           </p>
 
           <h2>Changes</h2>

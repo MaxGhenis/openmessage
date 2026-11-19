@@ -43,9 +43,11 @@ export function TwoReaders({ person, call, routes, lines, initialRoute }) {
 
   return (
     <div className="readers__frame">
-      <section className="readers__pane" aria-label="The direct messages as a thread">
+      <section className="readers__pane" aria-labelledby="readers-thread-label">
         <div className="readers__head">
-          <span className="readers__who">As a thread</span>
+          <span className="readers__who" id="readers-thread-label">
+            As a thread
+          </span>
           <div className="routes" role="tablist" aria-label={`Networks for ${person}`} onKeyDown={onKeyDown}>
             {routes.map((route) => (
               <button
@@ -85,9 +87,11 @@ export function TwoReaders({ person, call, routes, lines, initialRoute }) {
         </div>
       </section>
 
-      <section className="readers__pane" aria-label="The messages as an MCP tool returns them">
+      <section className="readers__pane" aria-labelledby="readers-agent-label">
         <div className="readers__head">
-          <span className="readers__who">Your agent, over MCP</span>
+          <span className="readers__who" id="readers-agent-label">
+            Your agent, over MCP
+          </span>
           <code className="readers__call">{call}</code>
         </div>
         <pre className="result" ref={resultRef} tabIndex={0} role="region" aria-label="Tool result text">

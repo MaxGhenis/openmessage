@@ -7,8 +7,10 @@ export const OG_IMAGE = "/opengraph-image";
 export const OG_ALT =
   "OpenMessage: your texts, WhatsApp and Signal in one SQLite database your agent can query";
 export const OG_SIZE = { width: 1200, height: 630 };
-// What Next.js would emit for the file-based card, which a page's own
-// openGraph replaces: the route, its size, its alt text and its type.
+// The file-based card's entry, which a page's own openGraph replaces: its
+// size, alt text and type as Next.js emits them. Next.js adds a ?<hash> cache
+// key to the card's URL; this entry uses the bare route, which serves the same
+// image.
 export const OG_IMAGE_ENTRY = { url: OG_IMAGE, ...OG_SIZE, alt: OG_ALT, type: "image/png" };
 
 export function pageMetadata({ title, description, path, openGraph = {} }) {

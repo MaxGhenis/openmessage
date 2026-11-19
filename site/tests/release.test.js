@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { RELEASE } from "../data/facts.js";
 import {
@@ -6,8 +6,11 @@ import {
   compareVersions,
   formatDate,
   formatMegabytes,
+  getLatestRelease,
   normalizeRelease,
-  releaseStatus
+  releaseCopy,
+  releaseStatus,
+  UNKNOWN_LEAD
 } from "../lib/release.js";
 
 const payload = {
@@ -123,6 +126,96 @@ describe("releaseStatus", () => {
     expect(releaseStatus(live("0.2.8"), "0.2.9")).toBe("unknown");
     expect(releaseStatus({ ...live("0.2.9"), version: "zero" }, "0.2.9")).toBe("unknown");
     expect(releaseStatus(null)).toBe("unknown");
+  });
+});
+
+describe("releaseCopy", () => {
+  const live = (version, extra = {}) => ({
+    tag: `v${version}`,
+    version,
+    publishedAt: "2026-05-01T00:00:00.000Z",
+    dmgBytes: 21661450,
+    live: true,
+    ...extra
+  });
+  const silent = { status: "unknown", hero: "", lead: UNKNOWN_LEAD, jsonLd: {}, showNewer: false, showMainList: false };
+
+  test("names the confirmed release beside the button and shows the list of changes on main", () => {
+    expect(releaseCopy(live("0.2.9"), "0.2.9")).toEqual({
+      status: "same",
+      hero: "Version 0.2.9 came out May 1, 2026, as a 22 MB download.",
+      lead: "The download button serves version 0.2.9, which came out May 1, 2026.",
+      jsonLd: { softwareVersion: "0.2.9", datePublished: "2026-05-01" },
+      showNewer: false,
+      showMainList: true
+    });
+  });
+
+  test("names a newer release, shows the newer note and hides the list of changes on main", () => {
+    const copy = releaseCopy(live("0.3.0"), "0.2.9");
+    expect(copy.status).toBe("newer");
+    expect(copy.hero).toBe("Version 0.3.0 came out May 1, 2026, as a 22 MB download.");
+    expect(copy.showNewer).toBe(true);
+    expect(copy.showMainList).toBe(false);
+  });
+
+  // The button redirects to the latest release's disk image, which 404s while
+  // a release has none, so the page does not name that release.
+  test("says nothing about a version when the release has no disk image", () => {
+    expect(releaseCopy(live("0.2.9", { dmgBytes: null }), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(live("0.3.0", { dmgBytes: null }), "0.2.9")).toEqual(silent);
+  });
+
+  test("says nothing about a version when GitHub did not answer, though the fallback names one", () => {
+    expect(releaseCopy(FALLBACK_RELEASE)).toEqual(silent);
+  });
+
+  test("says nothing about a version for an older, unreadable or undated release", () => {
+    expect(releaseCopy(live("0.2.8"), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(live("0.2.9", { version: "zero" }), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(live("0.2.9", { publishedAt: "soon" }), "0.2.9")).toEqual(silent);
+    expect(releaseCopy(null)).toEqual(silent);
+  });
+});
+
+describe("getLatestRelease", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const answer = (status, body) =>
+    vi.fn(async () => ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => (typeof body === "function" ? body() : body)
+    }));
+
+  test("returns the live release GitHub reports", async () => {
+    vi.stubGlobal("fetch", answer(200, payload));
+    expect(await getLatestRelease()).toEqual(normalizeRelease(payload));
+  });
+
+  test("falls back when GitHub refuses, sends something that is not a release, or cannot be reached", async () => {
+    vi.stubGlobal("fetch", answer(403, { message: "API rate limit exceeded" }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    vi.stubGlobal("fetch", answer(200, { ...payload, prerelease: true }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    vi.stubGlobal("fetch", answer(200, () => {
+      throw new SyntaxError("Unexpected token < in JSON");
+    }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }));
+    expect(await getLatestRelease()).toBe(FALLBACK_RELEASE);
+  });
+
+  test("the fallback leads to copy that names no version", async () => {
+    vi.stubGlobal("fetch", answer(500, {}));
+    expect(releaseCopy(await getLatestRelease()).hero).toBe("");
   });
 });
 

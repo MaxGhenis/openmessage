@@ -77,6 +77,13 @@ describe("pages that use it", () => {
     expect(twitter[1]).not.toMatch(/\b(title|description|images)\b/);
   });
 
+  test("the root layout suffixes page titles in og:title as it does in <title>", () => {
+    const layout = read("app/layout.jsx");
+    const titleTemplate = /title:\s*\{\s*default:\s*title,\s*template:\s*"%s \| OpenMessage"\s*\}/;
+    expect(layout).toMatch(new RegExp(`metadata = \\{[\\s\\S]*?${titleTemplate.source}`));
+    expect(layout).toMatch(new RegExp(`openGraph:\\s*\\{\\s*${titleTemplate.source}`));
+  });
+
   test("the card names its alt text and size from the same constants pageMetadata uses", () => {
     const card = read("app/opengraph-image.jsx");
     expect(card).toMatch(/export const alt = OG_ALT;/);

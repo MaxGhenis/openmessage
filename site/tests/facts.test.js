@@ -56,26 +56,35 @@ describe("MCP tools", () => {
     expect([...siteTools].sort()).toEqual(registeredTools(RELEASE.tag));
   });
 
-  // The release's internal/tools package as top-level function bodies keyed by
-  // name. gofmt puts each top-level func's closing brace alone at column 0.
+  // The release's internal/tools package as function bodies keyed by name:
+  // top-level funcs, plus package-level seams such as `downloadWhatsAppMedia = func(`
+  // inside a var block. gofmt puts a top-level func's closing brace alone at
+  // column 0 and a var-block func literal's closing brace at one tab.
   function packageFunctions(ref) {
     const bodies = new Map();
     for (const file of listAt(ref, "internal/tools")) {
       if (!file.endsWith(".go") || file.endsWith("_test.go")) {
         continue;
       }
-      for (const chunk of fileAt(ref, file).split(/^(?=func )/m)) {
+      const text = fileAt(ref, file);
+      for (const chunk of text.split(/^(?=func )/m)) {
         const name = chunk.match(/^func (?:\([^)]*\)\s*)?(\w+)/);
         if (name) {
           const end = chunk.search(/^}$/m);
           bodies.set(name[1], end === -1 ? chunk : chunk.slice(0, end + 1));
         }
       }
+      for (const seam of text.matchAll(/^\t(\w+)\s*=\s*func\(/gm)) {
+        const rest = text.slice(seam.index);
+        const end = rest.search(/^\t}/m);
+        bodies.set(seam[1], end === -1 ? rest : rest.slice(0, end + 2));
+      }
     }
     return bodies;
   }
 
-  // True if the function, or any package function it calls, mentions needle.
+  // True if the function, or any package function it calls, mentions needle
+  // (a string, or a regular expression to test against each body).
   function reaches(bodies, start, needle) {
     const seen = new Set();
     const stack = [start];
@@ -86,7 +95,7 @@ describe("MCP tools", () => {
       }
       seen.add(fn);
       const body = bodies.get(fn);
-      if (body.includes(needle)) {
+      if (typeof needle === "string" ? body.includes(needle) : needle.test(body)) {
         return true;
       }
       for (const [, called] of body.matchAll(/\b(\w+)\(/g)) {
@@ -112,10 +121,28 @@ describe("MCP tools", () => {
       .filter(([, handlerFn]) => reaches(bodies, handlerFn, "messagePreamble"))
       .map(([name]) => name);
     expect(warned.sort()).toEqual([...WARNED_TOOLS].sort());
-    for (const name of UNWARNED_QUOTING_TOOLS) {
-      expect(handlers.has(name), `${name} is not a tool in the release`).toBe(true);
-      expect(warned).not.toContain(name);
+
+    // Story quotes (q.Text) and common phrases (p.Phrase) are message text.
+    // The site names every unwarned tool that returns them, and no others.
+    const quoting = [...handlers]
+      .filter(([name]) => !warned.includes(name))
+      .filter(([, handlerFn]) => reaches(bodies, handlerFn, /\bq\.Text\b|\bp\.Phrase\b/))
+      .map(([name]) => name);
+    expect(quoting.sort()).toEqual([...UNWARNED_QUOTING_TOOLS].sort());
+  });
+
+  test("the call graph indexes package-level func seams", () => {
+    const bodies = packageFunctions(RELEASE.tag);
+    for (const file of listAt(RELEASE.tag, "internal/tools")) {
+      if (!file.endsWith(".go") || file.endsWith("_test.go")) {
+        continue;
+      }
+      for (const [, name] of fileAt(RELEASE.tag, file).matchAll(/^\t(\w+)\s*=\s*func\(/gm)) {
+        expect(bodies.get(name), `${file}: ${name}`).toMatch(new RegExp(`^\\t${name}\\s*=\\s*func\\(`));
+        expect(bodies.get(name).trimEnd().endsWith("}"), `${file}: ${name}`).toBe(true);
+      }
     }
+    expect(bodies.has("downloadWhatsAppMedia")).toBe(true);
   });
 
   test("no tool is listed twice and the count matches", () => {
@@ -130,8 +157,7 @@ describe("MCP tools", () => {
     const serve = fileAt(RELEASE.tag, "cmd/serve.go");
     expect(serve).toContain(`port = "${MCP.port}"`);
     expect(serve).toContain(`host = "${MCP.host}"`);
-    expect(MCP.ssePath).toBe("/mcp/sse");
-    expect(serve).toContain("MCP SSE available at");
+    expect(serve).toContain(`"MCP SSE available at " + baseURL + "${MCP.ssePath}"`);
   });
 });
 

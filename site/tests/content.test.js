@@ -43,6 +43,30 @@ describe("receipts in use", () => {
   test("every defined receipt is shown somewhere", () => {
     expect(Object.keys(RECEIPTS).filter((id) => !used.has(id))).toEqual([]);
   });
+
+  // A repeated key in an object literal silently replaces the earlier entry,
+  // so read the keys from the source rather than from the imported object.
+  test("no receipt key is defined twice", () => {
+    const source = readFileSync(path.join(siteRoot, "data/facts.js"), "utf8");
+    const start = source.indexOf("export const RECEIPTS = {");
+    expect(start).toBeGreaterThan(-1);
+    const block = source.slice(start, source.indexOf("\n};", start));
+    const keys = [...block.matchAll(/^ {2}(\w+): \{/gm)].map((match) => match[1]);
+    expect(keys.length).toBe(Object.keys(RECEIPTS).length);
+    expect(keys.filter((key, index) => keys.indexOf(key) !== index)).toEqual([]);
+  });
+
+  test("the README's example receipt matches its entry in data/facts.js", () => {
+    const readme = readFileSync(path.join(siteRoot, "README.md"), "utf8");
+    const example = readme.match(/^(\w+): \{ ref: .* \}$/m);
+    expect(example).not.toBeNull();
+    const receipt = RECEIPTS[example[1]];
+    expect(receipt, `README cites "${example[1]}", which is not a receipt`).toBeDefined();
+    const quote = (value) => (value.includes('"') ? `'${value}'` : `"${value}"`);
+    expect(example[0]).toBe(
+      `${example[1]}: { ref: ${quote(receipt.ref)}, path: ${quote(receipt.path)}, line: ${receipt.line}, expect: ${quote(receipt.expect)} }`
+    );
+  });
 });
 
 describe("tool names in copy", () => {

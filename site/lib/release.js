@@ -3,9 +3,10 @@ import { RELEASE, REPO } from "../data/facts.js";
 // The Download button redirects to GitHub's "latest release", so the page asks
 // GitHub which release that is instead of trusting a constant. The copy
 // describes RELEASE, and the tests check it there. When GitHub confirms that
-// release, the page names it as what the button serves; when GitHub reports a
-// newer one, the page says so; and when GitHub is unreachable, rate-limited or
-// reports anything else, the page names no version beside the button.
+// release with its disk image, the page names it as what the button serves;
+// when GitHub reports a newer one, the page says so; and when GitHub is
+// unreachable, rate-limited or reports anything else, including a release
+// without the disk image, the page names no version beside the button.
 
 const API = `https://api.github.com/repos/${REPO}`;
 const HEADERS = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
@@ -78,6 +79,34 @@ export function releaseStatus(release, described = RELEASE.version) {
   return order === 1 ? "newer" : "unknown";
 }
 
+export const UNKNOWN_LEAD = "The download button serves the latest release on GitHub.";
+
+// Pure: everything the homepage says about the release, from GitHub's answer.
+// A version, date or size appears beside the button, in the status lead or in
+// the JSON-LD only when GitHub confirmed a release no older than the one the
+// copy describes, dated and carrying the disk image the button downloads. The
+// list of changes on main shows only when GitHub confirmed that release itself,
+// and the newer-release note only when it reported a later one.
+export function releaseCopy(release, described = RELEASE.version) {
+  const status = releaseStatus(release, described);
+  const date = status === "unknown" ? "" : formatDate(release.publishedAt);
+  const size = status === "unknown" ? "" : formatMegabytes(release.dmgBytes);
+  if (!date || !size) {
+    return { status: "unknown", hero: "", lead: UNKNOWN_LEAD, jsonLd: {}, showNewer: false, showMainList: false };
+  }
+  return {
+    status,
+    hero: `Version ${release.version} came out ${date}, as a ${size} download.`,
+    lead: `The download button serves version ${release.version}, which came out ${date}.`,
+    jsonLd: {
+      softwareVersion: release.version,
+      datePublished: new Date(Date.parse(release.publishedAt)).toISOString().slice(0, 10)
+    },
+    showNewer: status === "newer",
+    showMainList: status === "same"
+  };
+}
+
 async function getJson(url) {
   const response = await fetch(url, { headers: HEADERS, next: { revalidate: REVALIDATE_SECONDS } });
   if (!response.ok) {
@@ -97,7 +126,7 @@ export async function getLatestRelease() {
 // "2026-04-21T18:56:16Z" -> "April 21, 2026", in UTC so every visitor and
 // every build reads the same date.
 export function formatDate(iso) {
-  const time = Date.parse(iso);
+  const time = typeof iso === "string" ? Date.parse(iso) : NaN;
   if (Number.isNaN(time)) {
     return "";
   }

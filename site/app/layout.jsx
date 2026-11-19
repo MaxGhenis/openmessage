@@ -22,7 +22,7 @@ const mono = Atkinson_Hyperlegible_Mono({
 
 const title = "OpenMessage: a message database for your agent";
 const description =
-  "OpenMessage keeps your SMS, RCS, WhatsApp and Signal messages in one SQLite database on your Mac. A Mac app and a local MCP server read the same file.";
+  "OpenMessage keeps your messages from Google Messages on Android (SMS and RCS), WhatsApp and Signal in one SQLite database on your Mac. A Mac app and a local MCP server both read it.";
 
 export const metadata = {
   metadataBase: new URL(SITE_URL),

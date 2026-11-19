@@ -25,7 +25,7 @@ import {
   UNWARNED_QUOTING_TOOLS,
   WARNED_TOOLS
 } from "../data/facts";
-import { formatDate, formatMegabytes, getLatestRelease, releaseStatus } from "../lib/release";
+import { formatDate, getLatestRelease, releaseCopy } from "../lib/release";
 import { clockTime, parseTranscript } from "../lib/transcript";
 import appScreenshot from "../public/screens/app-demo-sms.png";
 
@@ -67,14 +67,9 @@ function DownloadButton() {
 export default async function HomePage() {
   const release = await getLatestRelease();
   const { lines, routes } = buildReaders();
-  // The copy describes RELEASE and names it inline. "same": GitHub confirms
-  // the button serves it. "newer": GitHub reports a later release, so the page
-  // says so. "unknown": GitHub gave no usable answer, so the page names no
-  // version beside the button.
-  const status = releaseStatus(release);
-  const known = status !== "unknown";
-  const releaseDate = formatDate(release.publishedAt);
-  const size = known ? formatMegabytes(release.dmgBytes) : "";
+  // The copy describes RELEASE and names it inline; releaseCopy decides what
+  // the page says about the release GitHub reports (see lib/release.js).
+  const copy = releaseCopy(release);
   const toolNames = (names) =>
     names.map((name, index) => (
       <span key={name}>
@@ -90,11 +85,11 @@ export default async function HomePage() {
     url: SITE_URL,
     applicationCategory: "CommunicationApplication",
     operatingSystem: `macOS ${MIN_MACOS} or later`,
-    ...(known ? { softwareVersion: release.version, datePublished: release.publishedAt.slice(0, 10) } : {}),
+    ...copy.jsonLd,
     downloadUrl: `${SITE_URL}${DOWNLOAD_PATH}`,
     offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
     author: { "@type": "Person", name: "Max Ghenis", url: "https://maxghenis.com" },
-    codeRepository: REPO_URL
+    sameAs: [REPO_URL]
   };
 
   return (
@@ -107,17 +102,17 @@ export default async function HomePage() {
               Your texts, WhatsApp and Signal in one SQLite database your agent can query
             </h1>
             <p className="hero__sub">
-              OpenMessage connects to Google Messages (SMS and RCS), WhatsApp and Signal, and keeps
-              your messages in SQLite on your Mac. A Mac app and a local MCP server read the same
-              file.
+              OpenMessage connects to Google Messages on your Android phone (SMS and RCS), WhatsApp
+              and Signal, and keeps your messages in one SQLite file on your Mac. A Mac app and a
+              local MCP server both read that file.
             </p>
             <div className="hero__cta">
               <DownloadButton />
               <a href="#setup">Set it up in three steps</a>
             </div>
             <p className="hero__release">
-              {known && `Version ${release.version}, released ${releaseDate}${size ? `. ${size}` : ""}. `}
-              macOS {MIN_MACOS} or later. Free, with no account.
+              {copy.hero && `${copy.hero} `}
+              OpenMessage is free, needs no sign-up and runs on macOS {MIN_MACOS} or later.
             </p>
 
             <div className="readers">
@@ -146,7 +141,7 @@ export default async function HomePage() {
             </div>
             <div className="section__body">
               <p className="lead">
-                While the app is open, an MCP server runs on your Mac at{" "}
+                While you have the Mac app open, an MCP server runs on your Mac at{" "}
                 <code>
                   {MCP.host}:{MCP.port}
                 </code>
@@ -172,12 +167,13 @@ export default async function HomePage() {
                 <div className="fact">
                   <h3>One call spans a person&rsquo;s networks</h3>
                   <p>
-                    <code>get_person_messages</code> takes a name and returns, by default, the
-                    oldest 50 messages across every SMS, WhatsApp and Signal conversation that
-                    matches it, including groups. <code>person_stats</code> summarizes that person&rsquo;s
-                    one-to-one history.
+                    <code>get_person_messages</code> takes a name and looks through your 1,000 most
+                    recent conversations, groups included, for ones whose name or participant list
+                    contains it. By default it returns the oldest 50 messages across those
+                    conversations, whatever the network. <code>person_stats</code> summarizes that
+                    person&rsquo;s one-to-one history.
                   </p>
-                  <Receipts ids={["personOldest", "personStatsDirect"]} />
+                  <Receipts ids={["personMatch", "personOldest", "personStatsDirect"]} />
                 </div>
                 <div className="fact">
                   <h3>Drafts wait for you</h3>
@@ -188,11 +184,12 @@ export default async function HomePage() {
                   <Receipts ids={["draftTool"]} />
                 </div>
                 <div className="fact">
-                  <h3>OpenMessage warns the model about message text</h3>
+                  <h3>{WARNED_TOOLS.length} tools warn the model about message text</h3>
                   <p>
-                    In results from {toolNames(WARNED_TOOLS)}, OpenMessage puts a warning before the
-                    message text that tells the model to ignore instructions inside message bodies.{" "}
-                    {toolNames(UNWARNED_QUOTING_TOOLS)} quote message text without that warning.
+                    Before the message text in results from {toolNames(WARNED_TOOLS)}, OpenMessage
+                    puts a warning that tells the model to ignore instructions inside message
+                    bodies. {toolNames(UNWARNED_QUOTING_TOOLS)} quote message text without that
+                    warning.
                   </p>
                   <Receipts ids={["untrustedPreamble", "storyQuotes", "statsPhrases"]} />
                 </div>
@@ -208,9 +205,10 @@ export default async function HomePage() {
             </div>
             <div className="section__body">
               <p className="lead">
-                OpenMessage writes messages from all three networks to one file,{" "}
+                The Mac app writes messages from all three networks to one file,{" "}
                 <code>messages.db</code>, in <code>~/Library/Application Support/OpenMessage</code>,
-                and tags each row with the network it came from.
+                and tags each row with the network it came from. A command-line build uses{" "}
+                <code>~/.local/share/openmessage</code> instead.
               </p>
               <figure>
                 <pre className="command command__code">
@@ -223,7 +221,9 @@ signal|11`}</code>
                   I ran this on the demo data in version {RELEASE.version}.
                 </figcaption>
               </figure>
-              <Receipts ids={["dataFolder", "messagesDb", "sourcePlatformColumn", "sqliteDriver"]} />
+              <Receipts
+                ids={["dataFolder", "messagesDb", "sourcePlatformColumn", "sqliteDriver", "cliDataDir"]}
+              />
 
               <div className="facts">
                 <div className="fact">
@@ -237,12 +237,13 @@ signal|11`}</code>
                 <div className="fact">
                   <h3>Import older history</h3>
                   <p>
-                    The command line and the <code>import_messages</code> tool load iMessage history
-                    from <code>chat.db</code> on your Mac, a Google Chat Takeout and a WhatsApp
-                    export. You can read imported iMessage and Google Chat threads but not reply
-                    to them, because OpenMessage has no live connection to either.
+                    The command line and the <code>import_messages</code> tool load older history
+                    from four sources: iMessage&rsquo;s <code>chat.db</code> on your Mac, a Google
+                    Chat Takeout, a WhatsApp chat export and Signal Desktop. You can read imported
+                    iMessage and Google Chat threads but not reply to them, because OpenMessage has
+                    no live connection to either.
                   </p>
-                  <Receipts ids={["imessageImport", "importCommands"]} />
+                  <Receipts ids={["imessageImport", "importCommands", "importSources"]} />
                 </div>
                 <div className="fact">
                   <h3>OpenMessage keeps logins beside the database</h3>
@@ -273,14 +274,14 @@ signal|11`}</code>
                   When a person&rsquo;s name and number match on more than one network, the sidebar
                   shows one row for them, with a tab per network in the thread.
                 </p>
-                <Receipts ids={["personRoutes"]} />
+                <Receipts ids={["sidebarMerge", "personRoutes"]} />
               </div>
             </div>
             <figure className="shot">
               <Image
                 className="shot__img"
                 src={appScreenshot}
-                alt="OpenMessage's web interface with Jordan Rivera selected in the sidebar, above a second Jordan Rivera row for Signal. The thread shows four SMS messages, with tabs for SMS and WhatsApp above them."
+                alt="OpenMessage's web interface. The sidebar highlights Jordan Rivera, above a second Jordan Rivera row that holds the Signal thread. The thread shows four SMS messages under tabs for SMS and WhatsApp."
                 sizes="(max-width: 72rem) 100vw, 67rem"
                 placeholder="empty"
               />
@@ -304,8 +305,9 @@ signal|11`}</code>
                 <div className="fact">
                   <h3>Unofficial clients</h3>
                   <p>
-                    OpenMessage reaches the three networks through open-source libraries that Google,
-                    WhatsApp and Signal do not support: mautrix-gmessages, whatsmeow and signal-cli.{" "}
+                    OpenMessage reaches the three networks through open-source software that Google,
+                    WhatsApp and Signal do not support: the mautrix-gmessages and whatsmeow
+                    libraries and the signal-cli program.{" "}
                     <a href="https://www.whatsapp.com/legal/terms-of-service" rel="noopener">
                       WhatsApp&rsquo;s terms
                     </a>{" "}
@@ -317,25 +319,29 @@ signal|11`}</code>
                 <div className="fact">
                   <h3>Your agent can send as you</h3>
                   <p>
-                    These tools send to other people: {toolNames(SENDING_TOOLS)}. OpenMessage
-                    does not ask you to confirm them. Keep your MCP client&rsquo;s
-                    permission prompt on for those tools, or have your agent use{" "}
-                    <code>draft_message</code>.
+                    OpenMessage does not ask you to confirm before these tools send to other
+                    people: {toolNames(SENDING_TOOLS)}. Keep your MCP client&rsquo;s permission
+                    prompt on for them, or have your agent use <code>draft_message</code>.
                   </p>
                   <p>
                     <code>send_message</code> reports &ldquo;Message sent&rdquo; when the network
                     accepts the message, and its result says nothing about delivery or reading. For
                     SMS, <code>send_to_conversation</code> and <code>send_group_message</code> report
-                    success without checking Google&rsquo;s answer.
+                    success without checking Google&rsquo;s answer. <code>send_message</code> and{" "}
+                    <code>send_to_conversation</code> can also report an error after the network
+                    has taken the message, when OpenMessage fails to save its own copy. An agent
+                    that retries on that error sends the message twice.
                   </p>
-                  <Receipts ids={["sendResult", "sendUnchecked", "groupSendUnchecked"]} />
+                  <Receipts
+                    ids={["sendResult", "sendUnchecked", "groupSendUnchecked", "sendPersistError"]}
+                  />
                 </div>
                 <div className="fact">
                   <h3>What your agent reads leaves your Mac</h3>
                   <p>
-                    Text that a tool returns goes to the model running your agent, and anyone can
-                    text you instructions aimed at that model. The warning OpenMessage puts before
-                    message text lowers that risk and does not remove it.
+                    Text that a tool returns goes to the model behind your agent, so anyone who can
+                    text you can put instructions in front of that model. The warning some tools add
+                    tells the model to ignore them, and nothing makes it comply.
                   </p>
                 </div>
                 <div className="fact">
@@ -352,10 +358,12 @@ signal|11`}</code>
                   <h3>Connections break when the networks change</h3>
                   <p>
                     A protocol change at Google, WhatsApp or Signal can stop a connection until a
-                    new version ships, and the app does not update itself. Version{" "}
-                    {RELEASE.version} cannot renew an expired Google Messages login, so you pair
-                    again when it lapses.
+                    fix ships. For Google Messages and WhatsApp, the fix comes in a new OpenMessage
+                    release, which you install yourself. For Signal, it may come in a{" "}
+                    <code>signal-cli</code> update instead. Version {RELEASE.version} cannot renew
+                    an expired Google Messages login, so you pair again when it lapses.
                   </p>
+                  <Receipts ids={["signalCli"]} />
                 </div>
               </div>
             </div>
@@ -369,11 +377,9 @@ signal|11`}</code>
             </div>
             <div className="section__body">
               <p className="lead">
-                {known
-                  ? `The download button serves version ${release.version}, released ${releaseDate}.`
-                  : "The download button serves the latest release on GitHub."}
+                {copy.lead}
               </p>
-              {status === "newer" && (
+              {copy.showNewer && (
                 <p>
                   Version {release.version} shipped after version {RELEASE.version}, so some details
                   here may have changed, including the agent setup command. Its{" "}
@@ -383,18 +389,19 @@ signal|11`}</code>
                   list what changed.
                 </p>
               )}
-              {status !== "newer" && (
+              {copy.showMainList && (
                 <>
                   <p>
                     These changes landed on <code>main</code> after version {RELEASE.version}:
                   </p>
                   <div className="facts">
                     <div className="fact">
-                      <h3>Connections that reconnect themselves</h3>
+                      <h3>Reconnects with backoff</h3>
                       <p>
                         A supervisor for each network retries a dropped connection after a random
-                        wait, under a ceiling that doubles from 5 seconds to 5 minutes. It can also
-                        refresh an expired Google Messages login from your local Chrome profile.
+                        wait, under a ceiling that doubles from 5 seconds to 5 minutes. The Google
+                        Messages supervisor can also refresh an expired login from your local Chrome
+                        profile.
                       </p>
                       <Receipts
                         ids={[
@@ -419,10 +426,11 @@ signal|11`}</code>
                     <div className="fact">
                       <h3>A send outbox, behind a flag</h3>
                       <p>
-                        With <code>OPENMESSAGES_V2_SEND=1</code>, OpenMessage saves each send
-                        locally before it tries it.
-                        It parks a send whose outcome is unknown as <code>uncertain</code> and never
-                        retries it automatically.
+                        If you run <code>openmessage serve</code> from a command-line build with{" "}
+                        <code>OPENMESSAGES_V2_SEND=1</code>, OpenMessage writes a send to disk
+                        before it hands the message to the network. When it cannot tell whether a
+                        send went out, it marks the send <code>uncertain</code> and never retries it
+                        on its own.
                       </p>
                       <Receipts ids={["outboxFlag", "outboxUncertain", "outboxLease"]} />
                     </div>
@@ -432,10 +440,12 @@ signal|11`}</code>
 
               <div className="table-scroll">
                 <table className="ledger">
-                  <caption className="visually-hidden">Where OpenMessage runs</caption>
+                  <caption className="visually-hidden">
+                    Where OpenMessage runs and which networks it reaches
+                  </caption>
                   <thead>
                     <tr>
-                      <th scope="col">Where</th>
+                      <th scope="col">Platform or network</th>
                       <th scope="col">Status</th>
                     </tr>
                   </thead>
@@ -543,10 +553,10 @@ signal|11`}</code>
                 <code>
                   {MCP.host}:{MCP.port}
                 </code>{" "}
-                in a browser. It shows the demo conversations and connects to none of the three
+                in a browser to see the demo conversations. The demo connects to none of the three
                 networks.
               </p>
-              <Receipts ids={["demoMode"]} />
+              <Receipts ids={["demoMode", "demoOffline"]} />
             </div>
           </div>
         </section>

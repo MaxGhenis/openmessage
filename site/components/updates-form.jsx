@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from "react";
 // THANKS matches WAITLIST_THANKS in lib/public-writes.mjs; tests/routes.test.js
 // checks that.
 const THANKS = "Thanks. I'll email you when a release ships.";
-const FAILED = "The site couldn't save your email. Try again shortly.";
+const FAILED = "The site couldn't save your address. Try again shortly.";
 
 export function UpdatesForm() {
   const [email, setEmail] = useState("");
@@ -95,7 +95,7 @@ export function UpdatesForm() {
           />
         </div>
         <button type="submit" className="btn btn--quiet" aria-disabled={sending ? "true" : undefined}>
-          {sending ? "Saving" : "Email me releases"}
+          {sending ? "Saving" : "Email me about releases"}
         </button>
       </div>
       <p id="updates-status" className="updates__status" data-state={state} role="status" aria-live="polite">

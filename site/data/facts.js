@@ -96,7 +96,7 @@ export const SENDING_TOOLS = [
 ];
 
 // Tools whose handlers write the untrusted-message warning before the message
-// text they return, at the release. tests/content.test.js derives this list
+// text they return, at the release. tests/facts.test.js derives this list
 // from the code.
 export const WARNED_TOOLS = [
   "get_conversation",
@@ -107,7 +107,7 @@ export const WARNED_TOOLS = [
 ];
 
 // Tools whose results quote message text (story quotes, common phrases)
-// without that warning.
+// without that warning. tests/facts.test.js derives this list from the code too.
 export const UNWARNED_QUOTING_TOOLS = ["generate_story", "generate_person_story", "conversation_stats", "person_stats"];
 
 export const TOOL_COUNT = TOOL_GROUPS.reduce((sum, group) => sum + group.tools.length, 0);
@@ -126,6 +126,12 @@ export const RECEIPTS = {
   },
   storyQuotes: { ref: "release", path: "internal/story/generate.go", line: 185, expect: "truncate(m.Body, 200)" },
   statsPhrases: { ref: "release", path: "internal/tools/story.go", line: 90, expect: "p.Phrase, p.Count" },
+  personMatch: {
+    ref: "release",
+    path: "internal/tools/get_person_messages.go",
+    line: 34,
+    expect: "a.Store.ListConversations(1000)"
+  },
   personOldest: { ref: "release", path: "internal/db/messages.go", line: 365, expect: "ORDER BY timestamp_ms ASC" },
   personStatsDirect: { ref: "release", path: "internal/tools/story.go", line: 418, expect: "if c.IsGroup {" },
   draftTool: {
@@ -133,6 +139,12 @@ export const RECEIPTS = {
     path: "internal/web/static/index.html",
     line: 7205,
     expect: "/api/drafts/send"
+  },
+  sendPersistError: {
+    ref: "release",
+    path: "internal/tools/send_message.go",
+    line: 130,
+    expect: "failed to persist sent message"
   },
   sendResult: {
     ref: "release",
@@ -152,6 +164,12 @@ export const RECEIPTS = {
     line: 65,
     expect: "_, err = cli.GM.SendMessage(payload)"
   },
+  sidebarMerge: {
+    ref: "release",
+    path: "internal/web/static/index.html",
+    line: 5267,
+    expect: "if (item.convos.length < 2 || distinctPlatforms.size < 2) {"
+  },
   personRoutes: {
     ref: "release",
     path: "internal/web/static/index.html",
@@ -169,11 +187,22 @@ export const RECEIPTS = {
   },
   imessageImport: {
     ref: "release",
-    path: "internal/importer/imessage.go",
-    line: 20,
-    expect: "Requires Full Disk Access"
+    path: "internal/tools/import_messages.go",
+    line: 74,
+    expect: "result, err = imp.ImportFromDB(a.Store)"
   },
-  importCommands: { ref: "release", path: "main.go", line: 31, expect: "import gchat" },
+  importCommands: {
+    ref: "release",
+    path: "main.go",
+    line: 65,
+    expect: "err = cmd.RunImport(logger, os.Args[2], os.Args[3:])"
+  },
+  importSources: {
+    ref: "release",
+    path: "internal/tools/import_messages.go",
+    line: 89,
+    expect: "importSignalDesktop(a.Store, path, name, address)"
+  },
   dataFolder: {
     ref: "release",
     path: "macos/OpenMessage/Sources/BackendManager.swift",
@@ -245,6 +274,48 @@ export const RECEIPTS = {
     line: 328,
     expect: 'body: latest.body ?? "New message"'
   },
+  appServerNotifications: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/BackendManager.swift",
+    line: 118,
+    expect: '"OPENMESSAGES_MACOS_NOTIFICATIONS": "1",'
+  },
+  serverNotifier: {
+    ref: "release",
+    path: "internal/notify/macos.go",
+    line: 125,
+    expect: 'return n.run("osascript", "-e", appleScriptNotification(title, body))'
+  },
+  appBundleId: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/Info.plist",
+    line: 10,
+    expect: "<string>com.openmessage.app</string>"
+  },
+  mediaCache: {
+    ref: "release",
+    path: "internal/web/api.go",
+    line: 937,
+    expect: 'w.Header().Set("Cache-Control", "public, max-age=86400")'
+  },
+  cliDataDir: {
+    ref: "release",
+    path: "internal/app/app.go",
+    line: 155,
+    expect: 'filepath.Join(home, ".local", "share", "openmessage")'
+  },
+  legacyCopy: {
+    ref: "release",
+    path: "macos/OpenMessage/Sources/BackendManager.swift",
+    line: 76,
+    expect: "try? fm.copyItem(atPath: src, toPath: dst)"
+  },
+  signalDeviceName: {
+    ref: "release",
+    path: "internal/signallive/client.go",
+    line: 60,
+    expect: '"link", "-n", "OpenMessage"'
+  },
   telemetryOptIn: { ref: "release", path: "cmd/serve.go", line: 404, expect: 'os.Getenv("OPENMESSAGE_TELEMETRY") == "1"' },
   telemetryEndpoint: {
     ref: "release",
@@ -266,6 +337,7 @@ export const RECEIPTS = {
   },
   storyApiKey: { ref: "release", path: "internal/tools/story.go", line: 119, expect: 'strArg(args, "api_key")' },
   demoMode: { ref: "release", path: "cmd/serve.go", line: 437, expect: "func RunDemo" },
+  demoOffline: { ref: "release", path: "cmd/serve.go", line: 107, expect: "if !isDemo {" },
   sourcePlatformColumn: {
     ref: "release",
     path: "internal/db/db.go",
@@ -338,12 +410,6 @@ export const RECEIPTS = {
     path: "internal/web/api.go",
     line: 1458,
     expect: 'mux.HandleFunc("/api/signal/qr"'
-  },
-  whatsappSessionStore: {
-    ref: "release",
-    path: "internal/whatsapplive/client.go",
-    line: 203,
-    expect: "sqlstore.New"
   },
   whatsappReceipts: {
     ref: "release",

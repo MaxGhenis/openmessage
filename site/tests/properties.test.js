@@ -6,6 +6,7 @@ import {
   formatDate,
   formatMegabytes,
   normalizeRelease,
+  releaseCopy,
   releaseStatus
 } from "../lib/release.js";
 import { clockTime, parseTranscript } from "../lib/transcript.js";
@@ -21,6 +22,11 @@ import { clockTime, parseTranscript } from "../lib/transcript.js";
 //   releaseStatus    — total; "newer" exactly when GitHub answered with a
 //                      later version, "same" exactly when it answered with
 //                      the described one, and "unknown" otherwise.
+//   releaseCopy      — total; a version, date or size appears in the hero,
+//                      the status lead or the JSON-LD only for a release
+//                      GitHub confirmed, no older than the described one,
+//                      dated and with a disk image; the list of changes on
+//                      main shows only for "same".
 //   formatMegabytes  — monotonic in the byte count.
 //   clockTime        — empty or a valid 12-hour label.
 
@@ -194,6 +200,46 @@ describe("release helper properties", () => {
     );
   });
 
+  test("releaseCopy names a version only for a confirmed release no older than the described one", () => {
+    const publishedAt = fc.oneof(
+      fc
+        .date({ min: new Date("2020-01-01T00:00:00Z"), max: new Date("2030-01-01T00:00:00Z"), noInvalidDate: true })
+        .map((date) => date.toISOString()),
+      fc.string()
+    );
+    const dmgBytes = fc.oneof(fc.constant(null), fc.integer({ min: -5, max: 2_000_000_000 }));
+    fc.assert(
+      fc.property(version, version, fc.boolean(), publishedAt, dmgBytes, (reported, described, live, published, size) => {
+        const release = { version: reported.text, live, publishedAt: published, dmgBytes: size };
+        const copy = releaseCopy(release, described.text);
+        const order = tupleOrder(reported.parts, described.parts);
+        const named = copy.hero !== "";
+        expect(named).toBe(live && order >= 0 && !Number.isNaN(Date.parse(published)) && size > 0);
+        expect(Object.keys(copy.jsonLd).length > 0).toBe(named);
+        if (named) {
+          expect(copy.hero).toContain(`Version ${reported.text} came out`);
+          expect(copy.hero).toContain(formatMegabytes(size));
+          expect(copy.lead).toContain(`version ${reported.text},`);
+          expect(copy.jsonLd.softwareVersion).toBe(reported.text);
+        } else {
+          expect(copy.lead).not.toMatch(/\d+\.\d+\.\d+/);
+        }
+        expect(copy.showMainList).toBe(named && order === 0);
+        expect(copy.showNewer).toBe(named && order === 1);
+      })
+    );
+  });
+
+  test("releaseCopy is total", () => {
+    fc.assert(
+      fc.property(fc.anything(), fc.anything(), (release, described) => {
+        const copy = releaseCopy(release, described);
+        expect(typeof copy.hero).toBe("string");
+        expect(typeof copy.lead).toBe("string");
+      })
+    );
+  });
+
   test("releaseStatus is total", () => {
     fc.assert(
       fc.property(fc.anything(), fc.anything(), (release, described) => {
@@ -213,7 +259,7 @@ describe("release helper properties", () => {
 
   test("formatDate is total and deterministic", () => {
     fc.assert(
-      fc.property(fc.string(), (text) => {
+      fc.property(fc.oneof(fc.string(), fc.anything()), (text) => {
         const once = formatDate(text);
         expect(typeof once).toBe("string");
         expect(formatDate(text)).toBe(once);
