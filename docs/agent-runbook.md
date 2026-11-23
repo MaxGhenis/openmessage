@@ -2012,6 +2012,16 @@ Always Allow persists it.
 
 ### gmessages fork contract
 
+**Update:** `go.mod` now requires upstream `go.mau.fi/mautrix-gmessages`
+v0.2611.0 directly, with no fork replace. The pinned fork couldn't complete
+Google Account pairing on current Messages builds (`unknown error pairing:
+3/32`, #300). Of the three carried patches below, (1) is covered by upstream's
+`ListConversations(ctx, *ListConversationsRequest)` with `Cursor`, and (3) by
+upstream's own hard timeout (fixed at 60 s). (2), payload-less frames, is not
+upstream: `ResponsePayloadError` survives only as a local type in
+`internal/client`, and a payload-less answer is an empty success again. The
+history below records the fork-era contract.
+
 **Root cause of the repeated deaths (fixed in #73):** the `MaxGhenis/gmessages`
 fork was frozen at its 2026-03-02 base and missed upstream's 2026-05-05
 [`libgm/longpoll: retry on network error when refreshing auth token`](https://github.com/mautrix/gmessages/commit/0b54a8fe65207f81d353ffe63f4d2549c2eb7976).
