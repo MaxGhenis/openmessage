@@ -514,12 +514,24 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
 	lastImportErr := map[string]string{}
+	// OPENMESSAGES_DISABLE_LOCAL_IMPORT: comma-separated platforms (whatsapp,
+	// signal, imessage) or "all" to skip importing from local desktop app DBs.
+	disabledImports := map[string]bool{}
+	for _, p := range strings.Split(os.Getenv("OPENMESSAGES_DISABLE_LOCAL_IMPORT"), ",") {
+		if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
+			disabledImports[p] = true
+		}
+	}
+	importEnabled := func(platform string) bool { return !disabledImports["all"] && !disabledImports[platform] }
 	syncLocalPlatforms := func() {
 		if app.Sandboxed() || isDemo {
 			return
 		}
 		changed := false
 		syncPlatform := func(platform, successMsg string, importFromDB func(*db.Store) (*importer.ImportResult, error)) {
+			if !importEnabled(platform) {
+				return
+			}
 			result, err := importFromDB(a.Store)
 			if err != nil {
 				logSyncError(logger, lastImportErr, platform, err)

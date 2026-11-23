@@ -24,14 +24,14 @@ var (
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		return cli.GM.SendReaction(payload)
+		return cli.GM.SendReaction(context.Background(), payload)
 	}
 	getGoogleReactionConversation = func(a *app.App, conversationID string) (*gmproto.Conversation, error) {
 		cli := a.GetClient()
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		return cli.GM.GetConversation(conversationID)
+		return cli.GM.GetConversation(context.Background(), conversationID)
 	}
 )
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -1458,7 +1459,7 @@ func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 func TestSendTextUnansweredLibgmRequests(t *testing.T) {
 	for _, reason := range []error{libgm.ErrPhoneNotResponding, libgm.ErrConnectionClosed} {
 		t.Run(reason.Error(), func(t *testing.T) {
-			sendErr := &libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: reason}
+			sendErr := fmt.Errorf("unanswered request: %w", reason)
 			fake := &fakeTextSendClient{conversationResult: &gmproto.Conversation{}, sendErr: sendErr}
 			a := newTextSendTestAdapter(t, fake)
 			_, err := a.SendText(context.Background(), bridge.TextRequest{
@@ -1472,7 +1473,7 @@ func TestSendTextUnansweredLibgmRequests(t *testing.T) {
 				t.Fatalf("send failure = %+v, want an ambiguous transient failure wrapping %v", failure, reason)
 			}
 
-			lookupErr := &libgm.UnansweredRequestError{Action: gmproto.ActionType_GET_CONVERSATION, Reason: reason}
+			lookupErr := fmt.Errorf("unanswered request: %w", reason)
 			lookupFake := &fakeTextSendClient{conversationErr: lookupErr}
 			a = newTextSendTestAdapter(t, lookupFake)
 			_, err = a.SendText(context.Background(), bridge.TextRequest{

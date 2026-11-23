@@ -212,6 +212,7 @@ The macOS app target lives under `OpenMessage/`.
 | `OPENMESSAGES_HOST` | `127.0.0.1` | Host/interface to bind the local web server to |
 | `OPENMESSAGES_MY_NAME` | system user name | Display name for outgoing imported iMessage/WhatsApp messages |
 | `OPENMESSAGES_STARTUP_BACKFILL` | `auto` | Startup history sync mode: `auto`, `shallow`, `deep`, or `off` |
+| `OPENMESSAGES_DISABLE_LOCAL_IMPORT` | unset | Comma-separated platforms (`whatsapp`, `signal`, `imessage`) or `all` to skip importing from local desktop app databases. |
 | `OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS` | `0` | Opt in to deep backfill's Phase C (contact-based orphan discovery). **Off by default** because it creates an empty SMS thread on your phone for each contact without prior message history. Enable with `1`/`true`/`yes`/`on` only if you understand the side effect. |
 | `OPENMESSAGES_KLIPY_API_KEY` | unset | Optional Klipy API key for the web compose GIF picker. GIF search is unavailable until this is set. `KLIPY_API_KEY` is also accepted as a fallback. |
 | `OPENMESSAGE_COOKIE_REFRESH_SCRIPT` | unset | Optional command run before reconnect when Google session cookies expire. If unset, OpenMessage backs off and prompts for manual re-pair instead of hammering Google's auth endpoint. |

@@ -38,8 +38,14 @@ func defaultChromeProfileDir(home string) string {
 // chromeSafeStorageSecret reads Chrome's cookie-encryption password from the
 // login keychain. The value itself is never logged.
 func chromeSafeStorageSecret(ctx context.Context) ([]byte, error) {
+	// OPENMESSAGE_CHROME_SAFE_STORAGE names the keychain item for other
+	// Chromium browsers (e.g. "Aside Safe Storage", "Brave Safe Storage").
+	service := os.Getenv("OPENMESSAGE_CHROME_SAFE_STORAGE")
+	if service == "" {
+		service = "Chrome Safe Storage"
+	}
 	out, err := exec.CommandContext(ctx,
-		"/usr/bin/security", "find-generic-password", "-w", "-s", "Chrome Safe Storage",
+		"/usr/bin/security", "find-generic-password", "-w", "-s", service,
 	).Output()
 	if err != nil {
 		return nil, fmt.Errorf("read Chrome Safe Storage from keychain: %w", err)

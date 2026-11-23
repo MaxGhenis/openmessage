@@ -27,7 +27,7 @@ var (
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		convResp, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
+		convResp, err := cli.GM.GetOrCreateConversation(context.Background(), &gmproto.GetOrCreateConversationRequest{
 			Numbers: app.NewContactNumbers([]string{phone}),
 		})
 		if err != nil {
@@ -40,7 +40,7 @@ var (
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		return cli.GM.SendMessage(payload)
+		return cli.GM.SendMessage(context.Background(), payload)
 	}
 )
 

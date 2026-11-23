@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
-	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
@@ -738,10 +737,7 @@ func TestUnansweredGoogleSendBecomesUncertainAndIsNotRedispatched(t *testing.T) 
 				Class:       bridge.FailureTransient,
 				Operation:   "send_text",
 				Fingerprint: "google_text_send_failed",
-				Cause: fmt.Errorf("send Google text: %w", &libgm.UnansweredRequestError{
-					Action: gmproto.ActionType_SEND_MESSAGE,
-					Reason: reason,
-				}),
+				Cause:       fmt.Errorf("send Google text: %w", fmt.Errorf("unanswered request: %w", reason)),
 			}}}}
 			registry := newScriptedRegistry("unanswered-platform", sender)
 			registry.setAvailable(true)

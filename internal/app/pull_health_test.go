@@ -13,13 +13,14 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func noPayloadErr(accountSwitch bool) error {
-	return &libgm.ResponsePayloadError{
+	return &client.ResponsePayloadError{
 		Action:        gmproto.ActionType_LIST_CONVERSATIONS,
 		Frames:        1,
 		AccountSwitch: accountSwitch,
@@ -178,7 +179,7 @@ func referenceSignal(events []pullEvent) (signal bool, consecutive int) {
 		if !counted {
 			continue
 		}
-		var payloadErr *libgm.ResponsePayloadError
+		var payloadErr *client.ResponsePayloadError
 		isNoPayload := errors.As(e.err, &payloadErr)
 		switch {
 		case e.err == nil && e.count > 0:
@@ -290,7 +291,7 @@ func TestBackfillAndReconcileRecordPulls(t *testing.T) {
 	mock.listConvErrors = map[gmproto.ListConversationsRequest_Folder]error{
 		gmproto.ListConversationsRequest_INBOX: noPayloadErr(false),
 	}
-	if err := a.Backfill(); !errors.Is(err, libgm.ErrNoResponsePayload) {
+	if err := a.Backfill(); !errors.Is(err, client.ErrNoResponsePayload) {
 		t.Fatalf("Backfill err = %v, want ErrNoResponsePayload", err)
 	}
 	if h := a.GooglePullHealth(); h.LastOutcome != GooglePullNoPayload || h.ConsecutiveDataless != 2 {
@@ -302,7 +303,7 @@ func TestTargetedBackfillRecordsLookup(t *testing.T) {
 	mock := &mockGMClient{getOrCreateErrs: map[string]error{"+15550000000": noPayloadErr(true)}}
 	a := newTestApp(t, mock)
 	a.SetGoogleConversationCounter(func() (int, error) { return 1044, nil })
-	if err := a.BackfillConversationByPhone("+15550000000"); !errors.Is(err, libgm.ErrNoResponsePayload) {
+	if err := a.BackfillConversationByPhone("+15550000000"); !errors.Is(err, client.ErrNoResponsePayload) {
 		t.Fatalf("err = %v", err)
 	}
 	if h := a.GooglePullHealth(); h.LastTrigger != "targeted" || !h.EmptyWithLocalHistory || !h.AccountSwitch {
@@ -519,7 +520,7 @@ func TestPullFromGenerationRetiredDuringCountIsIgnored(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 	a := &App{Store: store, Logger: zerolog.Nop()}
-	oldCli := &client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop())}
+	oldCli := &client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop(), exhttp.ClientSettings{})}
 	a.BeginGoogleGeneration(oldCli)
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -534,7 +535,7 @@ func TestPullFromGenerationRetiredDuringCountIsIgnored(t *testing.T) {
 		a.recordGoogleListPull(oldCli.GM, "reconcile:old", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
 	}()
 	<-entered
-	a.BeginGoogleGeneration(&client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop())})
+	a.BeginGoogleGeneration(&client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop(), exhttp.ClientSettings{})})
 	close(release)
 	<-done
 	if h := a.GooglePullHealth(); h != nil {
