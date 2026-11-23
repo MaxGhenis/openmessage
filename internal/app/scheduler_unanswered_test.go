@@ -66,8 +66,8 @@ func seedDueMedia(t *testing.T, a *App, id string) {
 // sendSMSMedia through their Google hooks.
 func TestPossiblySentScheduledSMSIsNotResent(t *testing.T) {
 	reasons := []error{
-		&libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: libgm.ErrPhoneNotResponding},
-		&libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: libgm.ErrConnectionClosed},
+		fmt.Errorf("unanswered request: %w", libgm.ErrPhoneNotResponding),
+		fmt.Errorf("unanswered request: %w", libgm.ErrConnectionClosed),
 		errors.New("Post \"https://instantmessaging-pa.googleapis.com\": connection reset by peer"),
 	}
 	for _, kind := range []string{"text", "media"} {
@@ -104,9 +104,7 @@ func TestNotSentScheduledSMSIsRetried(t *testing.T) {
 		name string
 		fake *fakeGoogleSend
 	}{
-		{"unanswered lookup", &fakeGoogleSend{lookupErr: &libgm.UnansweredRequestError{
-			Action: gmproto.ActionType_GET_CONVERSATION, Reason: libgm.ErrPhoneNotResponding,
-		}}},
+		{"unanswered lookup", &fakeGoogleSend{lookupErr: fmt.Errorf("unanswered request: %w", libgm.ErrPhoneNotResponding)}},
 		{"auth rejection", &fakeGoogleSend{sendErr: errors.New("HTTP 401: invalid authentication credentials")}},
 		{"no client", &fakeGoogleSend{sendErr: fmt.Errorf(ErrNotConnected)}},
 	} {
@@ -133,8 +131,8 @@ func TestGoogleSendStepErrorRetriesOnlyRefusedSends(t *testing.T) {
 		err         error
 		unconfirmed bool
 	}{
-		{&libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: libgm.ErrPhoneNotResponding}, true},
-		{&libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: libgm.ErrConnectionClosed}, true},
+		{fmt.Errorf("unanswered request: %w", libgm.ErrPhoneNotResponding), true},
+		{fmt.Errorf("unanswered request: %w", libgm.ErrConnectionClosed), true},
 		{errors.New("connection reset"), true},
 		{errors.New("HTTP 500: internal error"), true},
 		{errors.New("HTTP 401: invalid authentication credentials"), false},

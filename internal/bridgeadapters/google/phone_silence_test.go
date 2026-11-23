@@ -40,11 +40,11 @@ func (c *silenceClock) Advance(d time.Duration) {
 }
 
 func unanswered(action gmproto.ActionType) error {
-	return &libgm.UnansweredRequestError{Action: action, Reason: libgm.ErrPhoneNotResponding, Waited: 45 * time.Second}
+	return fmt.Errorf("unanswered request: %w", libgm.ErrPhoneNotResponding)
 }
 
 func disconnected(action gmproto.ActionType) error {
-	return &libgm.UnansweredRequestError{Action: action, Reason: libgm.ErrConnectionClosed}
+	return fmt.Errorf("unanswered request: %w", libgm.ErrConnectionClosed)
 }
 
 // wantBackoff is the probe window after k consecutive unanswered requests,
@@ -434,7 +434,7 @@ func TestUnansweredSendsAreUncertain(t *testing.T) {
 				a := newTextSendTestAdapter(t, &fakeTextSendClient{})
 				clock := newSilenceClock()
 				a.silence.now = clock.Now
-				err := c.run(t, a, &libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: reason})
+				err := c.run(t, a, fmt.Errorf("unanswered request: %w", reason))
 				failure, ok := asOpError(err)
 				if !ok || failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchUncertain ||
 					!errors.Is(failure.Cause, reason) {

@@ -35,21 +35,21 @@ var (
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		return cli.GM.UploadMedia(data, filename, mimeType)
+		return cli.GM.UploadMedia(context.Background(), data, filename, mimeType)
 	}
 	getGoogleConversation = func(a *app.App, conversationID string) (*gmproto.Conversation, error) {
 		cli := a.GetClient()
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		return cli.GM.GetConversation(conversationID)
+		return cli.GM.GetConversation(context.Background(), conversationID)
 	}
 	sendGoogleMediaMessage = func(a *app.App, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
 		cli := a.GetClient()
 		if cli == nil {
 			return nil, fmt.Errorf(app.ErrNotConnected)
 		}
-		return cli.GM.SendMessage(payload)
+		return cli.GM.SendMessage(context.Background(), payload)
 	}
 )
 

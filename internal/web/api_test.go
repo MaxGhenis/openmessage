@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/app"
@@ -2163,7 +2162,7 @@ func TestGoogleAuthExpiredErrorIsUserFacing(t *testing.T) {
 }
 
 func TestGoogleAccountSwitchErrorIsUserFacing(t *testing.T) {
-	err := fmt.Errorf("get conversation: %w", &libgm.ResponsePayloadError{
+	err := fmt.Errorf("get conversation: %w", &client.ResponsePayloadError{
 		Action:        gmproto.ActionType_GET_CONVERSATION,
 		Frames:        1,
 		AccountSwitch: true,
@@ -2175,7 +2174,7 @@ func TestGoogleAccountSwitchErrorIsUserFacing(t *testing.T) {
 	if strings.Contains(got, "GET_CONVERSATION") || strings.Contains(got, "f11") {
 		t.Fatalf("error leaked protocol details: %q", got)
 	}
-	plain := googleAPIErrorMessage("get conversation", &libgm.ResponsePayloadError{Action: gmproto.ActionType_GET_CONVERSATION})
+	plain := googleAPIErrorMessage("get conversation", &client.ResponsePayloadError{Action: gmproto.ActionType_GET_CONVERSATION})
 	if strings.Contains(plain, "switched to Google-account pairing") {
 		t.Fatalf("a payload error without the switch notice was misreported: %q", plain)
 	}

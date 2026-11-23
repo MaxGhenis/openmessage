@@ -11,12 +11,13 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 
 	"github.com/maxghenis/openmessage/internal/client"
 )
 
 func unanswered(reason error) error {
-	return &libgm.UnansweredRequestError{Action: gmproto.ActionType_LIST_MESSAGES, Reason: reason}
+	return fmt.Errorf("unanswered request: %w", reason)
 }
 
 // scriptedGMClient returns the next scripted error from every method and
@@ -135,12 +136,12 @@ func TestFailFastStopsAfterFirstUnansweredRequest(t *testing.T) {
 }
 
 func TestFailFastLetsOtherErrorsThrough(t *testing.T) {
-	payloadErr := &libgm.ResponsePayloadError{Action: gmproto.ActionType_LIST_CONVERSATIONS, AccountSwitch: true}
+	payloadErr := errors.New("response had no payload")
 	authErr := errors.New("HTTP 401: invalid authentication credentials")
 	inner := &scriptedGMClient{errs: []error{payloadErr, authErr, errors.New("network down")}}
 	gm := newFailFastGMClient(inner)
 	errs := callAll(gm)
-	if !errors.Is(errs[0], libgm.ErrNoResponsePayload) || !IsGoogleAccountSwitchError(errs[0]) {
+	if errs[0] != payloadErr {
 		t.Fatalf("payload error changed: %v", errs[0])
 	}
 	if errs[1] != authErr {
@@ -165,7 +166,7 @@ func TestFailFastPropertyOverRandomScripts(t *testing.T) {
 	outcomes := []func() error{
 		func() error { return nil },
 		func() error { return errors.New("transient") },
-		func() error { return &libgm.ResponsePayloadError{Action: gmproto.ActionType_LIST_MESSAGES} },
+		func() error { return errors.New("response had no payload") },
 		func() error { return unanswered(libgm.ErrPhoneNotResponding) },
 		func() error { return unanswered(libgm.ErrConnectionClosed) },
 		// Wrapped, as a caller might wrap it before it reaches the client.
@@ -250,7 +251,7 @@ func TestEveryCatchUpFailsFast(t *testing.T) {
 	catchUp.finish()
 
 	a.gmClient = nil
-	a.Client = &client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop())}
+	a.Client = &client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop(), exhttp.ClientSettings{})}
 	catchUp = a.beginGoogleCatchUp("test")
 	if catchUp == nil {
 		t.Fatal("no catch-up for a connected libgm client")

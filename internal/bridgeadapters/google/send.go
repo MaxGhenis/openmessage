@@ -27,7 +27,7 @@ type textSendClient interface {
 }
 
 var textSendClientFor = func(cli *client.Client) textSendClient {
-	return cli.GM
+	return gmCompat{cli.GM}
 }
 
 type reactionSendClient interface {
@@ -36,7 +36,7 @@ type reactionSendClient interface {
 }
 
 var reactionSendClientFor = func(cli *client.Client) reactionSendClient {
-	return cli.GM
+	return gmCompat{cli.GM}
 }
 
 type readSendClient interface {
@@ -44,7 +44,7 @@ type readSendClient interface {
 }
 
 var readSendClientFor = func(cli *client.Client) readSendClient {
-	return cli.GM
+	return gmCompat{cli.GM}
 }
 
 type downloadClient interface {
@@ -65,7 +65,12 @@ var downloadClientFor = func(cli *client.Client) downloadClient {
 	// ([]byte, error), with no MIME result. Adapt that actual return shape to
 	// the lifecycle seam; the shim consequently falls back to MediaRef.MIME.
 	return downloadClientFunc(func(mediaID string, key []byte) ([]byte, string, error) {
-		data, err := cli.GM.DownloadMedia(mediaID, key)
+		rc, err := cli.GM.DownloadMedia(context.Background(), mediaID, key)
+		if err != nil {
+			return nil, "", err
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(rc)
 		return data, "", err
 	})
 }
@@ -161,7 +166,7 @@ type mediaSendClient interface {
 }
 
 var mediaSendClientFor = func(cli *client.Client) mediaSendClient {
-	return cli.GM
+	return gmCompat{cli.GM}
 }
 
 // refuseMovedThread refuses an operation whose Google thread now names other

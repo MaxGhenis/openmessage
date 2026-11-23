@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"github.com/maxghenis/openmessage/internal/client"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
@@ -30,7 +30,7 @@ const (
 	// GooglePullEmpty: the phone answered with an empty result.
 	GooglePullEmpty GooglePullOutcome = "empty"
 	// GooglePullNoPayload: the phone answered only with frames that carry no
-	// response payload (libgm.ErrNoResponsePayload).
+	// response payload (client.ErrNoResponsePayload).
 	GooglePullNoPayload GooglePullOutcome = "no_payload"
 	// GooglePullError: the pull failed for another reason (transport, auth).
 	GooglePullError GooglePullOutcome = "error"
@@ -130,13 +130,13 @@ func (a *App) GooglePullHealth() *GooglePullHealthSnapshot {
 // answered with its Google-account switch notice instead of data (the phone
 // switched to Google-account pairing; this session is a QR pairing).
 func IsGoogleAccountSwitchError(err error) bool {
-	var payloadErr *libgm.ResponsePayloadError
+	var payloadErr *client.ResponsePayloadError
 	return errors.As(err, &payloadErr) && payloadErr.AccountSwitch
 }
 
 func classifyGooglePull(count int, err error) GooglePullOutcome {
 	switch {
-	case errors.Is(err, libgm.ErrNoResponsePayload):
+	case errors.Is(err, client.ErrNoResponsePayload):
 		return GooglePullNoPayload
 	case err != nil:
 		return GooglePullError

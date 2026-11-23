@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 )
 
 // RequestTimeout is how long a libgm request waits for the phone's answer
@@ -30,10 +31,18 @@ type Client struct {
 	Logger zerolog.Logger
 }
 
+// httpSettings mirrors the old fork's HTTP client: 20 s for response headers.
+// Upstream libgm (v0.2611) fixes the phone-response timeout at 60 s and no
+// longer exposes SetRequestTimeout, so RequestTimeout is not applied here.
+var httpSettings = exhttp.ClientSettings{
+	DialTimeout:           10 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ResponseHeaderTimeout: 20 * time.Second,
+	IdleConnTimeout:       90 * time.Second,
+}
+
 func newGMClient(authData *libgm.AuthData, pushKeys *libgm.PushKeys, logger zerolog.Logger) *libgm.Client {
-	cli := libgm.NewClient(authData, pushKeys, logger)
-	cli.SetRequestTimeout(RequestTimeout)
-	return cli
+	return libgm.NewClient(authData, pushKeys, logger, httpSettings)
 }
 
 func NewFromSession(sessionData *SessionData, logger zerolog.Logger) (*Client, error) {
